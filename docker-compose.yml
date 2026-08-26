@@ -1,0 +1,32 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: immo
+      POSTGRES_PASSWORD: immo
+      POSTGRES_DB: immo_rag
+    ports:
+      # 5433 (pas 5432) : un Postgres natif tourne déjà sur cette machine sur
+      # le port par défaut, ce qui provoquait des échecs d'authentification
+      # (les connexions arrivaient au mauvais serveur).
+      - "5433:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U immo -d immo_rag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
