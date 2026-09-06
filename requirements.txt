@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 pydantic-settings
 psycopg[binary]
+rank-bm25
+snowballstemmer
