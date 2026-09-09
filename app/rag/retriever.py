@@ -9,18 +9,24 @@ document dans chaque classement. C'est le principe de la méthode RRF
 
 Construction du module en trois temps (cf. CLAUDE.md) :
   1. la fusion seule (fusion_rrf)          [fait]
-  2. le raccordement des deux recherches   [ici]
-  3. le reclassement fin par-dessus        [à venir]
+  2. le raccordement des deux recherches   [fait]
+  3. le reclassement fin par-dessus        [ici, via reranker.py]
 
-Le garde-fou "refus en l'absence de résultat suffisamment pertinent" est prévu
-à l'étape 3, sur le score du reclasseur : le score de fusion n'offre pas de
-seuil interprétable.
+Le reclassement est facultatif. Sans reclasseur, l'ordre des résultats est
+celui de la fusion. Avec un reclasseur, les meilleurs candidats de la fusion
+sont soumis à un cross-encoder (reranker.py) qui relit la question et chaque
+texte ensemble ; l'ordre final suit alors le score du cross-encoder.
+
+Le garde-fou "refus en l'absence de résultat suffisamment pertinent" s'appuiera
+sur le score du reclasseur (champ score_rerank), le seul à offrir un seuil
+interprétable ; il sera ajouté dans une étape suivante.
 
 Contenu du fichier :
 - fusion_rrf : fusionne plusieurs classements d'identifiants en un seul.
 - RetrievalResult : un morceau retrouvé après fusion, avec son rang dans
-  chaque recherche (utile pour retracer son origine).
-- HybridRetriever : enchaîne les deux recherches et leur fusion.
+  chaque recherche et, le cas échéant, son score de reclassement.
+- HybridRetriever : enchaîne les deux recherches, leur fusion et le
+  reclassement facultatif.
 """
 from __future__ import annotations
 
@@ -56,13 +62,13 @@ def fusion_rrf(classements: list[list[UUID]], k: int = 60) -> list[UUID]:
     return sorted(scores, key=lambda doc_id: scores[doc_id], reverse=True)
 
 
-# --- Étape 2 : les deux recherches et leur fusion ---------------------------
+# --- Étapes 2 et 3 : les deux recherches, leur fusion, le reclassement ------
 
 
 class _ResultatRecherche(Protocol):
     """Partie commune aux résultats des deux recherches : de quoi identifier un
-    morceau et le restituer. Les scores ne sont pas utilisés ici ; la fusion ne
-    considère que les rangs."""
+    morceau et le restituer. Les scores des deux recherches ne sont pas utilisés
+    ici ; la fusion ne considère que les rangs."""
 
     id: UUID
     doc_id: str
@@ -82,13 +88,20 @@ class _Embeddings(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
-class RetrievalResult(BaseModel):
-    """Un morceau retrouvé par la recherche hybride, après fusion.
+class _Reranker(Protocol):
+    def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]: ...
 
-    score_rrf ordonne les morceaux entre eux, sans seuil absolu (aucun
-    garde-fou à ce stade). rang_dense et rang_bm25 indiquent le rang du morceau
-    dans chaque recherche, ou None s'il n'y figurait pas : cette information
-    retrace l'origine du résultat.
+
+class RetrievalResult(BaseModel):
+    """Un morceau retrouvé par la recherche hybride.
+
+    score_rrf ordonne les morceaux issus de la fusion. rang_dense et rang_bm25
+    indiquent le rang du morceau dans chaque recherche, ou None s'il n'y
+    figurait pas : cette information retrace l'origine du résultat.
+
+    score_rerank est le score du cross-encoder (entre 0 et 1), présent seulement
+    lorsqu'un reclasseur a été fourni. C'est lui qui portera le garde-fou de
+    retrieval ; il vaut None en son absence.
     """
 
     id: UUID
@@ -98,18 +111,27 @@ class RetrievalResult(BaseModel):
     score_rrf: float
     rang_dense: int | None = None
     rang_bm25: int | None = None
+    score_rerank: float | None = None
 
 
 class HybridRetriever:
-    """Enchaîne les deux recherches puis leur fusion.
+    """Enchaîne les deux recherches, leur fusion et un reclassement facultatif.
 
     Les composants utilisés (embeddings, recherche par le sens, recherche par
-    mots-clés) sont fournis en paramètres, non instanciés ici : le module reste
-    testable sans base ni modèle. pipeline.py les raccordera depuis .env.
+    mots-clés, reclasseur) sont fournis en paramètres, non instanciés ici : le
+    module reste testable sans base ni modèle. pipeline.py les raccordera depuis
+    .env.
 
     k_par_source : nombre de morceaux demandés à chaque recherche avant fusion.
     Ce nombre dépasse le total final afin qu'un morceau mal classé par une
     recherche mais bien classé par l'autre puisse remonter.
+
+    reranker : reclasseur facultatif. Fourni, il réordonne les meilleurs
+    candidats de la fusion. Absent (None), l'ordre reste celui de la fusion.
+
+    k_avant_rerank : nombre de candidats de la fusion soumis au reclasseur. Le
+    cross-encoder traite chaque candidat séparément ; ce plafond limite son
+    coût. Sans effet lorsque reranker vaut None.
     """
 
     def __init__(
@@ -117,18 +139,25 @@ class HybridRetriever:
         embeddings: _Embeddings,
         recherche_dense: _RechercheDense,
         recherche_sparse: _RechercheSparse,
+        reranker: _Reranker | None = None,
         k_par_source: int = 20,
         k_rrf: int = 60,
+        k_avant_rerank: int = 20,
     ):
         self._embeddings = embeddings
         self._dense = recherche_dense
         self._sparse = recherche_sparse
+        self._reranker = reranker
         self._k_par_source = k_par_source
         self._k_rrf = k_rrf
+        self._k_avant_rerank = k_avant_rerank
 
     def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
-        """Les k morceaux les mieux placés pour la question après fusion.
-        Renvoie une liste vide lorsque les deux recherches ne renvoient rien."""
+        """Les k morceaux les mieux placés pour la question.
+
+        L'ordre vient de la fusion RRF, ou du reclasseur lorsqu'il est fourni.
+        Renvoie une liste vide lorsque les deux recherches ne renvoient rien.
+        """
         embedding_requete = self._embeddings.embed_query(query)
         resultats_denses = self._dense.search(embedding_requete, k=self._k_par_source)
         resultats_sparses = self._sparse.search(query, k=self._k_par_source)
@@ -142,21 +171,32 @@ class HybridRetriever:
         rang_dense = {r.id: i for i, r in enumerate(resultats_denses, start=1)}
         rang_bm25 = {r.id: i for i, r in enumerate(resultats_sparses, start=1)}
 
-        scores = _scores_rrf(
-            [list(rang_dense), list(rang_bm25)],
-            k=self._k_rrf,
-        )
+        scores = _scores_rrf([list(rang_dense), list(rang_bm25)], k=self._k_rrf)
         ids_ordonnes = sorted(scores, key=lambda i: scores[i], reverse=True)
 
-        return [
-            RetrievalResult(
+        def _resultat(chunk_id: UUID, score_rerank: float | None = None) -> RetrievalResult:
+            source = par_id[chunk_id]
+            return RetrievalResult(
                 id=chunk_id,
-                doc_id=par_id[chunk_id].doc_id,
-                content=par_id[chunk_id].content,
-                metadata=par_id[chunk_id].metadata,
+                doc_id=source.doc_id,
+                content=source.content,
+                metadata=source.metadata,
                 score_rrf=scores[chunk_id],
                 rang_dense=rang_dense.get(chunk_id),
                 rang_bm25=rang_bm25.get(chunk_id),
+                score_rerank=score_rerank,
             )
-            for chunk_id in ids_ordonnes[:k]
+
+        if self._reranker is None:
+            return [_resultat(chunk_id) for chunk_id in ids_ordonnes[:k]]
+
+        # Seuls les meilleurs candidats de la fusion sont soumis au reclasseur ;
+        # leur ordre final est celui qu'il renvoie, pas celui de la fusion.
+        candidats = ids_ordonnes[: self._k_avant_rerank]
+        textes = [par_id[chunk_id].content for chunk_id in candidats]
+        classement = self._reranker.rerank(query, textes)
+
+        return [
+            _resultat(candidats[indice], score_rerank=score)
+            for indice, score in classement[:k]
         ]

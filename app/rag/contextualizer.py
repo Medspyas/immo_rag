@@ -1,23 +1,23 @@
-"""
-Contextual retrieval : ajoute, devant chaque chunk, une courte phrase de
-contexte générée par un LLM à partir du document entier, avant l'embedding.
+"""Ajout d'une phrase de contexte devant chaque morceau, avant l'embedding.
 
-Le problème que ça résout : un article de loi isolé perd parfois son contexte
-("le présent article" — mais l'article de *quelle* loi, dans *quel*
-chapitre ?). Une recherche par sens (embedding) sur un chunk trop nu peut donc
-mal le retrouver. On demande à un LLM de lire le document complet et de
-rédiger 1-2 phrases qui replacent le chunk dedans (ex. "Cet extrait provient
-de la loi du 10 juillet 1965 sur le statut de la copropriété, chapitre I,
-article 6."), collées devant le chunk avant de l'embedder.
+Un article isolé perd ses repères : une formule comme "le présent article"
+n'indique plus de quelle loi ni de quel chapitre il s'agit, ce qui dégrade la
+recherche par le sens. Un modèle de langage, qui reçoit le document entier,
+rédige une ou deux phrases de situation ("Cet extrait vient de la loi du
+10 juillet 1965 sur la copropriété, article 6.") ; ces phrases sont placées
+devant le morceau avant le calcul de l'embedding.
 
-Analogie : comme ajouter un post-it de contexte sur une fiche avant de la
-ranger, pour qu'elle reste compréhensible même sortie du classeur.
+Le document entier est renvoyé à l'identique à chaque appel. Ce texte répété
+est mis en cache par Groq, ce qui limite le volume traité.
 
-Le document complet est envoyé identique à chaque appel (un par chunk) — ce
-préfixe stable et répété est justement ce qui permet au prompt caching
-automatique de Groq de s'activer (cf. .env.example, LLM_MODEL) : les tokens du
-document ne sont traités en entier qu'une fois, puis réutilisés en cache pour
-tous les chunks suivants du même document.
+Le fournisseur passe par le contrat ContextGenerator et se règle dans .env.
+Seule l'offre gratuite de Groq est proposée.
+
+Contenu du fichier :
+- ContextGenerator : contrat commun aux fournisseurs de modèle.
+- GroqContextGenerator : implémentation Groq (gratuite, par défaut).
+- get_context_generator : sélectionne l'implémentation selon .env.
+- contextualiser_chunks : applique le contexte à une liste de morceaux.
 """
 from __future__ import annotations
 
@@ -40,15 +40,15 @@ Rédige une à deux phrases courtes, en français, qui situent cet extrait dans 
 
 
 class ContextGenerator(ABC):
-    """Contrat commun à tous les fournisseurs LLM utilisés pour le contextual retrieval."""
+    """Contrat commun aux fournisseurs de modèle de langage."""
 
     @abstractmethod
     def generer_contexte(self, document: str, chunk: str) -> str:
-        """Renvoie une courte phrase de contexte situant `chunk` dans `document`."""
+        """Renvoie une ou deux phrases situant l'extrait dans le document."""
 
 
 class GroqContextGenerator(ContextGenerator):
-    """Groq (gratuit) — cf. CLAUDE.md, contrainte budget : pas d'API payante par défaut."""
+    """Implémentation Groq : gratuite, retenue par défaut."""
 
     def __init__(self, api_key: str, model: str):
         from groq import Groq
@@ -71,49 +71,21 @@ class GroqContextGenerator(ContextGenerator):
         return reponse.choices[0].message.content.strip()
 
 
-class AnthropicContextGenerator(ContextGenerator):
-    """Anthropic (payant) — dispo en secours via .env, jamais le défaut (cf. CLAUDE.md)."""
-
-    def __init__(self, api_key: str, model: str):
-        import anthropic
-
-        self._client = anthropic.Anthropic(api_key=api_key)
-        self._model = model
-
-    def generer_contexte(self, document: str, chunk: str) -> str:
-        reponse = self._client.messages.create(
-            model=self._model,
-            max_tokens=150,
-            messages=[
-                {
-                    "role": "user",
-                    "content": PROMPT_CONTEXTE.format(document=document, chunk=chunk),
-                }
-            ],
-        )
-        return reponse.content[0].text.strip()
-
-
 def get_context_generator(settings: Settings) -> ContextGenerator:
-    """Fabrique : choisit l'implémentation selon LLM_PROVIDER dans .env."""
+    """Sélectionne l'implémentation selon le réglage LLM_PROVIDER de .env."""
     if settings.llm_provider == "groq":
         if not settings.groq_api_key:
             raise ValueError("GROQ_API_KEY manquant dans .env")
         return GroqContextGenerator(settings.groq_api_key, settings.llm_model)
-    if settings.llm_provider == "anthropic":
-        if not settings.anthropic_api_key:
-            raise ValueError("ANTHROPIC_API_KEY manquant dans .env")
-        return AnthropicContextGenerator(settings.anthropic_api_key, settings.llm_model)
     raise ValueError(f"Fournisseur LLM inconnu : {settings.llm_provider}")
 
 
 def contextualiser_chunks(
     chunks: list[RawChunk], document_complet: str, generator: ContextGenerator
 ) -> list[RawChunk]:
-    """Préfixe chaque chunk avec sa phrase de contexte générée par le LLM.
+    """Ajoute sa phrase de contexte devant chaque morceau.
 
-    Renvoie une nouvelle liste (les RawChunk d'origine, hors contenu, ne sont
-    pas modifiés en place) : `content` devient "<contexte>\\n\\n<article>".
+    Renvoie une nouvelle liste ; les morceaux d'origine ne sont pas modifiés.
     """
     resultat: list[RawChunk] = []
     for chunk in chunks:

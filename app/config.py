@@ -1,8 +1,12 @@
-"""Configuration du projet, lue depuis .env (cf. .env.example).
+"""Configuration du projet.
 
-extra="forbid" : une clé en trop ou mal orthographiée dans .env (ex.
-VOYAGE_API_KEYY) fait planter le démarrage avec une erreur claire, plutôt que
-d'être silencieusement ignorée et de laisser tourner l'app avec une clé vide.
+Tous les réglages sont lus depuis le fichier .env (un modèle figure dans
+.env.example). La classe Settings énumère les réglages attendus et interrompt
+le démarrage si l'un d'eux manque ou si une clé est mal orthographiée.
+
+Contrainte de projet : seuls des composants gratuits sont retenus. Chaque
+réglage de fournisseur n'accepte donc qu'une valeur locale ou une offre
+gratuite ; aucun service payant n'est proposé.
 """
 from __future__ import annotations
 
@@ -16,18 +20,20 @@ class Settings(BaseSettings):
 
     database_url: str
 
-    # Literal plutôt que str : un typo dans .env (ex. "voyag") est rejeté au
-    # démarrage au lieu d'échouer plus tard dans get_embedding_provider avec
-    # un message moins clair.
-    embeddings_provider: Literal["local", "voyage", "openai"] = "local"
+    # Embeddings : modèle local et gratuit. Un autre modèle local se choisit
+    # via embeddings_model (et embeddings_dimension si sa taille diffère).
+    embeddings_provider: Literal["local"] = "local"
     embeddings_model: str = "intfloat/multilingual-e5-base"
     embeddings_dimension: int = 768
 
-    voyage_api_key: str | None = None
-    openai_api_key: str | None = None
+    # Reclassement des résultats de recherche : modèle local et gratuit. Un
+    # autre modèle local se choisit via rerank_model.
+    rerank_provider: Literal["local"] = "local"
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
 
-    llm_provider: Literal["groq", "anthropic"] = "groq"
+    # LLM du contextual retrieval, puis de la génération de réponse. Groq offre
+    # un accès gratuit ; le volume d'usage doit rester dans ses limites.
+    llm_provider: Literal["groq"] = "groq"
     llm_model: str = "openai/gpt-oss-20b"
 
     groq_api_key: str | None = None
-    anthropic_api_key: str | None = None

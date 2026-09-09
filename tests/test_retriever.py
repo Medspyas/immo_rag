@@ -73,6 +73,19 @@ def _sparse(chunk_id, doc_id="loi-89-462"):
     )
 
 
+class _RerankerFake:
+    """Reclasseur de substitution : renvoie les candidats dans l'ordre inverse
+    de celui reçu, et retient les textes reçus pour vérification."""
+
+    def __init__(self):
+        self.textes_recus: list[str] | None = None
+
+    def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
+        self.textes_recus = list(documents)
+        n = len(documents)
+        return [(i, round((i + 1) / n, 3)) for i in reversed(range(n))]
+
+
 def _retriever(denses, sparses, **kwargs):
     return HybridRetriever(
         _EmbeddingsFake(),
@@ -116,3 +129,49 @@ def test_hybride_sans_resultat_sparse_garde_lordre_dense():
 
 def test_hybride_aucun_resultat_renvoie_liste_vide():
     assert _retriever([], []).search("q") == []
+
+
+# --- HybridRetriever : reclassement facultatif ------------------------------
+
+
+def test_sans_reranker_score_rerank_reste_none():
+    a = uuid4()
+    resultats = _retriever([_dense(a)], []).search("q")
+    assert resultats[0].score_rerank is None
+
+
+def test_reranker_impose_son_ordre_sur_celui_de_la_fusion():
+    a, b, c = uuid4(), uuid4(), uuid4()
+    # Fusion : a, b, c (a 1er des deux côtés). Le reclasseur inverse : c, b, a.
+    resultats = _retriever(
+        [_dense(a), _dense(b), _dense(c)],
+        [_sparse(a), _sparse(b), _sparse(c)],
+        reranker=_RerankerFake(),
+    ).search("q")
+    assert [r.id for r in resultats] == [c, b, a]
+
+
+def test_reranker_renseigne_le_score_rerank():
+    a = uuid4()
+    resultats = _retriever([_dense(a)], [], reranker=_RerankerFake()).search("q")
+    assert resultats[0].score_rerank == 1.0
+
+
+def test_reranker_ne_recoit_que_les_meilleurs_candidats():
+    ids = [uuid4() for _ in range(10)]
+    fake = _RerankerFake()
+    _retriever([_dense(i) for i in ids], [], reranker=fake, k_avant_rerank=3).search("q")
+    assert fake.textes_recus is not None
+    assert len(fake.textes_recus) == 3
+
+
+def test_reranker_respecte_k():
+    ids = [uuid4() for _ in range(5)]
+    resultats = _retriever(
+        [_dense(i) for i in ids], [], reranker=_RerankerFake()
+    ).search("q", k=2)
+    assert len(resultats) == 2
+
+
+def test_reranker_sans_candidat_renvoie_liste_vide():
+    assert _retriever([], [], reranker=_RerankerFake()).search("q") == []

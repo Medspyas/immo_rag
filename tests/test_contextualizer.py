@@ -17,7 +17,7 @@ def _settings(**overrides) -> Settings:
 
 
 class _FakeGenerator(ContextGenerator):
-    """Générateur factice pour tester contextualiser_chunks sans appeler un LLM réel."""
+    """Générateur de substitution : aucun appel à un vrai modèle pendant les tests."""
 
     def generer_contexte(self, document: str, chunk: str) -> str:
         return "Contexte factice."
@@ -33,14 +33,9 @@ def test_groq_sans_cle_api_leve_une_erreur():
         get_context_generator(_settings(groq_api_key=None))
 
 
-def test_anthropic_sans_cle_api_leve_une_erreur():
+def test_fournisseur_inconnu_est_refuse():
     with pytest.raises(ValueError):
-        get_context_generator(_settings(llm_provider="anthropic", anthropic_api_key=None))
-
-
-def test_fournisseur_inconnu_leve_une_erreur():
-    with pytest.raises(ValueError):
-        get_context_generator(_settings(llm_provider="mistral"))
+        _settings(llm_provider="anthropic")
 
 
 def test_contextualiser_prefixe_le_contenu_original():

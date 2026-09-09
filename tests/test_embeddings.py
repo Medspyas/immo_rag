@@ -5,7 +5,7 @@ from app.rag.embeddings import LocalEmbeddings, get_embedding_provider
 
 
 def _settings(**overrides) -> Settings:
-    base = {"database_url": "postgresql://x", "embeddings_provider": "voyage"}
+    base = {"database_url": "postgresql://x"}
     base.update(overrides)
     return Settings(**base)
 
@@ -17,16 +17,11 @@ def test_local_ne_necessite_aucune_cle_api():
     assert provider.dimension == settings.embeddings_dimension
 
 
-def test_voyage_sans_cle_api_leve_une_erreur():
+def test_local_ne_charge_pas_le_modele_a_la_construction():
+    provider = get_embedding_provider(_settings())
+    assert provider._model is None
+
+
+def test_fournisseur_inconnu_est_refuse():
     with pytest.raises(ValueError):
-        get_embedding_provider(_settings(voyage_api_key=None))
-
-
-def test_openai_sans_cle_api_leve_une_erreur():
-    with pytest.raises(ValueError):
-        get_embedding_provider(_settings(embeddings_provider="openai", openai_api_key=None))
-
-
-def test_fournisseur_inconnu_leve_une_erreur():
-    with pytest.raises(ValueError):
-        get_embedding_provider(_settings(embeddings_provider="mistral"))
+        _settings(embeddings_provider="voyage")

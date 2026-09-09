@@ -1,6 +1,21 @@
+# API web
 fastapi
 uvicorn[standard]
+
+# Configuration (lecture de .env)
 pydantic-settings
+
+# Base vectorielle (recherche par le sens)
 psycopg[binary]
+pgvector
+
+# Recherche par mots-clés (BM25 + tokenizer français)
 rank-bm25
 snowballstemmer
+
+# Embeddings locaux (intfloat/multilingual-e5-base) et reclassement local
+# (BAAI/bge-reranker-v2-m3) — fournisseurs par défaut
+sentence-transformers
+
+# LLM du contextual retrieval et de la génération de réponse (Groq, gratuit)
+groq
