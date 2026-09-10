@@ -1,0 +1,203 @@
+"""Étude d'ablation du retrieval : la recherche hybride vaut-elle sa complexité ?
+
+Le checkpoint de CLAUDE.md : avant d'empiler d'autres briques sur la recherche,
+mesurer si l'hybride (sens + mots-clés + fusion RRF) fait vraiment mieux que la
+recherche par le sens seule, sur le golden dataset. Si l'écart est faible, on
+coupe la complexité qui ne se justifie pas.
+
+Chaque question du golden est posée aux systèmes comparés ; on regarde à quel
+rang le premier article attendu remonte, puis on agrège en hit@k et MRR
+(cf. metrics.py).
+
+Systèmes comparés :
+  - « sens seul »   : recherche par le sens uniquement (dense) ;
+  - « hybride »      : dense + BM25 + fusion RRF ;
+  - « hybride+rerank » : idem, plus le reclasseur BGE-m3 (option --rerank ;
+                         lent sur CPU, désactivé par défaut).
+
+Lancement :
+    python -m eval.ablation                 # sens seul vs hybride
+    python -m eval.ablation --rerank         # ajoute le reclasseur
+    python -m eval.ablation --threads 2      # limite l'usage CPU
+
+Le premier lancement calcule les embeddings du corpus (~1-2 min, un pic CPU
+borné par --threads) puis les met en cache ; les suivants sont immédiats.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+# La sortie contient des accents ; sur une console Windows en page de code
+# héritée, forcer UTF-8 évite les caractères illisibles.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+# Bride le calcul parallèle AVANT tout import qui chargerait NumPy/PyTorch : ces
+# bibliothèques lisent le nombre de threads à l'import. --threads l'ajuste
+# ensuite pour PyTorch.
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from app.config import Settings
+from app.rag.embeddings import get_embedding_provider
+from app.rag.retriever import HybridRetriever
+from eval.corpus_memoire import CorpusMemoire, construire_corpus
+from eval.golden import CasGolden, charger_golden
+from eval.metrics import Source, mrr, rang_premier_pertinent, taux_hit_at_k
+
+# Rangs examinés. On récupère toujours K_MAX résultats ; hit@k se lit pour
+# k <= K_MAX, le MRR porte sur l'ensemble.
+KS = (1, 3, 5, 10)
+K_MAX = 20
+
+Recherche = Callable[[str, int], list[Source]]
+
+
+@dataclass
+class ResultatEval:
+    nom: str
+    n_questions: int
+    hit_at: dict[int, float]
+    mrr: float
+    rangs: list[int | None]
+
+
+def evaluer_systeme(nom: str, rechercher: Recherche, cas: list[CasGolden]) -> ResultatEval:
+    """Pose chaque question au système, relève le rang du premier article
+    attendu, agrège en hit@k et MRR."""
+    rangs: list[int | None] = []
+    for c in cas:
+        resultats = rechercher(c.question, K_MAX)
+        cibles = {(c.doc_id, article) for article in c.articles}
+        rangs.append(rang_premier_pertinent(resultats, cibles))
+    return ResultatEval(
+        nom=nom,
+        n_questions=len(cas),
+        hit_at={k: taux_hit_at_k(rangs, k) for k in KS},
+        mrr=mrr(rangs),
+        rangs=rangs,
+    )
+
+
+def _sources(resultats) -> list[Source]:
+    return [(r.doc_id, r.metadata.get("article", "")) for r in resultats]
+
+
+def recherche_dense(corpus: CorpusMemoire) -> Recherche:
+    def rechercher(question: str, k: int) -> list[Source]:
+        vecteur = corpus.embeddings.embed_query(question)
+        return _sources(corpus.dense.search(vecteur, k))
+
+    return rechercher
+
+
+def recherche_hybride(corpus: CorpusMemoire, *, reranker=None) -> Recherche:
+    retriever = HybridRetriever(
+        corpus.embeddings, corpus.dense, corpus.bm25, reranker=reranker
+    )
+
+    def rechercher(question: str, k: int) -> list[Source]:
+        return _sources(retriever.search(question, k))
+
+    return rechercher
+
+
+def _tableau(resultats: list[ResultatEval]) -> str:
+    lignes = [f"{'système':<18} " + "  ".join(f"hit@{k:<3}" for k in KS) + "   MRR"]
+    lignes.append("-" * len(lignes[0]))
+    for r in resultats:
+        cases = "  ".join(f"{r.hit_at[k]:6.1%}" for k in KS)
+        lignes.append(f"{r.nom:<18} {cases}   {r.mrr:.3f}")
+    return "\n".join(lignes)
+
+
+def _details(resultats: list[ResultatEval], cas: list[CasGolden]) -> str:
+    """Rang du premier article attendu, question par question, pour chaque
+    système. « — » quand l'article n'est pas dans les 20 premiers résultats."""
+    entetes = [r.nom for r in resultats]
+    lignes = [f"{'id':<5} {'  '.join(f'{n:>14}' for n in entetes)}   question"]
+    for i, c in enumerate(cas):
+        rangs = "  ".join(
+            f"{(str(r.rangs[i]) if r.rangs[i] is not None else '—'):>14}"
+            for r in resultats
+        )
+        lignes.append(f"{c.id:<5} {rangs}   {c.question[:60]}")
+    return "\n".join(lignes)
+
+
+def _diagnostic_hors_corpus(corpus: CorpusMemoire, cas: list[CasGolden]) -> str:
+    """Meilleur score de sens (cosinus) pour les questions hors corpus vs dans
+    le corpus. Un écart net indiquerait qu'un seuil sur ce score pourrait servir
+    de garde-fou (refus) — piste pour l'étage 1."""
+    def meilleur_score(question: str) -> float:
+        vecteur = corpus.embeddings.embed_query(question)
+        top = corpus.dense.search(vecteur, 1)
+        return top[0].score if top else 0.0
+
+    dans = sorted(meilleur_score(c.question) for c in cas if not c.hors_corpus)
+    hors = sorted(meilleur_score(c.question) for c in cas if c.hors_corpus)
+
+    def resume(xs: list[float]) -> str:
+        if not xs:
+            return "—"
+        return f"min {xs[0]:.3f} | médiane {xs[len(xs) // 2]:.3f} | max {xs[-1]:.3f}"
+
+    return (
+        "Meilleur score de sens (cosinus) :\n"
+        f"  questions DANS le corpus  ({len(dans):>2}) : {resume(dans)}\n"
+        f"  questions HORS corpus     ({len(hors):>2}) : {resume(hors)}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rerank", action="store_true", help="ajoute le reclasseur BGE-m3")
+    parser.add_argument("--threads", type=int, default=4, help="cœurs CPU max (défaut 4)")
+    parser.add_argument("--details", action="store_true", help="rang par question")
+    args = parser.parse_args()
+
+    import torch
+
+    torch.set_num_threads(max(1, args.threads))
+
+    settings = Settings()
+    embeddings = get_embedding_provider(settings)
+
+    print("Préparation du corpus en mémoire…")
+    corpus = construire_corpus(embeddings)
+    print(f"{len(corpus.chunks)} articles indexés.\n")
+
+    tous = charger_golden()
+    dans_corpus = [c for c in tous if not c.hors_corpus]
+
+    systemes: list[tuple[str, Recherche]] = [
+        ("sens seul", recherche_dense(corpus)),
+        ("hybride", recherche_hybride(corpus)),
+    ]
+    if args.rerank:
+        from app.rag.reranker import get_rerank_provider
+
+        systemes.append(
+            ("hybride+rerank", recherche_hybride(
+                corpus, reranker=get_rerank_provider(settings)
+            ))
+        )
+
+    resultats = [evaluer_systeme(nom, fn, dans_corpus) for nom, fn in systemes]
+
+    print(f"Ablation retrieval — {len(dans_corpus)} questions du corpus\n")
+    print(_tableau(resultats))
+    print()
+    print(_diagnostic_hors_corpus(corpus, tous))
+    if args.details:
+        print()
+        print(_details(resultats, dans_corpus))
+
+
+if __name__ == "__main__":
+    main()
