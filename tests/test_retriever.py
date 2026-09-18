@@ -175,3 +175,52 @@ def test_reranker_respecte_k():
 
 def test_reranker_sans_candidat_renvoie_liste_vide():
     assert _retriever([], [], reranker=_RerankerFake()).search("q") == []
+
+
+# --- Garde-fou étage 1 : seuil sur le score de reclassement ------------------
+
+
+class _RerankerScores:
+    """Reclasseur de substitution qui renvoie des scores fixés, dans l'ordre
+    reçu, pour tester le filtrage par seuil."""
+
+    def __init__(self, scores: list[float]):
+        self._scores = scores
+
+    def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
+        paires = sorted(enumerate(self._scores[: len(documents)]), key=lambda p: -p[1])
+        return paires
+
+
+def test_seuil_ecarte_les_candidats_sous_le_score():
+    a, b, c = uuid4(), uuid4(), uuid4()
+    resultats = _retriever(
+        [_dense(a), _dense(b), _dense(c)],
+        [],
+        reranker=_RerankerScores([0.9, 0.2, 0.05]),
+        seuil_rerank=0.3,
+    ).search("q")
+    assert [r.id for r in resultats] == [a]
+
+
+def test_seuil_tous_sous_le_score_renvoie_liste_vide():
+    a = uuid4()
+    resultats = _retriever(
+        [_dense(a)], [], reranker=_RerankerScores([0.1]), seuil_rerank=0.3
+    ).search("q")
+    assert resultats == []
+
+
+def test_seuil_ignore_sans_reclasseur():
+    a = uuid4()
+    # seuil_rerank n'a de sens qu'avec un score de reclassement à comparer.
+    resultats = _retriever([_dense(a)], [], seuil_rerank=0.3).search("q")
+    assert [r.id for r in resultats] == [a]
+
+
+def test_seuil_none_ne_filtre_rien():
+    a, b = uuid4(), uuid4()
+    resultats = _retriever(
+        [_dense(a), _dense(b)], [], reranker=_RerankerScores([0.9, 0.01])
+    ).search("q")
+    assert {r.id for r in resultats} == {a, b}

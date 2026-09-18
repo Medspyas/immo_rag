@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     # 512 borne ce coût et aligne la fenêtre du reclasseur sur celle des embeddings e5.
     rerank_max_length: int = 512
 
+    # Garde-fou étage 1 (cf. CLAUDE.md) : sous ce score de reclassement, un
+    # morceau est écarté des résultats plutôt que soumis au LLM générateur.
+    # Mesuré sur le golden dataset (ablation --rerank, 2026-09-10) : score du
+    # meilleur passage médiane 0,939 pour les questions du corpus, max 0,234
+    # pour les questions hors corpus. 0.3 sépare nettement les deux groupes.
+    seuil_garde_fou_retrieval: float = 0.3
+
     # LLM du contextual retrieval, puis de la génération de réponse. Groq offre
     # un accès gratuit ; le volume d'usage doit rester dans ses limites.
     llm_provider: Literal["groq"] = "groq"

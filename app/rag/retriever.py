@@ -17,16 +17,21 @@ celui de la fusion. Avec un reclasseur, les meilleurs candidats de la fusion
 sont soumis à un cross-encoder (reranker.py) qui relit la question et chaque
 texte ensemble ; l'ordre final suit alors le score du cross-encoder.
 
-Le garde-fou "refus en l'absence de résultat suffisamment pertinent" s'appuiera
-sur le score du reclasseur (champ score_rerank), le seul à offrir un seuil
-interprétable ; il sera ajouté dans une étape suivante.
+Garde-fou étage 1 (cf. CLAUDE.md) : un morceau dont le score de reclassement
+tombe sous seuil_rerank est écarté des résultats, avant même d'atteindre le
+LLM générateur. C'est le seul score des trois (RRF, dense, reclassement) dont
+l'échelle est interprétable dans l'absolu (0 à 1, cross-encoder) ; le score
+RRF et le cosinus dense ne le sont pas (mesuré : le cosinus dense des
+questions hors corpus chevauche celui des questions du corpus). Sans
+reclasseur, ce filtre n'a pas d'effet : il n'existe alors aucun score sur
+lequel le fonder.
 
 Contenu du fichier :
 - fusion_rrf : fusionne plusieurs classements d'identifiants en un seul.
 - RetrievalResult : un morceau retrouvé après fusion, avec son rang dans
   chaque recherche et, le cas échéant, son score de reclassement.
-- HybridRetriever : enchaîne les deux recherches, leur fusion et le
-  reclassement facultatif.
+- HybridRetriever : enchaîne les deux recherches, leur fusion, le
+  reclassement facultatif et le garde-fou de retrieval.
 """
 from __future__ import annotations
 
@@ -132,6 +137,11 @@ class HybridRetriever:
     k_avant_rerank : nombre de candidats de la fusion soumis au reclasseur. Le
     cross-encoder traite chaque candidat séparément ; ce plafond limite son
     coût. Sans effet lorsque reranker vaut None.
+
+    seuil_rerank : garde-fou étage 1. Fourni avec un reclasseur, tout candidat
+    dont le score de reclassement tombe sous ce seuil est écarté des résultats
+    plutôt que renvoyé. Sans effet lorsque reranker vaut None (aucun score de
+    reclassement à comparer).
     """
 
     def __init__(
@@ -143,6 +153,7 @@ class HybridRetriever:
         k_par_source: int = 20,
         k_rrf: int = 60,
         k_avant_rerank: int = 20,
+        seuil_rerank: float | None = None,
     ):
         self._embeddings = embeddings
         self._dense = recherche_dense
@@ -151,6 +162,7 @@ class HybridRetriever:
         self._k_par_source = k_par_source
         self._k_rrf = k_rrf
         self._k_avant_rerank = k_avant_rerank
+        self._seuil_rerank = seuil_rerank
 
     def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
         """Les k morceaux les mieux placés pour la question.
@@ -195,6 +207,14 @@ class HybridRetriever:
         candidats = ids_ordonnes[: self._k_avant_rerank]
         textes = [par_id[chunk_id].content for chunk_id in candidats]
         classement = self._reranker.rerank(query, textes)
+
+        # Garde-fou étage 1 : un candidat sous le seuil n'est pas assez fiable
+        # pour être soumis au LLM générateur, refus (résultats vides) plutôt
+        # qu'un appel de génération inutile.
+        if self._seuil_rerank is not None:
+            classement = [
+                (indice, score) for indice, score in classement if score >= self._seuil_rerank
+            ]
 
         return [
             _resultat(candidats[indice], score_rerank=score)
