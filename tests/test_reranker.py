@@ -17,9 +17,11 @@ class _ModeleFake:
     def __init__(self, scores: list[float]):
         self._scores = scores
         self.paires_recues: list[tuple[str, str]] | None = None
+        self.activation_recue = "absente"
 
-    def predict(self, paires):
+    def predict(self, paires, activation_fn=None):
         self.paires_recues = list(paires)
+        self.activation_recue = activation_fn
         return self._scores
 
 
@@ -42,6 +44,16 @@ def test_sigmoide_reste_dans_zero_un_sur_valeurs_extremes():
 def test_local_ne_charge_pas_le_modele_a_la_construction():
     reranker = LocalReranker("BAAI/bge-reranker-v2-m3")
     assert reranker._model is None
+
+
+def test_local_borne_la_longueur_a_512_par_defaut():
+    assert LocalReranker("modele-test")._max_length == 512
+
+
+def test_local_transmet_la_longueur_max_du_reglage():
+    provider = get_rerank_provider(_settings(rerank_provider="local", rerank_max_length=256))
+    assert isinstance(provider, LocalReranker)
+    assert provider._max_length == 256
 
 
 def test_local_trie_du_plus_pertinent_au_moins_pertinent():
@@ -69,6 +81,17 @@ def test_local_passe_la_question_avec_chaque_morceau():
 
 def test_local_liste_vide_renvoie_liste_vide():
     assert LocalReranker("modele-test").rerank("q", []) == []
+
+
+def test_local_neutralise_la_sigmoide_interne_du_modele():
+    # Le modèle applique une sigmoïde par défaut ; LocalReranker doit demander
+    # le score brut pour ne pas l'appliquer deux fois.
+    reranker = LocalReranker("modele-test")
+    fake = _ModeleFake([0.0])
+    reranker._model = fake
+    reranker.rerank("q", ["a"])
+    assert callable(fake.activation_recue)
+    assert fake.activation_recue(3.7) == 3.7  # fonction identité
 
 
 # --- get_rerank_provider ------------------------------------------------

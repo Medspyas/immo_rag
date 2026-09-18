@@ -5,3 +5,8 @@ __pycache__/
 data/*.pdf
 .pytest_cache/
 .ruff_cache/
+
+# Outillage local (accélération GPU du reclasseur pour aller plus vite en dev/
+# évaluation) : hors périmètre du RAG, jamais commité.
+.cache/
+scripts/exporter_reclasseur_onnx.py

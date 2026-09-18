@@ -17,7 +17,8 @@ en changeant RERANK_MODEL, sans nouvelle classe.
 
 Contenu du fichier :
 - RerankProvider : contrat commun.
-- LocalReranker : modèle libre exécuté sur la machine (BGE-m3), gratuit, retenu par défaut.
+- LocalReranker : modèle libre exécuté sur la machine (BGE-m3) via
+  sentence-transformers. Retenu par défaut.
 - get_rerank_provider : sélectionne l'implémentation selon .env.
 """
 from __future__ import annotations
@@ -68,22 +69,30 @@ class LocalReranker(RerankProvider):
     instantanée et les tests n'ont pas à le charger.
     """
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, max_length: int = 512):
         self._model_name = model_name
+        self._max_length = max_length
         self._model = None
 
     def _get_model(self):
         if self._model is None:
             from sentence_transformers import CrossEncoder
 
-            self._model = CrossEncoder(self._model_name)
+            # max_length tronque chaque paire (question, morceau) : sans borne,
+            # le modèle traite les articles longs en entier et une passe CPU
+            # prend plusieurs dizaines de secondes.
+            self._model = CrossEncoder(self._model_name, max_length=self._max_length)
         return self._model
 
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
         if not documents:
             return []
         paires = [(query, texte) for texte in documents]
-        scores = self._get_model().predict(paires)
+        # Ce modèle applique une sigmoïde en interne par défaut. On la neutralise
+        # (fonction identité) pour récupérer le score brut, puis _sigmoide est
+        # appliquée une seule fois plus bas — sinon les scores se tassent tous
+        # entre 0,5 et 0,73 et le seuil du garde-fou devient illisible.
+        scores = self._get_model().predict(paires, activation_fn=lambda x: x)
         ordre = sorted(
             range(len(documents)),
             key=lambda i: scores[i],
@@ -95,5 +104,5 @@ class LocalReranker(RerankProvider):
 def get_rerank_provider(settings: Settings) -> RerankProvider:
     """Sélectionne l'implémentation selon le réglage RERANK_PROVIDER de .env."""
     if settings.rerank_provider == "local":
-        return LocalReranker(settings.rerank_model)
+        return LocalReranker(settings.rerank_model, settings.rerank_max_length)
     raise ValueError(f"Fournisseur de reclassement inconnu : {settings.rerank_provider}")

@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     # autre modèle local se choisit via rerank_model.
     rerank_provider: Literal["local"] = "local"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # Longueur maximale, en tokens, de chaque paire (question, morceau) soumise
+    # au reclasseur. bge-reranker-v2-m3 accepte jusqu'à 8192 tokens et traite
+    # sinon les articles longs en entier, ce qui rend une passe CPU très lente.
+    # 512 borne ce coût et aligne la fenêtre du reclasseur sur celle des embeddings e5.
+    rerank_max_length: int = 512
 
     # LLM du contextual retrieval, puis de la génération de réponse. Groq offre
     # un accès gratuit ; le volume d'usage doit rester dans ses limites.
