@@ -11,6 +11,7 @@ import numpy as np
 
 from eval.ablation import (
     KS,
+    _diagnostic_hors_corpus,
     evaluer_systeme,
     recherche_dense,
     recherche_hybride,
@@ -85,6 +86,32 @@ def test_recherche_hybride_renvoie_des_couples_doc_article(tmp_path):
     corpus = _corpus(tmp_path)
     sources = recherche_hybride(corpus)("carte professionnelle", 3)
     assert ("loi_b", "1") in sources
+
+
+class _RerankerFake:
+    """Garde l'ordre de la fusion et attribue un score fixe : suffit à exercer
+    le câblage du diagnostic, pas la qualité du reclassement."""
+
+    def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
+        return [(i, 0.9) for i in range(len(documents))]
+
+
+def test_diagnostic_ajoute_le_score_de_reclassement_quand_un_reranker_est_fourni(tmp_path):
+    corpus = _corpus(tmp_path)
+    cas = [
+        CasGolden(id="c1", question="préavis du locataire", categorie="x",
+                  doc_id="loi_a", articles=["1"], reponse_type="reponse"),
+        CasGolden(id="c2", question="question sans rapport", categorie="x",
+                  doc_id=None, articles=[], reponse_type="refus",
+                  hors_corpus=True),
+    ]
+
+    sans = _diagnostic_hors_corpus(corpus, cas)
+    assert "score de reclassement" not in sans
+
+    avec = _diagnostic_hors_corpus(corpus, cas, reranker=_RerankerFake())
+    assert "Meilleur score de reclassement (0–1) :" in avec
+    assert "0.900" in avec
 
 
 def test_evaluer_systeme_calcule_hit_et_mrr():

@@ -130,28 +130,55 @@ def _details(resultats: list[ResultatEval], cas: list[CasGolden]) -> str:
     return "\n".join(lignes)
 
 
-def _diagnostic_hors_corpus(corpus: CorpusMemoire, cas: list[CasGolden]) -> str:
-    """Meilleur score de sens (cosinus) pour les questions hors corpus vs dans
-    le corpus. Un écart net indiquerait qu'un seuil sur ce score pourrait servir
-    de garde-fou (refus) — piste pour l'étage 1."""
-    def meilleur_score(question: str) -> float:
+def _resume(xs: list[float]) -> str:
+    if not xs:
+        return "—"
+    return f"min {xs[0]:.3f} | médiane {xs[len(xs) // 2]:.3f} | max {xs[-1]:.3f}"
+
+
+def _diagnostic_hors_corpus(corpus: CorpusMemoire, cas: list[CasGolden], *, reranker=None) -> str:
+    """Compare, pour les questions dans le corpus vs hors corpus, le meilleur
+    score du passage n°1. Un écart net entre les deux groupes indiquerait qu'un
+    seuil sur ce score peut servir de garde-fou (refus) — l'étage 1.
+
+    Le score de sens (cosinus) est toujours affiché. Quand un reclasseur est
+    fourni, on ajoute le meilleur score de reclassement (0–1) : c'est lui que
+    le garde-fou étage 1 doit porter d'après le plan, la comparaison sert à en
+    fixer le seuil.
+    """
+    def meilleur_cosinus(question: str) -> float:
         vecteur = corpus.embeddings.embed_query(question)
         top = corpus.dense.search(vecteur, 1)
         return top[0].score if top else 0.0
 
-    dans = sorted(meilleur_score(c.question) for c in cas if not c.hors_corpus)
-    hors = sorted(meilleur_score(c.question) for c in cas if c.hors_corpus)
+    dans = sorted(meilleur_cosinus(c.question) for c in cas if not c.hors_corpus)
+    hors = sorted(meilleur_cosinus(c.question) for c in cas if c.hors_corpus)
 
-    def resume(xs: list[float]) -> str:
-        if not xs:
-            return "—"
-        return f"min {xs[0]:.3f} | médiane {xs[len(xs) // 2]:.3f} | max {xs[-1]:.3f}"
+    lignes = [
+        "Meilleur score de sens (cosinus) :",
+        f"  questions DANS le corpus  ({len(dans):>2}) : {_resume(dans)}",
+        f"  questions HORS corpus     ({len(hors):>2}) : {_resume(hors)}",
+    ]
 
-    return (
-        "Meilleur score de sens (cosinus) :\n"
-        f"  questions DANS le corpus  ({len(dans):>2}) : {resume(dans)}\n"
-        f"  questions HORS corpus     ({len(hors):>2}) : {resume(hors)}"
-    )
+    if reranker is not None:
+        retriever = HybridRetriever(
+            corpus.embeddings, corpus.dense, corpus.bm25, reranker=reranker
+        )
+
+        def meilleur_rerank(question: str) -> float:
+            top = retriever.search(question, 1)
+            return top[0].score_rerank if top and top[0].score_rerank is not None else 0.0
+
+        dans_r = sorted(meilleur_rerank(c.question) for c in cas if not c.hors_corpus)
+        hors_r = sorted(meilleur_rerank(c.question) for c in cas if c.hors_corpus)
+        lignes += [
+            "",
+            "Meilleur score de reclassement (0–1) :",
+            f"  questions DANS le corpus  ({len(dans_r):>2}) : {_resume(dans_r)}",
+            f"  questions HORS corpus     ({len(hors_r):>2}) : {_resume(hors_r)}",
+        ]
+
+    return "\n".join(lignes)
 
 
 def main() -> None:
@@ -179,13 +206,13 @@ def main() -> None:
         ("sens seul", recherche_dense(corpus)),
         ("hybride", recherche_hybride(corpus)),
     ]
+    reranker = None
     if args.rerank:
         from app.rag.reranker import get_rerank_provider
 
+        reranker = get_rerank_provider(settings)
         systemes.append(
-            ("hybride+rerank", recherche_hybride(
-                corpus, reranker=get_rerank_provider(settings)
-            ))
+            ("hybride+rerank", recherche_hybride(corpus, reranker=reranker))
         )
 
     resultats = [evaluer_systeme(nom, fn, dans_corpus) for nom, fn in systemes]
@@ -193,7 +220,7 @@ def main() -> None:
     print(f"Ablation retrieval — {len(dans_corpus)} questions du corpus\n")
     print(_tableau(resultats))
     print()
-    print(_diagnostic_hors_corpus(corpus, tous))
+    print(_diagnostic_hors_corpus(corpus, tous, reranker=reranker))
     if args.details:
         print()
         print(_details(resultats, dans_corpus))
