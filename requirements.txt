@@ -17,5 +17,10 @@ snowballstemmer
 # (BAAI/bge-reranker-v2-m3) — fournisseurs par défaut
 sentence-transformers
 
+# Garde-fou étage 2 : modèle NLI local (MoritzLaurer/mDeBERTa-v3-base-mnli-xnli)
+# — utilisé directement (pas via sentence-transformers, qui l'apporterait déjà
+# en dépendance transitive, mais sans le garantir pour toute version)
+transformers
+
 # LLM du contextual retrieval et de la génération de réponse (Groq, gratuit)
 groq

@@ -5,12 +5,18 @@ la question. Ce module demande à un modèle de langage de rédiger une réponse
 en français, structurée, fondée uniquement sur ces articles, et de citer pour
 chaque affirmation le passage exact qui la soutient.
 
-Deux garde-fous encadrent cette génération (cf. CLAUDE.md) :
-  - le modèle doit refuser si les articles ne contiennent pas de quoi répondre,
-    plutôt que de compléter avec des connaissances extérieures ;
-  - chaque passage cité est ensuite vérifié contre le texte réel de l'article
-    (verifier_citations) : une citation qu'on ne retrouve pas dans une source
-    réellement récupérée invalide la réponse, qui bascule alors en refus.
+Trois garde-fous encadrent cette génération (cf. CLAUDE.md) :
+  - étage 1 (retrieval, dans retriever.py) : hors du périmètre de ce fichier ;
+  - le modèle doit lui-même refuser si les articles ne contiennent pas de quoi
+    répondre, plutôt que de compléter avec des connaissances extérieures ;
+  - étage 2 (verifier_citations) : chaque passage cité est vérifié contre le
+    texte réel de l'article — une citation qu'on ne retrouve pas dans une
+    source réellement récupérée invalide la réponse, qui bascule en refus ;
+  - étage 2, suite (verifier_fidelite) : même une citation authentique ne
+    garantit pas que le texte rédigé par le LLM colle à ce qu'elle dit (le
+    LLM peut broder à côté). La réponse est décomposée en affirmations, et
+    chacune est confrontée aux articles cités par un modèle NLI, avec repli
+    sur un juge LLM pour les cas où le score NLI seul ne tranche pas.
 
 Contenu du fichier :
 - Citation : un passage d'article invoqué à l'appui de la réponse.
@@ -20,6 +26,8 @@ Contenu du fichier :
 - get_llm : sélectionne l'implémentation selon .env.
 - generer_reponse : construit la consigne, appelle le modèle, lit sa réponse.
 - verifier_citations : confronte chaque passage cité au texte des articles.
+- verifier_fidelite : confronte chaque affirmation de la réponse aux articles
+  cités, via un modèle NLI (garde-fou étage 2).
 """
 from __future__ import annotations
 
@@ -265,5 +273,124 @@ def verifier_citations(
             refus=True,
             motif=f"citation introuvable dans les sources : « {exemple} »",
         )
+
+    return reponse
+
+
+# --- Garde-fou étage 2 : fidélité de la réponse aux articles cités ----------
+
+# Découpe une réponse en phrases (approximation d'« affirmations atomiques") :
+# un point, un point d'exclamation ou d'interrogation suivi d'une espace.
+_SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])\s+")
+
+CONSIGNE_JUGE_FIDELITE = """Tu vérifies si une affirmation est fondée sur un texte source, dans le \
+cadre d'un assistant juridique qui ne doit rien avancer que le texte ne dise \
+vraiment.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour :
+{"fondee": true} si le texte source implique l'affirmation (dit la même chose, \
+même reformulée) ; {"fondee": false} sinon (l'affirmation va au-delà du texte, \
+le contredit, ou n'a pas de rapport avec lui)."""
+
+
+class _NLI(Protocol):
+    """Partie d'un fournisseur NLI utilisée ici : le score d'implication entre
+    un texte source et une affirmation."""
+
+    def score_implication(self, premisse: str, hypothese: str) -> float: ...
+
+
+def _decouper_en_affirmations(texte: str) -> list[str]:
+    """Découpe une réponse en affirmations, une par phrase.
+
+    Une décomposition par phrase reste une approximation d'une décomposition
+    en affirmations atomiques (une phrase peut porter plusieurs faits, cf.
+    RAGAS faithfulness) — suffisante pour un garde-fou rapide en ligne, sans
+    appel de modèle supplémentaire pour la décomposition elle-même.
+    """
+    return [p.strip() for p in _SEPARATEUR_PHRASE.split(texte) if p.strip()]
+
+
+def _contextes_cites(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> list[str]:
+    """Textes des articles cités par la réponse, à confronter aux affirmations.
+
+    Restreint aux articles réellement cités : c'est leur contenu, et non celui
+    de tous les articles récupérés, que la réponse est censée refléter. Repli
+    sur tous les articles récupérés si aucune citation ne correspond (ne
+    devrait pas arriver après verifier_citations, mais garde la fonction
+    utilisable seule).
+    """
+    cites = {(c.doc_id, str(c.article)) for c in reponse.citations}
+    contextes = [
+        r.content
+        for r in resultats
+        if (r.doc_id, str(r.metadata.get("article"))) in cites
+    ]
+    return contextes or [r.content for r in resultats]
+
+
+def _juger_fidelite(affirmation: str, contexte: str, llm: LLM) -> bool:
+    """Repli pour les cas ambigus : demande à un LLM si le texte source fonde
+    l'affirmation. Une réponse illisible est traitée comme non fondée, par
+    prudence dans un domaine réglementé."""
+    message = f"Texte source :\n{contexte}\n\nAffirmation à vérifier :\n{affirmation}"
+    brut = llm.generer(CONSIGNE_JUGE_FIDELITE, message)
+    try:
+        return bool(json.loads(brut).get("fondee", False))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False
+
+
+def verifier_fidelite(
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    nli: _NLI,
+    seuil_haut: float,
+    seuil_bas: float,
+    llm: LLM | None = None,
+) -> ReponseGeneree:
+    """Garde-fou étage 2 (suite) : la réponse rédigée colle-t-elle aux articles
+    qu'elle cite ?
+
+    Une bonne citation (vérifiée par verifier_citations) ne garantit pas que le
+    texte rédigé autour reste fidèle à ce qu'elle dit : le LLM peut broder à
+    côté même avec la bonne source sous les yeux. La réponse est découpée en
+    affirmations, chacune confrontée par un modèle NLI aux articles cités.
+
+    Pour chaque affirmation, le score d'implication (0 à 1) tranche : au-dessus
+    de seuil_haut, fondée ; en dessous de seuil_bas, non fondée, refus direct.
+    Entre les deux (score ambigu, le NLI seul ne suffit pas), llm sert de juge
+    de repli si fourni ; sans llm, un score ambigu est traité comme non fondé
+    (prudence par défaut, domaine réglementé).
+
+    Un refus est transmis tel quel. Une réponse sans texte (cas dégénéré déjà
+    exclu par ailleurs) n'a aucune affirmation à vérifier et passe telle quelle.
+    """
+    if reponse.refus:
+        return reponse
+
+    affirmations = _decouper_en_affirmations(reponse.reponse)
+    if not affirmations:
+        return reponse
+
+    contextes = _contextes_cites(reponse, resultats)
+
+    for affirmation in affirmations:
+        score = max((nli.score_implication(c, affirmation) for c in contextes), default=0.0)
+        if score >= seuil_haut:
+            continue
+        if score <= seuil_bas:
+            fondee = False
+        else:
+            fondee = llm is not None and any(
+                _juger_fidelite(affirmation, c, llm) for c in contextes
+            )
+        if not fondee:
+            return ReponseGeneree(
+                refus=True,
+                motif=f"affirmation non fondée sur les sources : « {affirmation} »",
+            )
 
     return reponse

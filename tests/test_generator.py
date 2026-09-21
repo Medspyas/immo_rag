@@ -10,6 +10,7 @@ from app.rag.generator import (
     generer_reponse,
     get_llm,
     verifier_citations,
+    verifier_fidelite,
 )
 
 
@@ -213,3 +214,122 @@ def test_reponse_sans_citation_bascule_en_refus():
 def test_un_refus_est_transmis_sans_verification():
     refus = ReponseGeneree(refus=True, motif="hors sujet")
     assert verifier_citations(refus, [_ARTICLE_15]) is refus
+
+
+# --- verifier_fidelite (garde-fou étage 2) ----------------------------------
+
+
+class _NLIFixe:
+    """Renvoie un score fixe quels que soient les textes reçus, et retient le
+    dernier couple (prémisse, hypothèse) transmis."""
+
+    def __init__(self, score: float):
+        self._score = score
+        self.dernier_appel: tuple[str, str] | None = None
+
+    def score_implication(self, premisse: str, hypothese: str) -> float:
+        self.dernier_appel = (premisse, hypothese)
+        return self._score
+
+
+class _JugeLLM:
+    """Juge de repli figé : renvoie toujours la même décision."""
+
+    def __init__(self, fondee: bool):
+        self._sortie = json.dumps({"fondee": fondee})
+        self.appele = False
+
+    def generer(self, consigne: str, question: str) -> str:
+        self.appele = True
+        return self._sortie
+
+
+def _reponse_avec_citation(texte: str, article: str = "15") -> ReponseGeneree:
+    return ReponseGeneree(
+        refus=False,
+        reponse=texte,
+        citations=[
+            Citation(doc_id="loi-89-462", article=article, passage="le délai de préavis est de trois mois")
+        ],
+    )
+
+
+def test_score_au_dessus_du_seuil_haut_est_conserve():
+    reponse = _reponse_avec_citation("Le préavis est de trois mois.")
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_bas=0.3)
+    assert verifiee.refus is False
+
+
+def test_score_sous_le_seuil_bas_bascule_en_refus_sans_juge():
+    reponse = _reponse_avec_citation("Le préavis est de six mois.")
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.05), seuil_haut=0.7, seuil_bas=0.3)
+    assert verifiee.refus is True
+    assert "non fondée" in verifiee.motif
+
+
+def test_score_ambigu_sans_juge_bascule_en_refus_par_prudence():
+    reponse = _reponse_avec_citation("Le préavis est plutôt court.")
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3)
+    assert verifiee.refus is True
+
+
+def test_score_ambigu_le_juge_llm_peut_sauver_la_reponse():
+    reponse = _reponse_avec_citation("Le préavis est plutôt court.")
+    juge = _JugeLLM(fondee=True)
+    verifiee = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, llm=juge
+    )
+    assert verifiee.refus is False
+    assert juge.appele is True
+
+
+def test_score_ambigu_le_juge_llm_peut_confirmer_le_refus():
+    reponse = _reponse_avec_citation("Le préavis est plutôt court.")
+    verifiee = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, llm=_JugeLLM(fondee=False)
+    )
+    assert verifiee.refus is True
+
+
+def test_juge_llm_nest_pas_appele_hors_zone_ambigue():
+    juge = _JugeLLM(fondee=False)
+    reponse = _reponse_avec_citation("Le préavis est de trois mois.")
+    verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_bas=0.3, llm=juge)
+    assert juge.appele is False
+
+
+class _NLISelonAffirmation:
+    """Score haut pour les affirmations reprenant le texte de l'article, bas
+    pour les autres — simule une affirmation fondée suivie d'une invention."""
+
+    def score_implication(self, premisse: str, hypothese: str) -> float:
+        return 0.95 if "trois mois" in hypothese else 0.05
+
+
+def test_une_seule_affirmation_non_fondee_suffit_a_refuser():
+    reponse = _reponse_avec_citation(
+        "Le préavis est de trois mois. Le bailleur doit aussi verser une prime."
+    )
+    verifiee = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLISelonAffirmation(), seuil_haut=0.7, seuil_bas=0.3
+    )
+    assert verifiee.refus is True
+    assert "prime" in verifiee.motif
+
+
+def test_verifie_contre_le_contenu_de_larticle_cite():
+    nli = _NLIFixe(0.95)
+    reponse = _reponse_avec_citation("Le préavis est de trois mois.")
+    verifier_fidelite(reponse, [_ARTICLE_15], nli, seuil_haut=0.7, seuil_bas=0.3)
+    assert nli.dernier_appel[0] == _ARTICLE_15.content
+
+
+def test_un_refus_est_transmis_sans_verification_de_fidelite():
+    refus = ReponseGeneree(refus=True, motif="hors sujet")
+    assert verifier_fidelite(refus, [_ARTICLE_15], _NLIFixe(0.0), seuil_haut=0.7, seuil_bas=0.3) is refus
+
+
+def test_reponse_vide_ne_leve_pas_derreur():
+    reponse = ReponseGeneree(refus=False, reponse="", citations=[])
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.0), seuil_haut=0.7, seuil_bas=0.3)
+    assert verifiee.refus is False

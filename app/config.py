@@ -43,8 +43,23 @@ class Settings(BaseSettings):
     # pour les questions hors corpus. 0.3 sépare nettement les deux groupes.
     seuil_garde_fou_retrieval: float = 0.3
 
-    # LLM du contextual retrieval, puis de la génération de réponse. Groq offre
-    # un accès gratuit ; le volume d'usage doit rester dans ses limites.
+    # Garde-fou étage 2 (cf. CLAUDE.md) : vérifie que chaque affirmation de la
+    # réponse générée est bien impliquée par le texte des articles cités,
+    # via un modèle NLI local et gratuit. Un modèle anglais-only échouerait
+    # silencieusement sur des affirmations en français.
+    nli_provider: Literal["local"] = "local"
+    nli_model: str = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+    nli_max_length: int = 512
+    # Au-dessus de seuil_nli_haut, l'affirmation est jugée fondée sans recours
+    # au LLM. En dessous de seuil_nli_bas, elle est jugée non fondée, refus
+    # direct. Entre les deux, le score du NLI seul ne permet pas de trancher :
+    # repli sur un juge LLM (cf. CLAUDE.md, "cas limites").
+    seuil_nli_haut: float = 0.7
+    seuil_nli_bas: float = 0.3
+
+    # LLM du contextual retrieval, de la génération de réponse, et du juge de
+    # repli du garde-fou étage 2. Groq offre un accès gratuit ; le volume
+    # d'usage doit rester dans ses limites.
     llm_provider: Literal["groq"] = "groq"
     llm_model: str = "openai/gpt-oss-20b"
 
