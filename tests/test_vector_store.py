@@ -1,6 +1,6 @@
-"""
-Tests d'intégration : nécessitent `docker compose up -d db` (Postgres + pgvector).
-Sautés automatiquement si la base n'est pas joignable.
+"""Tests nécessitant la base réelle (docker compose up -d db).
+
+Ignorés automatiquement si la base n'est pas joignable.
 """
 import uuid
 
@@ -63,3 +63,21 @@ def test_upsert_rejette_un_embedding_de_mauvaise_longueur():
     chunk = Chunk(id=uuid.uuid4(), doc_id="doc-x", content="texte", embedding=[0.0, 1.0], metadata={})
     with pytest.raises(ValueError):
         store.upsert([chunk])
+
+
+def test_tous_renvoie_les_morceaux_ranges_sans_leur_vecteur():
+    store = VectorStore(DSN, DIMENSION)
+    doc_id = f"doc-test-{uuid.uuid4()}"
+    chunk = Chunk(
+        id=uuid.uuid4(), doc_id=doc_id, content="préavis de trois mois",
+        embedding=_vecteur(0), metadata={"article": "15"},
+    )
+    store.upsert([chunk])
+
+    morceaux = {m.id: m for m in store.tous()}
+
+    assert morceaux[chunk.id].doc_id == doc_id
+    assert morceaux[chunk.id].content == "préavis de trois mois"
+    assert morceaux[chunk.id].metadata == {"article": "15"}
+
+    store.delete_by_doc(doc_id)

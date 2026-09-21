@@ -6,12 +6,19 @@ On vérifie l'enchaînement des étapes, pas la qualité des vecteurs.
 """
 from __future__ import annotations
 
+import json
+
+from app.config import Settings
 from app.rag.pipeline import (
+    construire_index_bm25,
+    construire_retriever,
     documents_bm25,
     identifiant_chunk,
     ingerer_document,
     preparer_morceaux,
+    repondre,
 )
+from app.rag.retriever import HybridRetriever
 from app.rag.vector_store import Chunk
 
 # Deux articles, dont un abrogé (marqueurs posés par le nettoyage en amont).
@@ -58,7 +65,7 @@ class _VectorStoreFake:
 
 
 class _ContextGeneratorFake:
-    def generer_contexte(self, document: str, chunk: str) -> str:
+    def resumer_document(self, debut_document: str) -> str:
         return "[contexte]"
 
 
@@ -140,3 +147,189 @@ def test_documents_bm25_reprend_id_contenu_et_metadonnees():
     assert [d.id for d in docs] == [m.id for m in morceaux]
     assert docs[0].metadata["article"] == "1"
     assert "préavis" in docs[0].content
+
+
+# --- construire_index_bm25 ---------------------------------------------------
+
+
+class _MorceauStockeFake:
+    def __init__(self, id, doc_id, content, metadata):
+        self.id = id
+        self.doc_id = doc_id
+        self.content = content
+        self.metadata = metadata
+
+
+class _VectorStoreLectureFake:
+    def __init__(self, morceaux):
+        self._morceaux = morceaux
+
+    def tous(self):
+        return self._morceaux
+
+
+def test_construire_index_bm25_retrouve_un_morceau_range():
+    morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
+    stockes = [_MorceauStockeFake(m.id, m.doc_id, m.content, m.metadata) for m in morceaux]
+    index = construire_index_bm25(_VectorStoreLectureFake(stockes))
+    resultats = index.search("préavis")
+    assert resultats
+    assert resultats[0].doc_id == "loi-essai"
+
+
+def test_construire_index_bm25_base_vide_ne_trouve_rien():
+    index = construire_index_bm25(_VectorStoreLectureFake([]))
+    assert index.search("préavis") == []
+
+
+# --- construire_retriever ----------------------------------------------------
+
+
+class _RechercheDenseFake:
+    def search(self, query_embedding, k):
+        return []
+
+
+class _RechercheSparseFake:
+    def search(self, query, k):
+        return []
+
+
+class _RerankerFake:
+    def rerank(self, query, documents):
+        return []
+
+
+def test_construire_retriever_transmet_le_seuil_avec_reclasseur():
+    retriever = construire_retriever(
+        _settings(seuil_garde_fou_retrieval=0.42),
+        _EmbeddingsFake(),
+        _RechercheDenseFake(),
+        _RechercheSparseFake(),
+        reranker=_RerankerFake(),
+    )
+    assert isinstance(retriever, HybridRetriever)
+    assert retriever._seuil_rerank == 0.42
+
+
+def test_construire_retriever_ignore_le_seuil_sans_reclasseur():
+    retriever = construire_retriever(
+        _settings(seuil_garde_fou_retrieval=0.42),
+        _EmbeddingsFake(),
+        _RechercheDenseFake(),
+        _RechercheSparseFake(),
+    )
+    assert retriever._seuil_rerank is None
+
+
+# --- repondre (orchestration d'une requête) ---------------------------------
+
+
+def _settings(**overrides) -> Settings:
+    base = {"database_url": "postgresql://x", "groq_api_key": "fake-key"}
+    base.update(overrides)
+    return Settings(**base)
+
+
+class _ResultatFake:
+    def __init__(self, doc_id, content, article="15"):
+        self.id = article
+        self.doc_id = doc_id
+        self.content = content
+        self.metadata = {"article": article, "abroge": False}
+
+
+class _RetrieverFake:
+    def __init__(self, resultats):
+        self._resultats = resultats
+        self.question_recue = None
+        self.k_recu = None
+
+    def search(self, question, k=10):
+        self.question_recue = question
+        self.k_recu = k
+        return self._resultats
+
+
+class _LLMFake:
+    def __init__(self, sortie: str):
+        self._sortie = sortie
+
+    def generer(self, consigne: str, question: str) -> str:
+        return self._sortie
+
+
+class _NLIToujoursFonde:
+    def score_implication(self, premisse: str, hypothese: str) -> float:
+        return 0.99
+
+
+_ARTICLE_15 = _ResultatFake(
+    "loi-89-462", "Le délai de préavis est de trois mois.", article="15"
+)
+
+_REPONSE_OK = json.dumps(
+    {
+        "refus": False,
+        "reponse": "Le délai de préavis est de trois mois.",
+        "citations": [
+            {"doc_id": "loi-89-462", "article": "15", "passage": "Le délai de préavis est de trois mois."}
+        ],
+    }
+)
+
+
+def test_repondre_enchaine_recherche_generation_et_garde_fous():
+    retriever = _RetrieverFake([_ARTICLE_15])
+    reponse = repondre(
+        "Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIToujoursFonde(), _settings()
+    )
+    assert reponse.refus is False
+    assert retriever.question_recue == "Quel préavis ?"
+
+
+def test_repondre_sans_resultat_refuse_sans_appeler_le_modele():
+    retriever = _RetrieverFake([])
+    appele = []
+    class _LLMEspion:
+        def generer(self, consigne, question):
+            appele.append(True)
+            return _REPONSE_OK
+    reponse = repondre("Quel préavis ?", retriever, _LLMEspion(), _NLIToujoursFonde(), _settings())
+    assert reponse.refus is True
+    assert appele == []
+
+
+def test_repondre_citation_inventee_bascule_en_refus():
+    retriever = _RetrieverFake([_ARTICLE_15])
+    sortie = json.dumps(
+        {
+            "refus": False,
+            "reponse": "Le préavis est de six mois.",
+            "citations": [
+                {"doc_id": "loi-89-462", "article": "15", "passage": "le délai de préavis est de six mois"}
+            ],
+        }
+    )
+    reponse = repondre("Quel préavis ?", retriever, _LLMFake(sortie), _NLIToujoursFonde(), _settings())
+    assert reponse.refus is True
+    assert "introuvable" in reponse.motif
+
+
+def test_repondre_affirmation_non_fondee_bascule_en_refus():
+    class _NLIJamaisFonde:
+        def score_implication(self, premisse, hypothese):
+            return 0.0
+
+    retriever = _RetrieverFake([_ARTICLE_15])
+    reponse = repondre(
+        "Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIJamaisFonde(), _settings()
+    )
+    assert reponse.refus is True
+    assert "non fondée" in reponse.motif
+
+
+def test_repondre_transmet_k_au_retriever():
+    retriever = _RetrieverFake([_ARTICLE_15])
+    repondre("Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIToujoursFonde(), _settings(), k=3)
+    assert retriever.k_recu == 3

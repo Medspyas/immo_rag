@@ -1,11 +1,15 @@
-"""
-Stockage et recherche des chunks dans pgvector.
+"""Rangement et recherche des morceaux par le sens (base pgvector).
 
-Analogie : pgvector ajoute à Postgres la capacité de chercher "les vecteurs les
-plus proches" d'un vecteur donné — comme chercher les adresses les plus proches
-sur une carte, mais dans l'espace des embeddings plutôt que géographique. C'est
-la moitié "dense" de la recherche hybride (l'autre moitié est bm25_index.py) ;
-les deux résultats sont ensuite combinés par fusion RRF dans retriever.py.
+L'extension pgvector ajoute à PostgreSQL la recherche des vecteurs les plus
+proches d'un vecteur donné, dans l'espace de sens produit par les embeddings.
+Ce module fournit la composante "sens" de la recherche ; la composante
+"mots-clés" est dans bm25_index.py, et retriever.py combine les deux.
+
+Contenu du fichier :
+- Chunk : un morceau prêt à être rangé (texte, vecteur, métadonnées).
+- SearchResult : un morceau retrouvé, avec son score de proximité.
+- MorceauStocke : un morceau rangé, sans son vecteur (cf. VectorStore.tous).
+- VectorStore : ajout, remplacement, suppression et recherche des morceaux.
 """
 from __future__ import annotations
 
@@ -37,25 +41,38 @@ class SearchResult(BaseModel):
     doc_id: str
     content: str
     metadata: dict
-    score: float  # similarité cosinus : 1.0 = identique, 0.0 = aucun rapport
+    score: float  # proximité de sens : 1.0 = identique, 0.0 = aucun rapport
+
+
+class MorceauStocke(BaseModel):
+    """Un morceau rangé en base, sans son vecteur : sert à reconstruire l'index
+    BM25 (bm25_index.py), qui n'a besoin que du texte."""
+
+    id: UUID
+    doc_id: str
+    content: str
+    metadata: dict
 
 
 class VectorStore:
-    def __init__(self, dsn: str, dimension: int):
+    def __init__(self, dsn: str, dimension: int, connect_timeout: int = 5):
         self._dsn = dsn
         self._dimension = dimension
+        # Sans borne, une base injoignable (port fermé, réseau filtré) bloque
+        # l'appelant plusieurs dizaines de secondes avant d'échouer : trop long
+        # pour une route web censée dégrader vite (cf. app/main.py).
+        self._connect_timeout = connect_timeout
         self._verifier_dimension()
 
     def _connect(self) -> psycopg.Connection:
-        conn = psycopg.connect(self._dsn)
+        conn = psycopg.connect(self._dsn, connect_timeout=self._connect_timeout)
         register_vector(conn)
         return conn
 
     def _verifier_dimension(self) -> None:
-        """Vérifie au démarrage que la dimension configurée (EMBEDDINGS_DIMENSION
-        dans .env) correspond bien à la colonne `embedding` déjà créée en base par
-        init.sql — évite une incohérence silencieuse entre les deux, détectée sinon
-        seulement au moment (tardif et confus) du premier insert."""
+        """Vérifie au démarrage que la dimension configurée dans .env
+        correspond à celle de la colonne en base. Un écart non détecté ici
+        n'apparaîtrait qu'au premier ajout, avec un message peu clair."""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -67,7 +84,7 @@ class VectorStore:
         if row is not None and row[0] != self._dimension:
             raise ValueError(
                 f"Dimension configurée ({self._dimension}) différente de la "
-                f"colonne 'embedding' en base ({row[0]}) — vérifie "
+                f"colonne 'embedding' en base ({row[0]}) — vérifier "
                 f"EMBEDDINGS_DIMENSION dans .env par rapport à init.sql."
             )
 
@@ -78,7 +95,7 @@ class VectorStore:
             )
 
     def upsert(self, chunks: list[Chunk]) -> None:
-        """Insère ou remplace des chunks (par id) — un chunk ré-ingéré écrase l'ancien."""
+        """Ajoute des morceaux, ou les remplace si l'identifiant existe déjà."""
         if not chunks:
             return
         for c in chunks:
@@ -101,24 +118,22 @@ class VectorStore:
             conn.commit()
 
     def delete_by_doc(self, doc_id: str) -> None:
-        """Supprime tous les chunks d'un document — nécessaire avant de ré-ingérer
-        un PDF mis à jour dont le nombre de chunks a changé (sinon les anciens
-        chunks en trop restent orphelins en base indéfiniment)."""
+        """Supprime tous les morceaux d'un document. Opération à effectuer avant
+        la réingestion d'une version à jour, faute de quoi d'anciens morceaux
+        subsistent en base."""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
             conn.commit()
 
     def search(self, query_embedding: list[float], k: int = 10) -> list[SearchResult]:
-        """kNN par similarité cosinus.
+        """Renvoie les k morceaux les plus proches du vecteur donné.
 
-        `<=>` est l'opérateur de distance cosinus de pgvector (0 = identique,
-        2 = opposé) ; on renvoie 1 - distance pour avoir un score de similarité
-        plus intuitif (1 = identique, proche de 0 = sans rapport).
+        Le score renvoyé vaut 1 - distance, plus lisible : 1 = identique,
+        0 = aucun rapport.
 
-        `::vector` est nécessaire : psycopg envoie une liste Python comme un
-        tableau Postgres générique (`double precision[]`), que `<=>` ne sait
-        pas comparer sans cast explicite (contrairement à un INSERT, où le
-        type de la colonne force la conversion implicitement).
+        La conversion `::vector` dans la requête est nécessaire : sans elle,
+        PostgreSQL reçoit une simple liste de nombres et ne peut pas la
+        comparer.
         """
         self._verifier_longueur(query_embedding)
         with self._connect() as conn, conn.cursor() as cur:
@@ -135,4 +150,18 @@ class VectorStore:
         return [
             SearchResult(id=r[0], doc_id=r[1], content=r[2], metadata=r[3], score=r[4])
             for r in rows
+        ]
+
+    def tous(self) -> list[MorceauStocke]:
+        """Renvoie tous les morceaux rangés, sans leur vecteur.
+
+        Sert à reconstruire l'index BM25 (en mémoire, cf. bm25_index.py) au
+        démarrage de l'application : la recherche par mots-clés n'a pas besoin
+        du vecteur, seulement du texte.
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, doc_id, content, metadata FROM chunks")
+            rows = cur.fetchall()
+        return [
+            MorceauStocke(id=r[0], doc_id=r[1], content=r[2], metadata=r[3]) for r in rows
         ]

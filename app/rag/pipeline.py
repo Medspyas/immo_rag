@@ -15,7 +15,13 @@ article. Sans elle, le texte brut de l'article est indexé tel quel.
 
 La recherche par mots-clés (BM25) n'est pas construite ici : son index se bâtit
 d'un bloc à partir de tous les morceaux d'un coup (bm25_index.py). documents_bm25
-en fournit la matière à partir des morceaux préparés.
+en fournit la matière à partir des morceaux préparés ; construire_index_bm25
+la fournit à partir de ce qui est déjà rangé en base (utile au démarrage de
+l'application, où l'on ne repart pas des textes bruts).
+
+Le second axe du fichier est la requête (cf. CLAUDE.md, section Flux) :
+repondre enchaîne la recherche hybride, la génération de la réponse citée, et
+les deux garde-fous (vérification des citations puis de la fidélité).
 
 Contenu du fichier :
 - RapportIngestion : bilan chiffré d'une ingestion (combien d'articles, dont
@@ -25,6 +31,11 @@ Contenu du fichier :
 - preparer_morceaux : étapes 1 à 3, sans toucher à la base.
 - ingerer_document : les quatre étapes, rangement en base compris.
 - documents_bm25 : convertit des morceaux préparés en entrées pour l'index BM25.
+- construire_index_bm25 : reconstruit l'index BM25 à partir de la base.
+- construire_retriever : assemble la recherche hybride à partir de ses
+  composants et du réglage du garde-fou étage 1.
+- repondre : orchestration complète d'une requête (recherche + génération +
+  garde-fous).
 """
 from __future__ import annotations
 
@@ -33,9 +44,17 @@ from uuid import UUID, uuid5
 
 from pydantic import BaseModel
 
-from app.rag.bm25_index import BM25Document
+from app.config import Settings
+from app.rag.bm25_index import BM25Document, BM25Index
 from app.rag.chunking import decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
+from app.rag.generator import (
+    ReponseGeneree,
+    generer_reponse,
+    verifier_citations,
+    verifier_fidelite,
+)
+from app.rag.retriever import HybridRetriever
 from app.rag.vector_store import Chunk
 
 # Espace de noms fixe pour dériver l'identifiant d'un article de façon
@@ -58,6 +77,27 @@ class _VectorStore(Protocol):
     def upsert(self, chunks: list[Chunk]) -> None: ...
 
     def delete_by_doc(self, doc_id: str) -> None: ...
+
+
+class _VectorStoreLecture(Protocol):
+    """Partie de la base vectorielle utilisée pour reconstruire l'index BM25 :
+    la lecture de tous les morceaux rangés, sans leur vecteur."""
+
+    def tous(self) -> list: ...  # list[MorceauStocke] — non importé pour rester découplé
+
+
+class _LLM(Protocol):
+    """Partie d'un fournisseur de modèle de langage utilisée ici : générer une
+    réponse brute, et jouer le juge de repli du garde-fou étage 2."""
+
+    def generer(self, consigne: str, question: str) -> str: ...
+
+
+class _NLI(Protocol):
+    """Partie d'un fournisseur NLI utilisée ici : le score d'implication entre
+    un texte source et une affirmation."""
+
+    def score_implication(self, premisse: str, hypothese: str) -> float: ...
 
 
 class RapportIngestion(BaseModel):
@@ -159,3 +199,89 @@ def documents_bm25(morceaux: list[Chunk]) -> list[BM25Document]:
         )
         for m in morceaux
     ]
+
+
+class _EmbeddingsRequete(Protocol):
+    """Partie d'un fournisseur d'embeddings utilisée par le retriever : la
+    vectorisation d'une question (distincte de embed_documents, utilisée à
+    l'ingestion — cf. embeddings.py)."""
+
+    def embed_query(self, text: str) -> list[float]: ...
+
+
+class _RechercheDense(Protocol):
+    def search(self, query_embedding: list[float], k: int) -> list: ...
+
+
+class _RechercheSparse(Protocol):
+    def search(self, query: str, k: int) -> list: ...
+
+
+class _Reranker(Protocol):
+    def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]: ...
+
+
+def construire_index_bm25(vector_store: _VectorStoreLecture) -> BM25Index:
+    """Reconstruit l'index BM25 (en mémoire) à partir de ce qui est déjà rangé
+    en base.
+
+    Utile au démarrage de l'application : contrairement à l'ingestion, où les
+    morceaux sortent de preparer_morceaux, ici on repart de la base — c'est
+    elle qui fait foi sur ce qui a été ingéré.
+    """
+    morceaux = vector_store.tous()
+    documents = [
+        BM25Document(id=m.id, doc_id=m.doc_id, content=m.content, metadata=m.metadata)
+        for m in morceaux
+    ]
+    return BM25Index(documents)
+
+
+def construire_retriever(
+    settings: Settings,
+    embeddings: _EmbeddingsRequete,
+    vector_store: _RechercheDense,
+    bm25_index: _RechercheSparse,
+    reranker: _Reranker | None = None,
+) -> HybridRetriever:
+    """Assemble la recherche hybride à partir de ses composants déjà construits
+    et du réglage du garde-fou étage 1.
+
+    Le seuil de retrieval n'a de sens qu'avec un reclasseur : lui seul produit
+    un score interprétable dans l'absolu (cf. retriever.py, en-tête). Sans
+    reclasseur, il est ignoré plutôt que transmis à tort.
+    """
+    return HybridRetriever(
+        embeddings=embeddings,
+        recherche_dense=vector_store,
+        recherche_sparse=bm25_index,
+        reranker=reranker,
+        seuil_rerank=settings.seuil_garde_fou_retrieval if reranker is not None else None,
+    )
+
+
+def repondre(
+    question: str,
+    retriever: HybridRetriever,
+    llm: _LLM,
+    nli: _NLI,
+    settings: Settings,
+    k: int = 10,
+) -> ReponseGeneree:
+    """Orchestration complète d'une requête : recherche puis génération sous
+    deux garde-fous (cf. CLAUDE.md, section garde-fou anti-hallucination).
+
+    Le garde-fou étage 1 (seuil sur le score de reclassement) agit déjà dans
+    retriever.search, avant même l'appel de ce module : ses résultats sont
+    vides si aucun morceau n'est assez fiable, ce que generer_reponse traite
+    comme un refus. Les étages suivants agissent ici, dans l'ordre :
+      1. génération de la réponse (le LLM peut lui-même refuser) ;
+      2. vérification des citations contre le texte réellement récupéré ;
+      3. vérification de la fidélité de la réponse aux articles cités (NLI).
+    """
+    resultats = retriever.search(question, k=k)
+    reponse = generer_reponse(question, resultats, llm)
+    reponse = verifier_citations(reponse, resultats)
+    return verifier_fidelite(
+        reponse, resultats, nli, settings.seuil_nli_haut, settings.seuil_nli_bas, llm=llm
+    )
