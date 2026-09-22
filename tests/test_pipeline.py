@@ -7,6 +7,7 @@ On vérifie l'enchaînement des étapes, pas la qualité des vecteurs.
 from __future__ import annotations
 
 import json
+import uuid
 
 from app.config import Settings
 from app.rag.pipeline import (
@@ -71,14 +72,13 @@ class _ContextGeneratorFake:
 
 def test_preparer_morceaux_un_par_article_hors_preambule():
     morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
-    assert len(morceaux) == 3
-    assert [m.metadata["article"] for m in morceaux] == ["1", "2", "3"]
+    assert len(morceaux) == 2
+    assert [m.metadata["article"] for m in morceaux] == ["1", "3"]
 
 
-def test_preparer_morceaux_marque_l_article_abroge():
+def test_preparer_morceaux_ecarte_l_article_abroge():
     morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
-    abroges = {m.metadata["article"]: m.metadata["abroge"] for m in morceaux}
-    assert abroges == {"1": False, "2": True, "3": False}
+    assert "2" not in [m.metadata["article"] for m in morceaux]
 
 
 def test_preparer_morceaux_identifiants_stables_entre_deux_appels():
@@ -120,7 +120,7 @@ def test_ingerer_document_supprime_avant_d_inserer():
     store = _VectorStoreFake()
     ingerer_document(TEXTE, "loi-essai", embeddings=_EmbeddingsFake(),
                      vector_store=store)
-    assert store.appels == ["delete:loi-essai", "upsert:3"]
+    assert store.appels == ["delete:loi-essai", "upsert:2"]
 
 
 def test_ingerer_document_rapport_chiffre():
@@ -128,8 +128,8 @@ def test_ingerer_document_rapport_chiffre():
     rapport = ingerer_document(TEXTE, "loi-essai", embeddings=_EmbeddingsFake(),
                                vector_store=store)
     assert rapport.doc_id == "loi-essai"
-    assert rapport.articles_indexes == 3
-    assert rapport.articles_abroges == 1
+    assert rapport.articles_indexes == 2
+    assert rapport.articles_abroges == 0
     assert rapport.contextualise is False
 
 
@@ -169,8 +169,15 @@ class _VectorStoreLectureFake:
 
 
 def test_construire_index_bm25_retrouve_un_morceau_range():
-    morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
-    stockes = [_MorceauStockeFake(m.id, m.doc_id, m.content, m.metadata) for m in morceaux]
+    # Corpus dédié (pas TEXTE) : avec seulement 2 documents dont 1 porte le
+    # terme cherché, le calcul BM25 classique (idf = log((N-n+0.5)/(n+0.5)))
+    # tombe pile sur idf = 0 pour un terme présent dans la moitié du corpus,
+    # un artefact de petit corpus qui n'a rien à voir avec ce qui est testé ici.
+    stockes = [
+        _MorceauStockeFake(uuid.uuid4(), "loi-essai", "Le préavis est de trois mois.", {"article": "1"}),
+        _MorceauStockeFake(uuid.uuid4(), "loi-essai", "Le dépôt de garantie est restitué.", {"article": "2"}),
+        _MorceauStockeFake(uuid.uuid4(), "loi-essai", "Les charges de copropriété sont réparties.", {"article": "3"}),
+    ]
     index = construire_index_bm25(_VectorStoreLectureFake(stockes))
     resultats = index.search("préavis")
     assert resultats
@@ -333,3 +340,36 @@ def test_repondre_transmet_k_au_retriever():
     retriever = _RetrieverFake([_ARTICLE_15])
     repondre("Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIToujoursFonde(), _settings(), k=3)
     assert retriever.k_recu == 3
+
+
+def test_repondre_est_tracee_quand_langfuse_est_configure(monkeypatch):
+    """repondre porte @trace (observability/tracing.py) : un appel doit ouvrir
+    un span Langfuse quand un client est disponible, sans changer son résultat."""
+    journal: list[str] = []
+
+    class _SpanFake:
+        def __enter__(self):
+            journal.append("entree")
+            return self
+
+        def __exit__(self, *exc):
+            journal.append("sortie")
+            return False
+
+        def update(self, output=None):
+            pass
+
+    class _ClientFake:
+        def start_as_current_span(self, name):
+            journal.append(f"nom:{name}")
+            return _SpanFake()
+
+    monkeypatch.setattr(
+        "app.observability.tracing._client_langfuse", lambda: _ClientFake()
+    )
+    retriever = _RetrieverFake([_ARTICLE_15])
+    reponse = repondre(
+        "Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIToujoursFonde(), _settings()
+    )
+    assert reponse.refus is False
+    assert journal == ["nom:repondre", "entree", "sortie"]

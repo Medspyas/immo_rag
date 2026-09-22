@@ -35,7 +35,7 @@ Contenu du fichier :
 - construire_retriever : assemble la recherche hybride à partir de ses
   composants et du réglage du garde-fou étage 1.
 - repondre : orchestration complète d'une requête (recherche + génération +
-  garde-fous).
+  garde-fous), tracée dans Langfuse quand configuré (observability/tracing.py).
 """
 from __future__ import annotations
 
@@ -45,6 +45,7 @@ from uuid import UUID, uuid5
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.observability.tracing import trace
 from app.rag.bm25_index import BM25Document, BM25Index
 from app.rag.chunking import decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
@@ -260,6 +261,7 @@ def construire_retriever(
     )
 
 
+@trace("repondre")
 def repondre(
     question: str,
     retriever: HybridRetriever,

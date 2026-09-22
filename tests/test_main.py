@@ -4,9 +4,15 @@ os.environ.setdefault("DATABASE_URL", "postgresql://immo:immo@localhost:5433/imm
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import app, settings
 
 client = TestClient(app)
+
+# DSN volontairement injoignable (port fermé) pour les deux tests "base
+# injoignable" ci-dessous : dépendre de l'absence de Docker sur la machine de
+# test cassait dès que la base tournait réellement (ex. pour une ingestion en
+# conditions réelles) — corrigé le 2026-09-21.
+_DSN_INJOIGNABLE = "postgresql://x:x@localhost:1/x"
 
 
 def test_health_repond_200_meme_si_la_base_est_injoignable():
@@ -15,15 +21,14 @@ def test_health_repond_200_meme_si_la_base_est_injoignable():
     assert response.json()["status"] == "ok"
 
 
-def test_ingest_renvoie_503_si_la_base_est_injoignable():
-    # Aucune base ne tourne dans cet environnement de test (cf. DATABASE_URL
-    # ci-dessus, jamais démarrée) : la route doit dégrader proprement plutôt
-    # que de faire planter le serveur.
+def test_ingest_renvoie_503_si_la_base_est_injoignable(monkeypatch):
+    monkeypatch.setattr(settings, "database_url", _DSN_INJOIGNABLE)
     response = client.post("/ingest", json={"doc_id": "loi-test", "texte": "Article 1\nTexte."})
     assert response.status_code == 503
 
 
-def test_query_renvoie_503_si_la_base_est_injoignable():
+def test_query_renvoie_503_si_la_base_est_injoignable(monkeypatch):
+    monkeypatch.setattr(settings, "database_url", _DSN_INJOIGNABLE)
     response = client.post("/query", json={"question": "Quel préavis ?"})
     assert response.status_code == 503
 

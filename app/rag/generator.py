@@ -127,6 +127,14 @@ class GroqLLM(LLM):
             ],
             temperature=0.0,
             response_format={"type": "json_object"},
+            max_tokens=1024,
+            # openai/gpt-oss-20b (modèle par défaut) raisonne avant de répondre ;
+            # ce raisonnement consomme max_tokens en priorité. Sans ce réglage,
+            # un raisonnement long épuise le budget avant d'atteindre la
+            # réponse JSON, qui arrive vide (constaté en conditions réelles,
+            # 2026-09-21, sur le juge de repli de verifier_fidelite — même
+            # cause que dans contextualizer.py, corrigée là le 2026-09-18).
+            reasoning_effort="low",
         )
         return reponse.choices[0].message.content
 

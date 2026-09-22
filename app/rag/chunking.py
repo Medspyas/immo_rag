@@ -1,18 +1,26 @@
-"""
-Découpage d'un texte de loi nettoyé (data/clean/*.txt) en chunks alignés sur
-les articles.
+"""Découpage d'un texte de loi en morceaux ("chunks").
 
-Analogie : plutôt que de découper le texte tous les 500 mots comme on
-trancherait une baguette à intervalles réguliers (une fenêtre glissante
-générique), on découpe le long des articulations naturelles du texte — un
-article de loi = un chunk. Comme découper un livre de recettes recette par
-recette plutôt que page par page : on ne coupe jamais une recette en deux.
+Un texte de loi nettoyé (data/clean/*.txt) est fourni en entrée ; une liste de
+morceaux est produite en sortie, à raison d'un morceau par article. La coupure
+suit les articles plutôt qu'un nombre de mots fixe, ce qui évite de séparer un
+article en deux. Le contenu situé avant le premier article (titre) et après le
+dernier (historique parlementaire) est écarté : il ne constitue pas une source
+citable.
 
-Le nettoyage fait par scripts/clean_legifrance_pdf.py a déjà repéré les
-articles abrogés et les a entourés de deux marqueurs (MARQUEUR_DEBUT_ABROGE /
-MARQUEUR_FIN_ABROGE). Ce module s'appuie sur ces mêmes marqueurs pour
-regrouper correctement un article abrogé avec son marqueur de début, qui se
-trouve juste avant la ligne "Article X" dans le texte.
+Le nettoyage en amont a entouré chaque article abrogé de deux marqueurs. Ce
+module s'en sert pour écarter ces morceaux : un article abrogé n'est plus le
+droit en vigueur (cf. le marqueur source lui-même, « ne pas citer comme droit
+actuel ») et ne doit pas être indexé comme une source citable. C'est aussi ce
+qui évite une collision d'identifiant : Légifrance liste parfois plusieurs
+versions successives d'un même numéro d'article (l'ancienne abrogée, puis
+l'actuelle) — sans ce filtre, les deux généreraient le même identifiant
+(doc_id + numéro, cf. pipeline.py) et l'une écraserait l'autre en base, au
+hasard de l'ordre du fichier source.
+
+Contenu du fichier :
+- RawChunk : un morceau avant traitement (texte d'un article et repères :
+  document, numéro d'article, abrogé ou non).
+- decouper_en_articles : réalise le découpage.
 """
 from __future__ import annotations
 
@@ -20,26 +28,28 @@ import re
 
 from pydantic import BaseModel, Field
 
-# Identique à DEBUT_ARTICLE dans scripts/clean_legifrance_pdf.py : "Article 1",
-# "Article L. 111-1", "Article 8-2-1", etc. Le groupe capture le numéro pour
-# pouvoir citer précisément l'article dans une réponse.
+# Détecte le début d'un article : "Article 1", "Article L. 111-1"...
+# Le numéro est capturé afin de pouvoir citer l'article dans une réponse.
 DEBUT_ARTICLE = re.compile(r"^Article\s+([\w.\s-]+?)\s*$")
 
 MARQUEUR_DEBUT_ABROGE = "=== ARTICLE ABROGÉ (n'est plus en vigueur — ne pas citer comme droit actuel) ==="
 MARQUEUR_FIN_ABROGE = "=== FIN ARTICLE ABROGÉ ==="
 
-# Un export Légifrance d'une "loi" (pas d'un code) se termine par l'historique
-# parlementaire (débats, votes) — ni un article, ni du bruit d'en-tête/pied de
-# page (donc pas retiré par clean_legifrance_pdf.py), mais pas non plus du
-# droit à citer. Ce repère marque la fin du contenu normatif du document.
-# Pas ancré en début de ligne : dans les PDF réels la mention apparaît parfois
-# au milieu d'une ligne (ex. "Loi n° 65-557, TRAVAUX PREPARATOIRES"), et sans
-# accent selon le document — d'où [ÉE] plutôt que juste "é".
+# Une loi se termine par l'historique parlementaire (débats, votes), qui ne se
+# cite pas. Ce repère marque la fin du contenu utile. La recherche n'est pas
+# ancrée en début de ligne (la mention se trouve parfois au milieu) et accepte
+# É ou E (l'accent varie selon le document).
 DEBUT_TRAVAUX_PREPARATOIRES = re.compile(r"TRAVAUX PR[ÉE]PARATOIRES", re.IGNORECASE)
 
 
 class RawChunk(BaseModel):
-    """Un chunk avant contextualisation/embedding — juste le texte d'un article."""
+    """Un morceau de texte avant traitement : le contenu d'un article.
+
+    abroge vaut toujours False ici : les articles abrogés sont écartés avant
+    la création du morceau (cf. docstring du module). Le champ reste présent
+    pour la compatibilité du schéma avec la suite du pipeline (vector_store.py,
+    generator.py), qui le lit depuis les métadonnées d'un morceau rangé.
+    """
 
     doc_id: str = Field(min_length=1)
     article: str = Field(min_length=1)
@@ -48,12 +58,10 @@ class RawChunk(BaseModel):
 
 
 def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
-    """Découpe `texte` (un fichier de data/clean/) en un RawChunk par article.
+    """Découpe un texte de loi en une liste de morceaux, un par article.
 
-    Le texte avant le premier "Article X" (titre du document, bannière...) et
-    après le dernier (travaux préparatoires) n'est pas rattaché à un article
-    précis : il ne peut pas être cité comme source d'une réponse, donc on ne
-    le garde pas comme chunk.
+    Le début (titre, bannière) et la fin (historique parlementaire) ne font
+    partie d'aucun article et sont ignorés.
     """
     lignes = texte.split("\n")
     chunks: list[RawChunk] = []
@@ -68,35 +76,28 @@ def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
         premiere_ligne = contenu_brut.splitlines()[0].strip()
         correspondance = DEBUT_ARTICLE.match(premiere_ligne)
         if correspondance is None:
-            # Pas un article (préambule avant le premier "Article X", ou
-            # travaux préparatoires après le dernier) : pas de source citable.
+            # Ni un article (préambule ou historique) : aucun morceau n'est créé.
             return
-        abroge = MARQUEUR_FIN_ABROGE in contenu_brut
-        contenu = (
-            contenu_brut.replace(MARQUEUR_DEBUT_ABROGE, "")
-            .replace(MARQUEUR_FIN_ABROGE, "")
-            .strip()
-        )
+        if MARQUEUR_FIN_ABROGE in contenu_brut:
+            # Article abrogé : écarté, pas indexé (cf. docstring du module).
+            return
         chunks.append(
             RawChunk(
                 doc_id=doc_id,
                 article=correspondance.group(1).strip(),
-                content=contenu,
-                abroge=abroge,
+                content=contenu_brut,
             )
         )
 
     for ligne in lignes:
         ligne_nettoyee = ligne.strip()
         if ligne_nettoyee == MARQUEUR_DEBUT_ABROGE:
-            # Précède "Article X" dans le texte nettoyé : clôt le bloc en
-            # cours (l'article précédent), le marqueur ouvre le suivant.
+            # Ce marqueur précède un article : le bloc précédent est clôturé.
             cloturer_bloc()
             bloc = [ligne]
         elif ligne_nettoyee == MARQUEUR_FIN_ABROGE:
-            # Clôt tout de suite l'article abrogé, sans attendre le prochain
-            # "Article X" — sinon bloc[0] resterait le marqueur de DÉBUT même
-            # une fois rendu à l'article suivant, qui n'est pourtant pas abrogé.
+            # L'article abrogé est clôturé immédiatement. Attendre l'article
+            # suivant lui appliquerait à tort l'étiquette "abrogé".
             bloc.append(ligne)
             cloturer_bloc()
             bloc = []
