@@ -16,6 +16,7 @@ base-mnli-xnli par défaut), pas un modèle anglais uniquement — celui-ci
 section garde-fou).
 
 Contenu du fichier :
+- ScoreNLI : scores d'implication et de contradiction d'un couple.
 - NLIProvider : contrat commun.
 - LocalNLI : modèle libre exécuté sur la machine, retenu par défaut.
 - get_nli_provider : sélectionne l'implémentation selon .env.
@@ -23,38 +24,52 @@ Contenu du fichier :
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from app.config import Settings
 
 
-def _trouver_indice_entailment(id2label: dict) -> int:
-    """Retrouve l'indice de la classe "entailment" dans la configuration d'un
-    modèle NLI.
+def _trouver_indice(id2label: dict, prefixe: str) -> int:
+    """Retrouve l'indice d'une classe ("entailment", "contradiction") dans la
+    configuration d'un modèle NLI, d'après le début de son étiquette.
 
     L'ordre des classes (entailment/neutral/contradiction) dépend du modèle :
     mieux vaut le lire dans sa configuration que le figer en dur, ce qui
     casserait silencieusement avec un autre modèle NLI.
     """
     for indice, etiquette in id2label.items():
-        if str(etiquette).lower().startswith("entail"):
+        if str(etiquette).lower().startswith(prefixe):
             return int(indice)
     raise ValueError(
-        'Aucune étiquette « entailment » trouvée dans la configuration du modèle.'
+        f"Aucune étiquette « {prefixe}… » trouvée dans la configuration du modèle."
     )
+
+
+@dataclass(frozen=True)
+class ScoreNLI:
+    """Probabilités (0 à 1) qu'un texte source implique une affirmation, ou
+    la contredise.
+
+    Les deux sont utiles au garde-fou : un extrait court peut sembler
+    impliquer une affirmation fausse par simple proximité des mots, alors
+    qu'un autre extrait du même article la contredit nettement.
+    """
+
+    implication: float
+    contradiction: float
 
 
 class NLIProvider(ABC):
     """Contrat commun à tous les fournisseurs de vérification NLI."""
 
     @abstractmethod
-    def score_implication(self, premisse: str, hypothese: str) -> float:
-        """Probabilité (0 à 1) que hypothese soit impliquée par premisse.
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]:
+        """Scores de chaque prémisse face à une même hypothèse, dans l'ordre.
 
-        premisse est le texte source (l'article cité), hypothese l'affirmation
-        générée à vérifier. Une valeur proche de 1 signifie que le texte source
-        fonde bien l'affirmation ; proche de 0, qu'il ne la fonde pas
-        (contradiction ou absence de rapport — les deux comptent comme un
-        défaut de fondement pour le garde-fou).
+        Les prémisses sont des extraits du texte source (l'article cité),
+        l'hypothèse l'affirmation générée à vérifier. Traiter les extraits
+        ensemble permet un seul passage du modèle (un lot) au lieu d'un
+        passage par extrait.
         """
 
 
@@ -77,32 +92,51 @@ class LocalNLI(NLIProvider):
         self._tokenizer = None
         self._model = None
         self._indice_entailment: int | None = None
+        self._indice_contradiction: int | None = None
 
     def _charger(self) -> None:
         if self._model is not None:
             return
+        import torch
         from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         self._tokenizer = AutoTokenizer.from_pretrained(self._model_name)
-        self._model = AutoModelForSequenceClassification.from_pretrained(self._model_name)
+        # float32 imposé : sans précision explicite, transformers reprend celle
+        # enregistrée avec le modèle (float16 pour mDeBERTa), un format sans
+        # accélération sur processeur — environ 12 fois plus lent, mesuré.
+        self._model = AutoModelForSequenceClassification.from_pretrained(
+            self._model_name, dtype=torch.float32
+        )
         self._model.eval()
-        self._indice_entailment = _trouver_indice_entailment(self._model.config.id2label)
+        etiquettes = self._model.config.id2label
+        self._indice_entailment = _trouver_indice(etiquettes, "entail")
+        self._indice_contradiction = _trouver_indice(etiquettes, "contradict")
 
-    def score_implication(self, premisse: str, hypothese: str) -> float:
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]:
         import torch
 
+        if not premisses:
+            return []
         self._charger()
+        # truncation="only_first" : si un couple dépasse la limite, seule la
+        # prémisse est raccourcie, jamais l'affirmation à vérifier.
         entrees = self._tokenizer(
-            premisse,
-            hypothese,
+            premisses,
+            [hypothese] * len(premisses),
             return_tensors="pt",
-            truncation=True,
+            padding=True,
+            truncation="only_first",
             max_length=self._max_length,
         )
         with torch.no_grad():
-            logits = self._model(**entrees).logits[0]
-        probabilites = torch.softmax(logits, dim=-1)
-        return float(probabilites[self._indice_entailment])
+            probabilites = torch.softmax(self._model(**entrees).logits, dim=-1)
+        return [
+            ScoreNLI(
+                implication=float(ligne[self._indice_entailment]),
+                contradiction=float(ligne[self._indice_contradiction]),
+            )
+            for ligne in probabilites
+        ]
 
 
 def get_nli_provider(settings: Settings) -> NLIProvider:

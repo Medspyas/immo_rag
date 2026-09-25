@@ -56,6 +56,10 @@ class Settings(BaseSettings):
     # repli sur un juge LLM (cf. CLAUDE.md, "cas limites").
     seuil_nli_haut: float = 0.7
     seuil_nli_bas: float = 0.3
+    # Même au-dessus de seuil_nli_haut, une affirmation qu'un extrait de
+    # l'article contredit au-delà de ce seuil passe au juge LLM : signaux
+    # opposés, le NLI seul ne tranche pas (cf. generator.verifier_fidelite).
+    seuil_nli_contradiction: float = 0.7
 
     # LLM du contextual retrieval, de la génération de réponse, et du juge de
     # repli du garde-fou étage 2. Groq offre un accès gratuit ; le volume

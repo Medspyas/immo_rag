@@ -55,6 +55,7 @@ from app.rag.generator import (
     verifier_citations,
     verifier_fidelite,
 )
+from app.rag.nli import ScoreNLI
 from app.rag.retriever import HybridRetriever
 from app.rag.vector_store import Chunk
 
@@ -95,10 +96,10 @@ class _LLM(Protocol):
 
 
 class _NLI(Protocol):
-    """Partie d'un fournisseur NLI utilisée ici : le score d'implication entre
-    un texte source et une affirmation."""
+    """Partie d'un fournisseur NLI utilisée ici : les scores d'implication et
+    de contradiction d'extraits de texte source face à une affirmation."""
 
-    def score_implication(self, premisse: str, hypothese: str) -> float: ...
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]: ...
 
 
 class RapportIngestion(BaseModel):
@@ -285,5 +286,11 @@ def repondre(
     reponse = generer_reponse(question, resultats, llm)
     reponse = verifier_citations(reponse, resultats)
     return verifier_fidelite(
-        reponse, resultats, nli, settings.seuil_nli_haut, settings.seuil_nli_bas, llm=llm
+        reponse,
+        resultats,
+        nli,
+        settings.seuil_nli_haut,
+        settings.seuil_nli_bas,
+        settings.seuil_nli_contradiction,
+        llm=llm,
     )

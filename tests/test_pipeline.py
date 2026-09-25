@@ -10,6 +10,7 @@ import json
 import uuid
 
 from app.config import Settings
+from app.rag.nli import ScoreNLI
 from app.rag.pipeline import (
     construire_index_bm25,
     construire_retriever,
@@ -267,8 +268,8 @@ class _LLMFake:
 
 
 class _NLIToujoursFonde:
-    def score_implication(self, premisse: str, hypothese: str) -> float:
-        return 0.99
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]:
+        return [ScoreNLI(implication=0.99, contradiction=0.0) for _ in premisses]
 
 
 _ARTICLE_15 = _ResultatFake(
@@ -325,8 +326,8 @@ def test_repondre_citation_inventee_bascule_en_refus():
 
 def test_repondre_affirmation_non_fondee_bascule_en_refus():
     class _NLIJamaisFonde:
-        def score_implication(self, premisse, hypothese):
-            return 0.0
+        def evaluer(self, premisses, hypothese):
+            return [ScoreNLI(implication=0.0, contradiction=0.0) for _ in premisses]
 
     retriever = _RetrieverFake([_ARTICLE_15])
     reponse = repondre(

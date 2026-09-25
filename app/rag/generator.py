@@ -41,6 +41,8 @@ from typing import Protocol
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings
+from app.rag.bm25_index import tokeniser_fr
+from app.rag.nli import ScoreNLI
 
 CONSIGNE = """Tu es un assistant documentaire pour des professionnels de l'immobilier \
 (agents, gestionnaires, syndics). Tu réponds à des questions de réglementation.
@@ -101,6 +103,11 @@ class _ResultatRecherche(Protocol):
     metadata: dict
 
 
+# Nombre de nouvelles tentatives du client Groq sur erreur temporaire (limite
+# de débit 429, surcharge 5xx). Partagé avec contextualizer.py.
+GROQ_MAX_ESSAIS = 6
+
+
 class LLM(ABC):
     """Contrat commun aux fournisseurs de modèle de langage."""
 
@@ -115,7 +122,11 @@ class GroqLLM(LLM):
     def __init__(self, api_key: str, model: str):
         from groq import Groq
 
-        self._client = Groq(api_key=api_key)
+        # Le forfait gratuit Groq plafonne les tokens par minute : deux appels
+        # rapprochés (rédaction puis juge de repli) peuvent le dépasser
+        # (429, constaté le 2026-09-24). Le client réessaie alors après
+        # l'attente indiquée par Groq ; 2 essais par défaut ne suffisaient pas.
+        self._client = Groq(api_key=api_key, max_retries=GROQ_MAX_ESSAIS)
         self._model = model
 
     def generer(self, consigne: str, question: str) -> str:
@@ -148,15 +159,37 @@ def get_llm(settings: Settings) -> LLM:
     raise ValueError(f"Fournisseur LLM inconnu : {settings.llm_provider}")
 
 
+# Budget de caractères pour le bloc d'articles envoyé au LLM. Le forfait
+# gratuit Groq plafonne openai/gpt-oss-20b à 8000 tokens/minute — une seule
+# requête dépassant déjà ce plafond échoue, peu importe le débit accumulé.
+# Constaté en conditions réelles (2026-09-22, eval/run_eval.py) : k=10
+# articles complets peut demander plus de 10 000 tokens pour une seule
+# question (10120 tokens demandés pour ~39 000 caractères de consigne +
+# message, soit environ 4,3 caractères par token). Le budget laisse la place
+# à la consigne, à la question et à max_tokens=1024 de réponse, avec marge.
+LONGUEUR_MAX_CONTEXTE_CARACTERES = 24_000
+
+
 def _bloc_articles(resultats: list[_ResultatRecherche]) -> str:
-    """Met en forme les articles récupérés pour la consigne."""
+    """Met en forme les articles récupérés pour la consigne.
+
+    Les articles arrivent déjà triés par pertinence (retriever.py) : au-delà
+    du budget de caractères, les suivants sont simplement omis plutôt que
+    tronqués au milieu — une troncature casserait la vérification des
+    citations, faite contre le texte complet de l'article dans `resultats`.
+    Le premier article est toujours inclus, même s'il dépasse le budget à
+    lui seul (cas limite non rencontré dans le corpus actuel).
+    """
     blocs: list[str] = []
+    longueur = 0
     for i, r in enumerate(resultats, start=1):
         article = r.metadata.get("article", "?")
         marque = " — ABROGÉ" if r.metadata.get("abroge") else ""
-        blocs.append(
-            f"[{i}] Document : {r.doc_id} — Article {article}{marque}\n{r.content}"
-        )
+        bloc = f"[{i}] Document : {r.doc_id} — Article {article}{marque}\n{r.content}"
+        if blocs and longueur + len(bloc) > LONGUEUR_MAX_CONTEXTE_CARACTERES:
+            break
+        blocs.append(bloc)
+        longueur += len(bloc)
     return "\n\n".join(blocs)
 
 
@@ -287,9 +320,27 @@ def verifier_citations(
 
 # --- Garde-fou étage 2 : fidélité de la réponse aux articles cités ----------
 
-# Découpe une réponse en phrases (approximation d'« affirmations atomiques") :
-# un point, un point d'exclamation ou d'interrogation suivi d'une espace.
+# Découpe une ligne de réponse en phrases : un point, un point d'exclamation ou
+# d'interrogation suivi d'une espace.
 _SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])\s+")
+# Début d'un élément de liste : « 1. », « 2) », « - », « • », « * ».
+_PUCE = re.compile(r"^\s*(?:\d+[.)]|[-•*])\s+")
+# « Oui, » / « Non. » en tête de réponse : une réaction à la question, pas une
+# affirmation que le texte source pourrait impliquer.
+_OUI_NON = re.compile(r"^(?:oui|non)\s*[,.:]\s*", re.IGNORECASE)
+# Découpe d'un article en phrases : ponctuation forte, point-virgule ou
+# deux-points (qui séparent les éléments d'une énumération légale).
+_SEPARATEUR_PHRASE_SOURCE = re.compile(r"(?<=[.!?;:])\s+")
+
+# Un extrait regroupe quelques phrases consécutives de l'article : assez pour
+# garder le contexte immédiat d'une phrase, assez court pour le modèle NLI,
+# entraîné sur des prémisses de la taille d'une phrase (un article entier lui
+# fait rejeter même des paraphrases quasi littérales — mesuré le 2026-09-24).
+_PHRASES_PAR_EXTRAIT = 3
+# Nombre d'extraits soumis au NLI pour chaque affirmation, retenus parmi ceux
+# qui partagent le plus de mots avec elle : évite de passer tout l'article au
+# modèle, ce qui coûterait un passage NLI par extrait.
+_EXTRAITS_PAR_AFFIRMATION = 8
 
 CONSIGNE_JUGE_FIDELITE = """Tu vérifies si une affirmation est fondée sur un texte source, dans le \
 cadre d'un assistant juridique qui ne doit rien avancer que le texte ne dise \
@@ -302,21 +353,79 @@ le contredit, ou n'a pas de rapport avec lui)."""
 
 
 class _NLI(Protocol):
-    """Partie d'un fournisseur NLI utilisée ici : le score d'implication entre
-    un texte source et une affirmation."""
+    """Partie d'un fournisseur NLI utilisée ici : les scores d'implication et
+    de contradiction d'extraits de texte source face à une affirmation."""
 
-    def score_implication(self, premisse: str, hypothese: str) -> float: ...
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]: ...
 
 
 def _decouper_en_affirmations(texte: str) -> list[str]:
-    """Découpe une réponse en affirmations, une par phrase.
+    """Découpe une réponse en affirmations, une par phrase ou par élément de
+    liste.
 
     Une décomposition par phrase reste une approximation d'une décomposition
     en affirmations atomiques (une phrase peut porter plusieurs faits, cf.
     RAGAS faithfulness) — suffisante pour un garde-fou rapide en ligne, sans
     appel de modèle supplémentaire pour la décomposition elle-même.
+
+    Les listes demandent un traitement à part : « Les missions du syndic
+    sont : » n'affirme rien seule, et « Conserver l'immeuble » n'a pas de
+    sujet. Chaque élément de liste est donc rattaché à la phrase qui
+    l'introduit (celle qui se termine par « : »), pour former une affirmation
+    complète que le NLI peut vérifier.
     """
-    return [p.strip() for p in _SEPARATEUR_PHRASE.split(texte) if p.strip()]
+    affirmations: list[str] = []
+    introduction: str | None = None
+    for ligne in texte.splitlines():
+        if not ligne.strip():
+            continue
+        if _PUCE.match(ligne):
+            element = _PUCE.sub("", ligne).strip()
+            affirmations.append(f"{introduction} {element}" if introduction else element)
+            continue
+        for phrase in _SEPARATEUR_PHRASE.split(ligne.strip()):
+            phrase = phrase.strip()
+            if not phrase:
+                continue
+            if phrase.endswith(":"):
+                introduction = phrase[:-1].strip()
+                continue
+            introduction = None
+            affirmations.append(phrase)
+    affirmations = [_OUI_NON.sub("", a).strip() for a in affirmations]
+    return [a for a in affirmations if a]
+
+
+def _extraits(contextes: list[str]) -> list[str]:
+    """Découpe les articles en extraits de quelques phrases consécutives, qui
+    se chevauchent (fenêtre glissante d'une phrase) pour qu'aucune phrase ne
+    soit séparée de ses voisines immédiates."""
+    extraits: list[str] = []
+    for contexte in contextes:
+        phrases = [
+            p.strip()
+            for ligne in contexte.splitlines()
+            for p in _SEPARATEUR_PHRASE_SOURCE.split(ligne)
+            if p.strip()
+        ]
+        n = _PHRASES_PAR_EXTRAIT
+        if len(phrases) <= n:
+            extraits.append(" ".join(phrases))
+        else:
+            extraits.extend(" ".join(phrases[i : i + n]) for i in range(len(phrases) - n + 1))
+    return [e for e in extraits if e]
+
+
+def _preselectionner(extraits: list[str], affirmation: str) -> list[str]:
+    """Extraits partageant le plus de mots avec l'affirmation (même
+    tokenisation française que l'index BM25 : accents, racines, mots vides).
+
+    Un tri rapide qui ne coûte aucun passage de modèle : sur un article de
+    150 extraits, seuls les plus proches sont confiés au NLI."""
+    mots = set(tokeniser_fr(affirmation))
+    return sorted(extraits, key=lambda e: -len(mots & set(tokeniser_fr(e))))[
+        :_EXTRAITS_PAR_AFFIRMATION
+    ]
 
 
 def _contextes_cites(
@@ -357,6 +466,7 @@ def verifier_fidelite(
     nli: _NLI,
     seuil_haut: float,
     seuil_bas: float,
+    seuil_contradiction: float,
     llm: LLM | None = None,
 ) -> ReponseGeneree:
     """Garde-fou étage 2 (suite) : la réponse rédigée colle-t-elle aux articles
@@ -365,13 +475,22 @@ def verifier_fidelite(
     Une bonne citation (vérifiée par verifier_citations) ne garantit pas que le
     texte rédigé autour reste fidèle à ce qu'elle dit : le LLM peut broder à
     côté même avec la bonne source sous les yeux. La réponse est découpée en
-    affirmations, chacune confrontée par un modèle NLI aux articles cités.
+    affirmations, chacune confrontée par un modèle NLI aux extraits les plus
+    proches des articles cités.
 
-    Pour chaque affirmation, le score d'implication (0 à 1) tranche : au-dessus
-    de seuil_haut, fondée ; en dessous de seuil_bas, non fondée, refus direct.
-    Entre les deux (score ambigu, le NLI seul ne suffit pas), llm sert de juge
-    de repli si fourni ; sans llm, un score ambigu est traité comme non fondé
-    (prudence par défaut, domaine réglementé).
+    Pour chaque affirmation, on retient le meilleur score d'implication et le
+    plus fort score de contradiction parmi ces extraits :
+    - implication au-dessus de seuil_haut ET aucune contradiction au-dessus de
+      seuil_contradiction : fondée ;
+    - implication en dessous de seuil_bas : non fondée, refus direct ;
+    - sinon (score ambigu, ou signaux opposés) : le NLI seul ne suffit pas,
+      llm sert de juge de repli sur les articles entiers s'il est fourni ;
+      sans llm, traité comme non fondé (prudence, domaine réglementé).
+
+    Le contrôle de contradiction protège d'un piège des extraits courts : un
+    extrait qui partage les mots de l'affirmation (« dépôt de garantie »,
+    « deux mois ») peut sembler l'impliquer alors qu'un autre extrait du même
+    article la contredit (« un mois » et non « deux mois »).
 
     Un refus est transmis tel quel. Une réponse sans texte (cas dégénéré déjà
     exclu par ailleurs) n'a aucune affirmation à vérifier et passe telle quelle.
@@ -384,12 +503,15 @@ def verifier_fidelite(
         return reponse
 
     contextes = _contextes_cites(reponse, resultats)
+    extraits = _extraits(contextes)
 
     for affirmation in affirmations:
-        score = max((nli.score_implication(c, affirmation) for c in contextes), default=0.0)
-        if score >= seuil_haut:
+        scores = nli.evaluer(_preselectionner(extraits, affirmation), affirmation)
+        implication = max((s.implication for s in scores), default=0.0)
+        contradiction = max((s.contradiction for s in scores), default=0.0)
+        if implication >= seuil_haut and contradiction < seuil_contradiction:
             continue
-        if score <= seuil_bas:
+        if implication <= seuil_bas:
             fondee = False
         else:
             fondee = llm is not None and any(

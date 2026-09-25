@@ -1,0 +1,15 @@
+# Dépendances de la mesure faithfulness indépendante (score_faithfulness.py),
+# à installer dans un venv séparé de celui de l'app (.venv-eval, cf. CLAUDE.md
+# section Commandes) — jamais dans requirements.txt ni dans l'image Docker.
+#
+# Pourquoi séparé : deepeval entraîne des dépendances (client OpenAI, etc.)
+# sans rapport avec le produit. RAGAS a été essayé en premier mais écarté :
+# son wrapper Groq (langchain-groq) exige groq<1.0.0, ce qui rétrograde
+# silencieusement le client Groq utilisé par app/rag/generator.py si installé
+# dans le même environnement — et même isolé, l'import de ragas échouait
+# (langchain_community.chat_models.vertexai manquant, bug d'empaquetage).
+# deepeval n'a pas ce problème : pas de dépendance forcée à langchain/groq,
+# le juge LLM se branche via une petite classe custom (GroqDeepEvalLLM).
+deepeval
+groq
+python-dotenv

@@ -35,6 +35,7 @@ from abc import ABC, abstractmethod
 
 from app.config import Settings
 from app.rag.chunking import RawChunk
+from app.rag.generator import GROQ_MAX_ESSAIS
 
 # Longueur, en caractères, du début de document transmis pour le résumé
 # (~1/4 de ce nombre en tokens). Choisie pour rester largement sous la limite
@@ -64,7 +65,8 @@ class GroqContextGenerator(ContextGenerator):
     def __init__(self, api_key: str, model: str):
         from groq import Groq
 
-        self._client = Groq(api_key=api_key)
+        # Même plafond de tokens par minute que pour la génération.
+        self._client = Groq(api_key=api_key, max_retries=GROQ_MAX_ESSAIS)
         self._model = model
 
     def resumer_document(self, debut_document: str) -> str:

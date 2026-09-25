@@ -18,6 +18,9 @@ Systèmes comparés :
 Lancement :
     python -m eval.ablation                 # sens seul vs hybride
     python -m eval.ablation --rerank         # ajoute le reclasseur
+    python -m eval.ablation --contexte       # situe chaque article dans son
+                                              # document avant l'embedding
+                                              # (contextual retrieval, Groq)
     python -m eval.ablation --threads 2      # limite l'usage CPU
 
 Le premier lancement calcule les embeddings du corpus (~1-2 min, un pic CPU
@@ -184,6 +187,9 @@ def _diagnostic_hors_corpus(corpus: CorpusMemoire, cas: list[CasGolden], *, rera
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rerank", action="store_true", help="ajoute le reclasseur BGE-m3")
+    parser.add_argument(
+        "--contexte", action="store_true", help="active le contextual retrieval (Groq)"
+    )
     parser.add_argument("--threads", type=int, default=4, help="cœurs CPU max (défaut 4)")
     parser.add_argument("--details", action="store_true", help="rang par question")
     args = parser.parse_args()
@@ -195,9 +201,15 @@ def main() -> None:
     settings = Settings()
     embeddings = get_embedding_provider(settings)
 
+    contextualizer = None
+    if args.contexte:
+        from app.rag.contextualizer import get_context_generator
+
+        contextualizer = get_context_generator(settings)
+
     print("Préparation du corpus en mémoire…")
-    corpus = construire_corpus(embeddings)
-    print(f"{len(corpus.chunks)} articles indexés.\n")
+    corpus = construire_corpus(embeddings, contextualizer=contextualizer)
+    print(f"{len(corpus.chunks)} articles indexés" + (" (contextualisés).\n" if args.contexte else ".\n"))
 
     tous = charger_golden()
     dans_corpus = [c for c in tous if not c.hors_corpus]

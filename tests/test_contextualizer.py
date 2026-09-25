@@ -36,6 +36,13 @@ def test_groq_est_le_fournisseur_par_defaut():
     assert isinstance(provider, GroqContextGenerator)
 
 
+def test_client_groq_reessaie_sur_limite_de_debit():
+    from app.rag.generator import GROQ_MAX_ESSAIS
+
+    provider = get_context_generator(_settings())
+    assert provider._client.max_retries == GROQ_MAX_ESSAIS
+
+
 def test_groq_sans_cle_api_leve_une_erreur():
     with pytest.raises(ValueError):
         get_context_generator(_settings(groq_api_key=None))

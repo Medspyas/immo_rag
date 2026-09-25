@@ -76,6 +76,25 @@ def test_construire_corpus_decoupe_tous_les_articles(tmp_path):
     }
 
 
+class _ContextualizerFake:
+    """Résumé fixe, pour vérifier le câblage sans appeler Groq."""
+
+    def resumer_document(self, debut_document: str) -> str:
+        return "Résumé de test."
+
+
+def test_construire_corpus_avec_contextualizer_prefixe_chaque_article(tmp_path):
+    (tmp_path / "loi_a.txt").write_text(LOI_A, encoding="utf-8")
+    corpus = construire_corpus(
+        _EmbeddingsFake(),
+        fichiers=["loi_a.txt"],
+        dossier=tmp_path,
+        cache_dir=tmp_path / "cache",
+        contextualizer=_ContextualizerFake(),
+    )
+    assert all(c.content.startswith("Résumé de test.") for c in corpus.chunks)
+
+
 def test_recherche_dense_remonte_l_article_sur_le_bon_sujet(tmp_path):
     corpus = _corpus(tmp_path)
     sources = recherche_dense(corpus)("préavis de départ du locataire", 3)

@@ -4,14 +4,19 @@ import pytest
 
 from app.config import Settings
 from app.rag.generator import (
+    GROQ_MAX_ESSAIS,
     Citation,
     GroqLLM,
     ReponseGeneree,
+    _decouper_en_affirmations,
+    _extraits,
+    _preselectionner,
     generer_reponse,
     get_llm,
     verifier_citations,
     verifier_fidelite,
 )
+from app.rag.nli import ScoreNLI
 
 
 def _settings(**overrides) -> Settings:
@@ -59,6 +64,11 @@ _REPONSE_OK = json.dumps(
 
 def test_groq_est_le_fournisseur_par_defaut():
     assert isinstance(get_llm(_settings()), GroqLLM)
+
+
+def test_client_groq_reessaie_sur_limite_de_debit():
+    llm = get_llm(_settings())
+    assert llm._client.max_retries == GROQ_MAX_ESSAIS
 
 
 def test_groq_sans_cle_api_leve_une_erreur():
@@ -134,6 +144,26 @@ def test_un_article_abroge_est_signale_au_modele():
         llm,
     )
     assert "ABROGÉ" in llm.question_recue
+
+
+def test_le_bloc_darticles_sarrete_avant_de_depasser_le_budget():
+    # Chaque article fait ~10 000 caractères : le 3e ferait dépasser le
+    # budget de 24 000 (2 x ~10 030 = 20 060, + un 3e = 30 090) et doit donc
+    # être omis, sans tronquer le 1er ni le 2e.
+    llm = _LLMFake(_REPONSE_OK)
+    articles = [_Resultat(f"doc-{i}", "x" * 10_000, article=str(i)) for i in range(1, 5)]
+    generer_reponse("Question ?", articles, llm)
+    assert "Article 1" in llm.question_recue
+    assert "Article 2" in llm.question_recue
+    assert "Article 3" not in llm.question_recue
+    assert "Article 4" not in llm.question_recue
+
+
+def test_le_premier_article_est_toujours_inclus_meme_hors_budget():
+    llm = _LLMFake(_REPONSE_OK)
+    articles = [_Resultat("loi-x", "x" * 30_000, article="1")]
+    generer_reponse("Question ?", articles, llm)
+    assert "Article 1" in llm.question_recue
 
 
 def test_reponse_generee_valeurs_par_defaut():
@@ -220,16 +250,16 @@ def test_un_refus_est_transmis_sans_verification():
 
 
 class _NLIFixe:
-    """Renvoie un score fixe quels que soient les textes reçus, et retient le
-    dernier couple (prémisse, hypothèse) transmis."""
+    """Renvoie des scores fixes quels que soient les textes reçus, et retient
+    le dernier appel (prémisses, hypothèse) transmis."""
 
-    def __init__(self, score: float):
-        self._score = score
-        self.dernier_appel: tuple[str, str] | None = None
+    def __init__(self, implication: float, contradiction: float = 0.0):
+        self._score = ScoreNLI(implication=implication, contradiction=contradiction)
+        self.dernier_appel: tuple[list[str], str] | None = None
 
-    def score_implication(self, premisse: str, hypothese: str) -> float:
-        self.dernier_appel = (premisse, hypothese)
-        return self._score
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]:
+        self.dernier_appel = (premisses, hypothese)
+        return [self._score for _ in premisses]
 
 
 class _JugeLLM:
@@ -256,20 +286,20 @@ def _reponse_avec_citation(texte: str, article: str = "15") -> ReponseGeneree:
 
 def test_score_au_dessus_du_seuil_haut_est_conserve():
     reponse = _reponse_avec_citation("Le préavis est de trois mois.")
-    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_bas=0.3)
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7)
     assert verifiee.refus is False
 
 
 def test_score_sous_le_seuil_bas_bascule_en_refus_sans_juge():
     reponse = _reponse_avec_citation("Le préavis est de six mois.")
-    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.05), seuil_haut=0.7, seuil_bas=0.3)
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.05), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7)
     assert verifiee.refus is True
     assert "non fondée" in verifiee.motif
 
 
 def test_score_ambigu_sans_juge_bascule_en_refus_par_prudence():
     reponse = _reponse_avec_citation("Le préavis est plutôt court.")
-    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3)
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7)
     assert verifiee.refus is True
 
 
@@ -277,7 +307,7 @@ def test_score_ambigu_le_juge_llm_peut_sauver_la_reponse():
     reponse = _reponse_avec_citation("Le préavis est plutôt court.")
     juge = _JugeLLM(fondee=True)
     verifiee = verifier_fidelite(
-        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, llm=juge
+        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7, llm=juge
     )
     assert verifiee.refus is False
     assert juge.appele is True
@@ -286,7 +316,7 @@ def test_score_ambigu_le_juge_llm_peut_sauver_la_reponse():
 def test_score_ambigu_le_juge_llm_peut_confirmer_le_refus():
     reponse = _reponse_avec_citation("Le préavis est plutôt court.")
     verifiee = verifier_fidelite(
-        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, llm=_JugeLLM(fondee=False)
+        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7, llm=_JugeLLM(fondee=False)
     )
     assert verifiee.refus is True
 
@@ -294,7 +324,7 @@ def test_score_ambigu_le_juge_llm_peut_confirmer_le_refus():
 def test_juge_llm_nest_pas_appele_hors_zone_ambigue():
     juge = _JugeLLM(fondee=False)
     reponse = _reponse_avec_citation("Le préavis est de trois mois.")
-    verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_bas=0.3, llm=juge)
+    verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7, llm=juge)
     assert juge.appele is False
 
 
@@ -302,8 +332,9 @@ class _NLISelonAffirmation:
     """Score haut pour les affirmations reprenant le texte de l'article, bas
     pour les autres — simule une affirmation fondée suivie d'une invention."""
 
-    def score_implication(self, premisse: str, hypothese: str) -> float:
-        return 0.95 if "trois mois" in hypothese else 0.05
+    def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]:
+        implication = 0.95 if "trois mois" in hypothese else 0.05
+        return [ScoreNLI(implication=implication, contradiction=0.0) for _ in premisses]
 
 
 def test_une_seule_affirmation_non_fondee_suffit_a_refuser():
@@ -311,7 +342,7 @@ def test_une_seule_affirmation_non_fondee_suffit_a_refuser():
         "Le préavis est de trois mois. Le bailleur doit aussi verser une prime."
     )
     verifiee = verifier_fidelite(
-        reponse, [_ARTICLE_15], _NLISelonAffirmation(), seuil_haut=0.7, seuil_bas=0.3
+        reponse, [_ARTICLE_15], _NLISelonAffirmation(), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7
     )
     assert verifiee.refus is True
     assert "prime" in verifiee.motif
@@ -320,16 +351,100 @@ def test_une_seule_affirmation_non_fondee_suffit_a_refuser():
 def test_verifie_contre_le_contenu_de_larticle_cite():
     nli = _NLIFixe(0.95)
     reponse = _reponse_avec_citation("Le préavis est de trois mois.")
-    verifier_fidelite(reponse, [_ARTICLE_15], nli, seuil_haut=0.7, seuil_bas=0.3)
-    assert nli.dernier_appel[0] == _ARTICLE_15.content
+    verifier_fidelite(reponse, [_ARTICLE_15], nli, seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7)
+    assert nli.dernier_appel[0] == [_ARTICLE_15.content]
 
 
 def test_un_refus_est_transmis_sans_verification_de_fidelite():
     refus = ReponseGeneree(refus=True, motif="hors sujet")
-    assert verifier_fidelite(refus, [_ARTICLE_15], _NLIFixe(0.0), seuil_haut=0.7, seuil_bas=0.3) is refus
+    assert verifier_fidelite(refus, [_ARTICLE_15], _NLIFixe(0.0), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7) is refus
 
 
 def test_reponse_vide_ne_leve_pas_derreur():
     reponse = ReponseGeneree(refus=False, reponse="", citations=[])
-    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.0), seuil_haut=0.7, seuil_bas=0.3)
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], _NLIFixe(0.0), seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7)
     assert verifiee.refus is False
+
+
+def test_contradiction_forte_empeche_lacceptation_directe():
+    # Implication haute mais un extrait contredit : signaux opposés, sans juge
+    # le garde-fou refuse par prudence.
+    reponse = _reponse_avec_citation("Le préavis est de deux mois.")
+    nli = _NLIFixe(0.95, contradiction=0.9)
+    verifiee = verifier_fidelite(reponse, [_ARTICLE_15], nli, seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7)
+    assert verifiee.refus is True
+
+
+def test_contradiction_forte_passe_la_main_au_juge_llm():
+    reponse = _reponse_avec_citation("Le préavis est de trois mois.")
+    juge = _JugeLLM(fondee=True)
+    verifiee = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.95, contradiction=0.9),
+        seuil_haut=0.7, seuil_bas=0.3, seuil_contradiction=0.7, llm=juge,
+    )
+    assert juge.appele is True
+    assert verifiee.refus is False
+
+
+# --- découpage en affirmations, extraits, présélection ----------------------
+
+
+def test_decoupe_une_affirmation_par_phrase():
+    assert _decouper_en_affirmations("Le préavis est de trois mois. Il court dès réception.") == [
+        "Le préavis est de trois mois.",
+        "Il court dès réception.",
+    ]
+
+
+def test_elements_de_liste_rattaches_a_leur_introduction():
+    texte = "Les missions du syndic sont :\n1. Conserver l'immeuble.\n2. Tenir la comptabilité."
+    assert _decouper_en_affirmations(texte) == [
+        "Les missions du syndic sont Conserver l'immeuble.",
+        "Les missions du syndic sont Tenir la comptabilité.",
+    ]
+
+
+def test_liste_a_puces_sans_introduction_garde_les_elements_seuls():
+    assert _decouper_en_affirmations("- Premier point.\n- Second point.") == [
+        "Premier point.",
+        "Second point.",
+    ]
+
+
+def test_une_phrase_ordinaire_clot_lintroduction_de_liste():
+    texte = "Il faut :\n- une carte.\nLa carte est délivrée par la CCI.\n- Autre point."
+    assert _decouper_en_affirmations(texte)[-1] == "Autre point."
+
+
+def test_oui_non_en_tete_est_retire():
+    assert _decouper_en_affirmations("Oui, le préavis est de trois mois.") == [
+        "le préavis est de trois mois."
+    ]
+
+
+def test_extraits_fenetre_glissante_de_trois_phrases():
+    article = "Phrase un. Phrase deux. Phrase trois. Phrase quatre."
+    assert _extraits([article]) == [
+        "Phrase un. Phrase deux. Phrase trois.",
+        "Phrase deux. Phrase trois. Phrase quatre.",
+    ]
+
+
+def test_extraits_article_court_donne_un_seul_extrait():
+    assert _extraits(["Le délai de préavis est de trois mois."]) == [
+        "Le délai de préavis est de trois mois."
+    ]
+
+
+def test_extraits_coupent_aux_alineas_et_points_virgules():
+    assert _extraits(["Premier alinéa ;\nSecond alinéa"]) == ["Premier alinéa ; Second alinéa"]
+
+
+def test_preselection_garde_les_extraits_les_plus_proches_en_tete():
+    extraits = ["Le bail est écrit.", "Le dépôt de garantie est d'un mois de loyer.", "Le syndic gère."]
+    assert _preselectionner(extraits, "Le dépôt de garantie vaut un mois de loyer.")[0] == extraits[1]
+
+
+def test_preselection_borne_le_nombre_dextraits():
+    extraits = [f"Phrase numéro {i}." for i in range(50)]
+    assert len(_preselectionner(extraits, "Phrase")) == 8
