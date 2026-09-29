@@ -6,9 +6,7 @@ services:
       POSTGRES_PASSWORD: immo
       POSTGRES_DB: immo_rag
     ports:
-      # 5433 (pas 5432) : un Postgres natif tourne déjà sur cette machine sur
-      # le port par défaut, ce qui provoquait des échecs d'authentification
-      # (les connexions arrivaient au mauvais serveur).
+      # 5433 côté hôte : un Postgres natif occupe déjà 5432 sur cette machine.
       - "5433:5432"
     volumes:
       - db_data:/var/lib/postgresql/data

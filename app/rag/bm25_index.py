@@ -1,40 +1,24 @@
-"""
-Index sparse BM25 : la moitié "mots-clés" de la recherche hybride.
+"""Recherche par mots-clés, fondée sur l'algorithme BM25.
 
-Analogie : l'embedding (vector_store.py) cherche par *sens* — il retrouve un
-chunk qui parle de la même chose même avec d'autres mots. BM25 cherche par
-*mots exacts* — il retrouve un chunk parce qu'il contient littéralement
-"préavis" ou "L. 111-1". Les deux se complètent : le sens rattrape les
-reformulations, les mots-clés rattrapent les termes techniques et les
-références d'articles qu'un embedding a tendance à "lisser". retriever.py
-lance les deux et fusionne les classements (RRF).
+Le projet combine deux recherches. La recherche par le sens (vector_store.py)
+retrouve un morceau qui traite du même sujet avec d'autres mots. La recherche
+par mots-clés retrouve un morceau qui contient exactement les termes de la
+question, par exemple « préavis » ou « L. 111-1 ». Le module retriever.py
+interroge les deux et réunit leurs résultats.
 
-BM25, en une phrase : un score de pertinence qui monte quand la question et le
-chunk partagent des mots rares, et qui sature (un mot répété 10 fois ne compte
-pas 10 fois) en tenant compte de la longueur du chunk.
+Le texte est d'abord ramené à une liste de mots comparables : accents
+supprimés, passage en minuscules, mots-outils retirés, pluriels réduits au
+singulier. Les références légales (« L. 111-1 ») sont conservées d'un seul
+tenant : elles forment une clé de recherche à part entière.
 
-## Tokenizer français
+L'index est conservé en mémoire vive. Pour un corpus plus volumineux que la
+mémoire disponible, le Full-Text Search de PostgreSQL est une alternative.
 
-Un index par mots-clés ne vaut que par sa façon de découper le texte en
-"mots". Ici (cf. CLAUDE.md, ligne Sparse) :
-
-- **accents** : "préavis" et "preavis" doivent matcher → on retire les accents.
-- **casse** : tout en minuscules.
-- **stopwords** : "le", "de", "et"… sont partout, ils n'aident pas à
-  discriminer un chunk → retirés.
-- **stemming** : "logement" / "logements" / (et racines proches) ramenés à une
-  forme commune, pour qu'une question au singulier retrouve un texte au
-  pluriel (stemmer Snowball français).
-- **références légales** : "L. 111-1", "R. 123-4", "89-462"… sont *préservées
-  comme un seul token* (`l.111-1`). Sans ça, le point, l'espace et le tiret les
-  casseraient en `l` / `111` / `1` — or c'est exactement la clé de recherche
-  qu'un professionnel tape telle quelle.
-
-Option évoquée dans CLAUDE.md : utiliser plutôt le Full-Text Search natif de
-Postgres avec la configuration `french` (`to_tsvector('french', …)`), qui gère
-déjà accents/stopwords/stemming. On garde rank-bm25 en mémoire pour l'instant :
-plus simple à faire évoluer et à mesurer dans l'étude d'ablation, et l'algo
-BM25 y est explicite plutôt que caché derrière le classement `ts_rank`.
+Contenu du fichier :
+- tokeniser_fr : découpe un texte français en mots pour l'index.
+- BM25Document : un morceau à indexer (texte et repères, sans vecteur).
+- BM25Result : un morceau retrouvé, avec son score.
+- BM25Index : construit l'index et répond aux recherches.
 """
 from __future__ import annotations
 
@@ -45,12 +29,9 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-# Une référence légale française : lettre de partie optionnelle (L/R/D/A pour
-# Législatif, Réglementaire décret, Décret, Arrêté) suivie d'un numéro
-# éventuellement composé de plusieurs tranches séparées par des tirets
-# ("L. 111-1", "R123-4", "D. 3-1"), OU un numéro composé seul ("89-462" pour un
-# numéro de loi, "6-1" pour un article). On capture tout le motif d'un bloc
-# pour le sortir du texte avant le découpage normal.
+# Une référence légale : lettre optionnelle (L/R/D/A) puis un numéro à tranches
+# ("L. 111-1", "R123-4"), ou un numéro composé seul ("89-462", "6-1"). Repérée
+# d'un bloc pour être mise de côté avant le découpage normal.
 _REF_LEGALE = re.compile(
     r"\b(?:[LRDA]\.?\s*\d+(?:-\d+)*|\d+-\d+(?:-\d+)*)\b",
     re.IGNORECASE,
@@ -58,9 +39,9 @@ _REF_LEGALE = re.compile(
 
 _MOT = re.compile(r"[a-z0-9]+")
 
-# Mots-outils français les plus fréquents (déjà sans accents : la comparaison se
-# fait après normalisation). Volontairement court — une liste trop agressive
-# retire des mots parfois utiles ("plus", "sans", "contre" ont un sens juridique).
+# Mots-outils français courants (sans accents : la comparaison se fait après
+# normalisation). Liste volontairement courte : trop large, elle retirerait des
+# mots utiles en droit ("plus", "sans", "contre").
 _STOPWORDS_FR = {
     "le", "la", "les", "un", "une", "des", "du", "de", "d", "l", "au", "aux",
     "et", "ou", "ni", "mais", "donc", "or", "car", "que", "qui", "quoi", "dont",
@@ -75,34 +56,32 @@ _STOPWORDS_FR = {
 
 
 def _sans_accents(texte: str) -> str:
-    """"éàïôç" → "eaioc". Décompose chaque caractère accentué (NFKD) puis retire
-    les diacritiques (catégorie Unicode "Mn", marque non espaçante)."""
+    """Retire les accents : "éàïôç" devient "eaioc"."""
     decompose = unicodedata.normalize("NFKD", texte)
     return "".join(c for c in decompose if not unicodedata.combining(c))
 
 
 @lru_cache(maxsize=1)
 def _stemmer():
-    """Stemmer Snowball français, chargé une seule fois (léger, pur Python)."""
+    """Ramène les mots français à leur racine ; chargé une seule fois."""
     import snowballstemmer
 
     return snowballstemmer.stemmer("french")
 
 
 def tokeniser_fr(texte: str) -> list[str]:
-    """Découpe un texte français en tokens comparables pour BM25.
+    """Découpe un texte français en mots comparables pour l'index.
 
-    Les références légales ("L. 111-1") sont renvoyées en tête, normalisées en
-    un seul token (`l.111-1`), avant les mots courants (sans accents, sans
-    stopwords, ramenés à leur racine).
+    Les références légales ("L. 111-1") viennent d'abord, d'un bloc, puis les
+    mots courants sans accents, sans mots-outils et ramenés à leur racine.
     """
     refs = [
         re.sub(r"\s+", "", correspondance.group(0)).lower()
         for correspondance in _REF_LEGALE.finditer(texte)
     ]
 
-    # On efface les références du texte avant le découpage normal : sinon "111"
-    # et "1" de "L. 111-1" reviendraient aussi comme tokens numériques parasites.
+    # Références retirées avant le découpage normal : sinon le "111" et le "1"
+    # de "L. 111-1" reviendraient comme des nombres isolés parasites.
     texte_sans_refs = _REF_LEGALE.sub(" ", texte)
     mots = _MOT.findall(_sans_accents(texte_sans_refs).lower())
 
@@ -116,8 +95,8 @@ def tokeniser_fr(texte: str) -> list[str]:
 
 
 class BM25Document(BaseModel):
-    """Un chunk tel qu'indexé par BM25 — pas besoin de l'embedding ici,
-    seulement du texte et de quoi retrouver le chunk ensuite."""
+    """Un morceau à indexer : le texte et de quoi le retrouver ensuite, sans
+    vecteur."""
 
     id: UUID
     doc_id: str = Field(min_length=1)
@@ -130,16 +109,16 @@ class BM25Result(BaseModel):
     doc_id: str
     content: str
     metadata: dict
-    score: float  # score BM25 brut (≥ 0, non borné) — sert au classement, pas de seuil absolu
+    score: float  # score brut (≥ 0, sans maximum) : sert au classement, pas de seuil
 
 
 class BM25Index:
-    """Index BM25 en mémoire, reconstruit à partir des chunks au démarrage.
+    """Index construit en mémoire à partir des morceaux.
 
-    rank-bm25 fige le corpus à la construction (pas d'ajout incrémental) : pour
-    ré-indexer après une ingestion, on recrée un BM25Index. Acceptable tant que
-    le corpus tient en mémoire (réglementation publique = quelques Mo de texte) ;
-    à revoir si le volume explose (bascule vers Postgres FTS, cf. module).
+    Le corpus est figé à la construction : après une nouvelle ingestion, un
+    nouvel index doit être créé. Convient tant que le texte tient en mémoire
+    (quelques Mo) ; au-delà, une bascule vers PostgreSQL s'impose (voir en-tête
+    du fichier).
     """
 
     def __init__(self, documents: list[BM25Document]):
@@ -147,15 +126,15 @@ class BM25Index:
 
         self._documents = list(documents)
         corpus_tokens = [tokeniser_fr(d.content) for d in self._documents]
-        # BM25Okapi refuse un corpus vide ; on garde None et search renvoie [].
+        # rank-bm25 refuse un corpus vide : il reste à None et search renvoie
+        # une liste vide.
         self._bm25 = BM25Okapi(corpus_tokens) if corpus_tokens else None
 
     def search(self, query: str, k: int = 10) -> list[BM25Result]:
-        """Les k chunks au meilleur score BM25 pour `query`.
+        """Les k morceaux au meilleur score pour la question.
 
-        Les chunks à score nul (aucun mot de la question en commun) sont exclus :
-        les renvoyer ferait croire à une pertinence inexistante et fausserait la
-        fusion RRF en aval.
+        Les morceaux sans aucun mot commun avec la question (score nul) sont
+        écartés : les garder ferait croire à une pertinence inexistante.
         """
         if self._bm25 is None:
             return []

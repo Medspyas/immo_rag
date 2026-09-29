@@ -2,12 +2,12 @@ from uuid import uuid4
 
 from app.rag.bm25_index import BM25Document, BM25Index, tokeniser_fr
 
-# --- tokenizer -------------------------------------------------------------
+# --- découpage du texte en mots -------------------------------------------
 
 def test_reference_legale_preservee_en_un_token():
     tokens = tokeniser_fr("La carte est régie par l'article L. 111-1 du code")
     assert "l.111-1" in tokens
-    # le point / l'espace / le tiret n'ont pas cassé la référence en morceaux
+    # la référence n'a pas été coupée en morceaux
     assert "111" not in tokens
 
 
@@ -27,7 +27,7 @@ def test_singulier_et_pluriel_meme_racine():
     assert tokeniser_fr("logements")[0] == tokeniser_fr("logement")[0]
 
 
-# --- index ----------------------------------------------------------------
+# --- l'index et ses recherches -------------------------------------------
 
 DOCS = [
     BM25Document(
@@ -60,7 +60,7 @@ def test_search_sans_mot_commun_renvoie_vide():
 
 
 def test_search_ignore_les_scores_nuls():
-    # "copropriété" ne concerne qu'un seul chunk : k=3 demandé, 1 seul rendu
+    # "copropriété" ne concerne qu'un seul morceau : 3 demandés, 1 renvoyé
     resultats = BM25Index(DOCS).search("copropriété", k=3)
     assert [r.doc_id for r in resultats] == ["loi-65"]
 

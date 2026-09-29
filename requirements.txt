@@ -17,6 +17,14 @@ snowballstemmer
 # (BAAI/bge-reranker-v2-m3) — fournisseurs par défaut
 sentence-transformers
 
+# Reclassement accéléré (RERANK_PROVIDER=onnx, cf. reranker.OnnxReranker) :
+# le même modèle exécuté par ONNX Runtime. Sous Windows, la variante DirectML
+# utilise la carte graphique (AMD, Intel ou NVIDIA) ; ailleurs, le moteur
+# standard. L'outil de conversion (optimum) n'en fait pas partie : il vit dans
+# un environnement jetable (scripts/exporter_reclasseur_onnx.py).
+onnxruntime-directml; sys_platform == "win32"
+onnxruntime; sys_platform != "win32"
+
 # Garde-fou étage 2 : modèle NLI local (MoritzLaurer/mDeBERTa-v3-base-mnli-xnli)
 # — utilisé directement (pas via sentence-transformers, qui l'apporterait déjà
 # en dépendance transitive, mais sans le garantir pour toute version)

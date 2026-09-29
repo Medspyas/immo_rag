@@ -11,14 +11,15 @@ par morceau — donc réservée aux quelques candidats déjà retenus par la
 recherche hybride, jamais appliquée au corpus entier.
 
 Le fournisseur passe par le contrat RerankProvider et se règle dans .env, comme
-pour les embeddings. Seules des implémentations gratuites sont proposées :
-LocalReranker couvre le besoin ; une autre implémentation locale se brancherait
-en changeant RERANK_MODEL, sans nouvelle classe.
+pour les embeddings. Seules des implémentations gratuites sont proposées. Un
+autre modèle local se branche en changeant RERANK_MODEL, sans nouvelle classe.
 
 Contenu du fichier :
 - RerankProvider : contrat commun.
 - LocalReranker : modèle libre exécuté sur la machine (BGE-m3) via
-  sentence-transformers. Retenu par défaut.
+  sentence-transformers. Retenu par défaut, fonctionne partout.
+- OnnxReranker : le même modèle, exporté en ONNX, exécuté sur la carte
+  graphique quand elle est disponible.
 - get_rerank_provider : sélectionne l'implémentation selon .env.
 """
 from __future__ import annotations
@@ -101,8 +102,78 @@ class LocalReranker(RerankProvider):
         return [(i, _sigmoide(float(scores[i]))) for i in ordre]
 
 
+class OnnxReranker(RerankProvider):
+    """Le même modèle que LocalReranker, exporté au format ONNX et exécuté
+    par ONNX Runtime : sur la carte graphique via DirectML, sur le processeur
+    à défaut.
+
+    Le reclassement représente l'essentiel du temps d'une recherche. Mesuré
+    avec eval/latence.py (2026-09-25, 461 articles) : médiane de 22,6 s par
+    requête sur processeur avec LocalReranker, 0,6 s avec cette classe sur
+    carte graphique.
+
+    Le modèle exporté (~2,2 Go) est produit par
+    scripts/exporter_reclasseur_onnx.py dans rerank_onnx_dir ; il n'est pas
+    versionné. Classe utilisée si RERANK_PROVIDER=onnx.
+    """
+
+    def __init__(self, model_dir: str, max_length: int = 512):
+        self._model_dir = model_dir
+        self._max_length = max_length
+        self._session = None
+        self._tokenizer = None
+
+    def _charger(self):
+        if self._session is None:
+            import onnxruntime as ort
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(self._model_dir)
+            self._session = ort.InferenceSession(
+                f"{self._model_dir}/model.onnx",
+                providers=_fournisseurs_onnx(ort.get_available_providers()),
+            )
+        return self._session, self._tokenizer
+
+    def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
+        if not documents:
+            return []
+        session, tokenizer = self._charger()
+        entrees = tokenizer(
+            [query] * len(documents),
+            documents,
+            padding=True,
+            truncation=True,
+            max_length=self._max_length,
+            return_tensors="np",
+        )
+        logits = session.run(
+            ["logits"],
+            {"input_ids": entrees["input_ids"], "attention_mask": entrees["attention_mask"]},
+        )[0]
+        scores = logits[:, 0]
+        ordre = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
+        return [(i, _sigmoide(float(scores[i]))) for i in ordre]
+
+
+def _fournisseurs_onnx(disponibles: list[str]) -> list[str]:
+    """Moteurs d'exécution à demander à ONNX Runtime, du plus rapide au plus
+    lent, parmi ceux réellement installés sur la machine.
+
+    DirectML (carte graphique sous Windows) n'existe pas partout, par exemple
+    sur un serveur Linux sans carte graphique : ne demander que ce qui est
+    disponible évite un avertissement, et le processeur reste toujours en
+    dernier recours.
+    """
+    preferes = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    choisis = [f for f in preferes if f in disponibles]
+    return choisis or ["CPUExecutionProvider"]
+
+
 def get_rerank_provider(settings: Settings) -> RerankProvider:
     """Sélectionne l'implémentation selon le réglage RERANK_PROVIDER de .env."""
     if settings.rerank_provider == "local":
         return LocalReranker(settings.rerank_model, settings.rerank_max_length)
+    if settings.rerank_provider == "onnx":
+        return OnnxReranker(settings.rerank_onnx_dir, settings.rerank_max_length)
     raise ValueError(f"Fournisseur de reclassement inconnu : {settings.rerank_provider}")

@@ -27,9 +27,14 @@ class Settings(BaseSettings):
     embeddings_dimension: int = 768
 
     # Reclassement des résultats de recherche : modèle local et gratuit. Un
-    # autre modèle local se choisit via rerank_model.
-    rerank_provider: Literal["local"] = "local"
+    # autre modèle local se choisit via rerank_model. "onnx" (OnnxReranker,
+    # reranker.py) exécute le même modèle sur la carte graphique ; "local"
+    # reste le défaut, qui fonctionne sur toute machine.
+    rerank_provider: Literal["local", "onnx"] = "local"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # Dossier du modèle exporté en ONNX (scripts/exporter_reclasseur_onnx.py),
+    # utilisé seulement si rerank_provider="onnx".
+    rerank_onnx_dir: str = ".cache/reclasseur_onnx"
     # Longueur maximale, en tokens, de chaque paire (question, morceau) soumise
     # au reclasseur. bge-reranker-v2-m3 accepte jusqu'à 8192 tokens et traite
     # sinon les articles longs en entier, ce qui rend une passe CPU très lente.
