@@ -192,15 +192,17 @@ class _RerankerScores:
         return paires
 
 
-def test_seuil_ecarte_les_candidats_sous_le_score():
+def test_seuil_franchi_par_le_meilleur_garde_les_candidats_suivants():
+    # Le seuil juge la recherche, pas chaque article : un article utile noté
+    # sous le seuil derrière un meilleur candidat reste transmis.
     a, b, c = uuid4(), uuid4(), uuid4()
     resultats = _retriever(
         [_dense(a), _dense(b), _dense(c)],
         [],
         reranker=_RerankerScores([0.9, 0.2, 0.05]),
         seuil_rerank=0.3,
-    ).search("q")
-    assert [r.id for r in resultats] == [a]
+    ).search("q", k=2)
+    assert [r.id for r in resultats] == [a, b]
 
 
 def test_seuil_tous_sous_le_score_renvoie_liste_vide():
@@ -224,3 +226,18 @@ def test_seuil_none_ne_filtre_rien():
         [_dense(a), _dense(b)], [], reranker=_RerankerScores([0.9, 0.01])
     ).search("q")
     assert {r.id for r in resultats} == {a, b}
+
+
+def test_le_reclasseur_recoit_le_titre_de_la_loi_devant_larticle():
+    a = uuid4()
+    dense = SearchResult(
+        id=a, doc_id="Loi_hoguet", content="Article 1\nLes dispositions…",
+        metadata={"titre": "Loi n° 70-9 du 2 janvier 1970 (loi Hoguet)"}, score=0.9,
+    )
+    reclasseur = _RerankerFake()
+    resultats = _retriever([dense], [], reranker=reclasseur).search("q")
+    assert reclasseur.textes_recus == ["Loi n° 70-9 du 2 janvier 1970 (loi Hoguet)\nArticle 1\nLes dispositions…"]
+    # Le contenu renvoyé (cité, vérifié) reste l'article seul.
+    assert resultats[0].content == "Article 1\nLes dispositions…"
+
+

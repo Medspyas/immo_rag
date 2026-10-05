@@ -1,0 +1,82 @@
+# Intégration continue : lint + tests à chaque push et pull request, puis gate
+# d'évaluation du retrieval (eval/gate.py) qui bloque une régression de qualité.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    # Base pgvector réelle : les tests de vector_store.py s'exécutent au lieu
+    # d'être ignorés. Le schéma est appliqué à la main plus bas (un service ne
+    # monte pas de fichier du dépôt).
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: immo
+          POSTGRES_PASSWORD: immo
+          POSTGRES_DB: immo_rag
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U immo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # PyTorch en version processeur : la version par défaut embarque CUDA
+      # (plusieurs Go) sans utilité sur un runner sans carte graphique.
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: psql postgresql://immo:immo@localhost:5433/immo_rag -f init.sql
+      - run: pytest -q
+
+  gate:
+    needs: tests
+    runs-on: ubuntu-latest
+    # Reclasseur sur processeur : ~22 s par question, 35 questions.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      # Le gate a besoin du corpus nettoyé (data/clean) ; sans lui, le job
+      # s'arrête proprement au lieu d'échouer.
+      - id: corpus
+        run: |
+          if ls data/clean/*.txt >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::data/clean absent du dépôt, gate d'évaluation ignoré"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.corpus.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # Modèles Hugging Face (embeddings e5, reclasseur BGE-m3) gardés d'une
+      # exécution à l'autre : ~3 Go à ne pas retélécharger à chaque fois.
+      - if: steps.corpus.outputs.present == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('app/config.py') }}
+      - if: steps.corpus.outputs.present == 'true'
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+      # Reclasseur local sur processeur (pas d'ONNX/carte graphique en CI).
+      - if: steps.corpus.outputs.present == 'true'
+        run: python -m eval.gate --threads 4
+        env:
+          RERANK_PROVIDER: local

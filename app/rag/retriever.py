@@ -56,6 +56,30 @@ def _scores_rrf(classements: list[list[UUID]], k: int = 60) -> dict[UUID, float]
     return scores
 
 
+def _texte_a_reclasser(resultat: _ResultatRecherche) -> str:
+    """Texte soumis au reclasseur : l'article précédé du titre de sa loi.
+
+    Le texte d'un article ne dit presque jamais de quelle loi il fait partie
+    (l'article 1er de la loi Hoguet ne contient ni « Hoguet » ni « agent
+    immobilier »). Mesuré le 2026-10-02 sur le golden dataset : avec le titre,
+    hit@1 45 % → 52 %, MRR 0,60 → 0,64, et le meilleur score d'une question
+    hors corpus baisse (0,23 → 0,13), ce qui éloigne les refus du seuil de
+    l'étage 1. L'intitulé de section en plus classait mieux encore mais
+    remontait une question hors corpus jusqu'au seuil : écarté.
+
+    Seul le reclasseur voit ce titre : les embeddings et l'index BM25 restent
+    calculés sur l'article seul (un résumé ajouté devant chaque article avait
+    dégradé la recherche dense, cf. contextual retrieval).
+
+    Un long article est jugé sur ses ~512 premiers tokens seulement. Noter
+    chaque article sur son meilleur passage a été mesuré le 2026-10-03 et
+    écarté : MRR 0,655 → 0,618, et une question hors corpus montait à 0,61,
+    au-dessus du seuil de l'étage 1 (plus de passages, plus de chances qu'un
+    passage sans rapport obtienne une note élevée)."""
+    titre = (resultat.metadata or {}).get("titre")
+    return f"{titre}\n{resultat.content}" if titre else resultat.content
+
+
 def fusion_rrf(classements: list[list[UUID]], k: int = 60) -> list[UUID]:
     """Fusionne plusieurs classements d'identifiants en un seul.
 
@@ -138,10 +162,10 @@ class HybridRetriever:
     cross-encoder traite chaque candidat séparément ; ce plafond limite son
     coût. Sans effet lorsque reranker vaut None.
 
-    seuil_rerank : garde-fou étage 1. Fourni avec un reclasseur, tout candidat
-    dont le score de reclassement tombe sous ce seuil est écarté des résultats
-    plutôt que renvoyé. Sans effet lorsque reranker vaut None (aucun score de
-    reclassement à comparer).
+    seuil_rerank : garde-fou étage 1. Fourni avec un reclasseur, la recherche
+    ne renvoie rien lorsque le meilleur score de reclassement tombe sous ce
+    seuil ; sinon les k meilleurs candidats sont renvoyés. Sans effet lorsque
+    reranker vaut None (aucun score de reclassement à comparer).
     """
 
     def __init__(
@@ -169,6 +193,12 @@ class HybridRetriever:
 
         L'ordre vient de la fusion RRF, ou du reclasseur lorsqu'il est fourni.
         Renvoie une liste vide lorsque les deux recherches ne renvoient rien.
+
+        La question est cherchée telle quelle. La reformuler avant la recherche
+        (dans les mots de la loi, ou en passage de loi hypothétique « HyDE ») a
+        été mesuré le 2026-10-03 et écarté : MRR 0,686 → 0,657 et 0,644, et une
+        question hors corpus montait au-dessus du seuil de l'étage 1 (jusqu'à
+        0,47) ; le passage hypothétique inventait en outre des chiffres.
         """
         embedding_requete = self._embeddings.embed_query(query)
         resultats_denses = self._dense.search(embedding_requete, k=self._k_par_source)
@@ -205,16 +235,20 @@ class HybridRetriever:
         # Seuls les meilleurs candidats de la fusion sont soumis au reclasseur ;
         # leur ordre final est celui qu'il renvoie, pas celui de la fusion.
         candidats = ids_ordonnes[: self._k_avant_rerank]
-        textes = [par_id[chunk_id].content for chunk_id in candidats]
+        textes = [_texte_a_reclasser(par_id[chunk_id]) for chunk_id in candidats]
         classement = self._reranker.rerank(query, textes)
 
-        # Garde-fou étage 1 : un candidat sous le seuil n'est pas assez fiable
-        # pour être soumis au LLM générateur, refus (résultats vides) plutôt
-        # qu'un appel de génération inutile.
-        if self._seuil_rerank is not None:
-            classement = [
-                (indice, score) for indice, score in classement if score >= self._seuil_rerank
-            ]
+        # Garde-fou étage 1 : si même le meilleur candidat est sous le seuil,
+        # rien de pertinent n'a été trouvé, refus (résultats vides) plutôt
+        # qu'un appel de génération inutile. Le seuil juge la recherche dans
+        # son ensemble, pas chaque article : écarter aussi les articles
+        # suivants sous le seuil privait le LLM de l'article qui répond
+        # (mesuré le 2026-10-03 : q26, l'article 3 de la loi Hoguet noté
+        # 0,27 derrière un article à 0,46 ; q12, l'article 10 « trois ans »
+        # écarté, seul l'article 11 transmis, d'où la réponse fausse « un an »).
+        meilleur = max((score for _, score in classement), default=None)
+        if self._seuil_rerank is not None and (meilleur is None or meilleur < self._seuil_rerank):
+            return []
 
         return [
             _resultat(candidats[indice], score_rerank=score)

@@ -220,6 +220,18 @@ def test_construire_retriever_transmet_le_seuil_avec_reclasseur():
     assert retriever._seuil_rerank == 0.42
 
 
+def test_construire_retriever_transmet_le_nombre_de_candidats():
+    retriever = construire_retriever(
+        _settings(k_par_source=30, k_avant_rerank=25),
+        _EmbeddingsFake(),
+        _RechercheDenseFake(),
+        _RechercheSparseFake(),
+        reranker=_RerankerFake(),
+    )
+    assert retriever._k_par_source == 30
+    assert retriever._k_avant_rerank == 25
+
+
 def test_construire_retriever_ignore_le_seuil_sans_reclasseur():
     retriever = construire_retriever(
         _settings(seuil_garde_fou_retrieval=0.42),
@@ -341,6 +353,15 @@ def test_repondre_transmet_k_au_retriever():
     retriever = _RetrieverFake([_ARTICLE_15])
     repondre("Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIToujoursFonde(), _settings(), k=3)
     assert retriever.k_recu == 3
+
+
+def test_repondre_prend_k_dans_la_config_par_defaut():
+    retriever = _RetrieverFake([_ARTICLE_15])
+    repondre(
+        "Quel préavis ?", retriever, _LLMFake(_REPONSE_OK), _NLIToujoursFonde(),
+        _settings(k_articles_generation=4),
+    )
+    assert retriever.k_recu == 4
 
 
 def test_repondre_est_tracee_quand_langfuse_est_configure(monkeypatch):

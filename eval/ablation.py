@@ -22,6 +22,9 @@ Lancement :
                                               # document avant l'embedding
                                               # (contextual retrieval, Groq)
     python -m eval.ablation --threads 2      # limite l'usage CPU
+    python -m eval.ablation --rerank --k-avant-rerank 10 --max-length 256
+                                              # reclasseur allégé (cf.
+                                              # eval/latence.py pour la vitesse)
 
 Le premier lancement calcule les embeddings du corpus (~1-2 min, un pic CPU
 borné par --threads) puis les met en cache ; les suivants sont immédiats.
@@ -99,9 +102,20 @@ def recherche_dense(corpus: CorpusMemoire) -> Recherche:
     return rechercher
 
 
-def recherche_hybride(corpus: CorpusMemoire, *, reranker=None) -> Recherche:
+def recherche_hybride(
+    corpus: CorpusMemoire,
+    *,
+    reranker=None,
+    k_avant_rerank: int = 20,
+    k_par_source: int = 20,
+) -> Recherche:
     retriever = HybridRetriever(
-        corpus.embeddings, corpus.dense, corpus.bm25, reranker=reranker
+        corpus.embeddings,
+        corpus.dense,
+        corpus.bm25,
+        reranker=reranker,
+        k_par_source=k_par_source,
+        k_avant_rerank=k_avant_rerank,
     )
 
     def rechercher(question: str, k: int) -> list[Source]:
@@ -139,7 +153,14 @@ def _resume(xs: list[float]) -> str:
     return f"min {xs[0]:.3f} | médiane {xs[len(xs) // 2]:.3f} | max {xs[-1]:.3f}"
 
 
-def _diagnostic_hors_corpus(corpus: CorpusMemoire, cas: list[CasGolden], *, reranker=None) -> str:
+def _diagnostic_hors_corpus(
+    corpus: CorpusMemoire,
+    cas: list[CasGolden],
+    *,
+    reranker=None,
+    k_avant_rerank: int = 20,
+    k_par_source: int = 20,
+) -> str:
     """Compare, pour les questions dans le corpus vs hors corpus, le meilleur
     score du passage n°1. Un écart net entre les deux groupes indiquerait qu'un
     seuil sur ce score peut servir de garde-fou (refus) — l'étage 1.
@@ -165,7 +186,12 @@ def _diagnostic_hors_corpus(corpus: CorpusMemoire, cas: list[CasGolden], *, rera
 
     if reranker is not None:
         retriever = HybridRetriever(
-            corpus.embeddings, corpus.dense, corpus.bm25, reranker=reranker
+            corpus.embeddings,
+            corpus.dense,
+            corpus.bm25,
+            reranker=reranker,
+            k_par_source=k_par_source,
+            k_avant_rerank=k_avant_rerank,
         )
 
         def meilleur_rerank(question: str) -> float:
@@ -192,6 +218,19 @@ def main() -> None:
     )
     parser.add_argument("--threads", type=int, default=4, help="cœurs CPU max (défaut 4)")
     parser.add_argument("--details", action="store_true", help="rang par question")
+    parser.add_argument(
+        "--reclasseur", choices=["local", "onnx"], help="force le reclasseur (défaut : .env)"
+    )
+    parser.add_argument(
+        "--k-avant-rerank", type=int, help="passages soumis au reclasseur (défaut : .env)"
+    )
+    parser.add_argument(
+        "--k-par-source", type=int,
+        help="résultats demandés à chaque recherche avant fusion (défaut : .env)",
+    )
+    parser.add_argument(
+        "--max-length", type=int, help="longueur max. en tokens par paire (défaut : .env)"
+    )
     args = parser.parse_args()
 
     import torch
@@ -199,6 +238,16 @@ def main() -> None:
     torch.set_num_threads(max(1, args.threads))
 
     settings = Settings()
+    reglages = {}
+    if args.reclasseur:
+        reglages["rerank_provider"] = args.reclasseur
+    if args.max_length:
+        reglages["rerank_max_length"] = args.max_length
+    if args.k_avant_rerank:
+        reglages["k_avant_rerank"] = args.k_avant_rerank
+    if args.k_par_source:
+        reglages["k_par_source"] = args.k_par_source
+    settings = settings.model_copy(update=reglages)
     embeddings = get_embedding_provider(settings)
 
     contextualizer = None
@@ -216,7 +265,7 @@ def main() -> None:
 
     systemes: list[tuple[str, Recherche]] = [
         ("sens seul", recherche_dense(corpus)),
-        ("hybride", recherche_hybride(corpus)),
+        ("hybride", recherche_hybride(corpus, k_par_source=settings.k_par_source)),
     ]
     reranker = None
     if args.rerank:
@@ -224,7 +273,19 @@ def main() -> None:
 
         reranker = get_rerank_provider(settings)
         systemes.append(
-            ("hybride+rerank", recherche_hybride(corpus, reranker=reranker))
+            (
+                "hybride+rerank",
+                recherche_hybride(
+                    corpus,
+                    reranker=reranker,
+                    k_avant_rerank=settings.k_avant_rerank,
+                    k_par_source=settings.k_par_source,
+                ),
+            )
+        )
+        print(
+            f"Reclasseur : {settings.rerank_provider}, {settings.k_avant_rerank} passages, "
+            f"{settings.rerank_max_length} tokens max.\n"
         )
 
     resultats = [evaluer_systeme(nom, fn, dans_corpus) for nom, fn in systemes]
@@ -232,7 +293,15 @@ def main() -> None:
     print(f"Ablation retrieval — {len(dans_corpus)} questions du corpus\n")
     print(_tableau(resultats))
     print()
-    print(_diagnostic_hors_corpus(corpus, tous, reranker=reranker))
+    print(
+        _diagnostic_hors_corpus(
+            corpus,
+            tous,
+            reranker=reranker,
+            k_avant_rerank=settings.k_avant_rerank,
+            k_par_source=settings.k_par_source,
+        )
+    )
     if args.details:
         print()
         print(_details(resultats, dans_corpus))

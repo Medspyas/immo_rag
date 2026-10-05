@@ -7,7 +7,7 @@ data/*.pdf
 .pytest_cache/
 .ruff_cache/
 
-# Outillage local (accélération GPU du reclasseur pour aller plus vite en dev/
-# évaluation) : hors périmètre du RAG, jamais commité.
+# Fichiers produits localement : caches d'embeddings de l'évaluation et modèle
+# ONNX exporté du reclasseur (~2,2 Go, régénéré par
+# scripts/exporter_reclasseur_onnx.py).
 .cache/
-scripts/exporter_reclasseur_onnx.py

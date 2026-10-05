@@ -48,6 +48,22 @@ class Settings(BaseSettings):
     # pour les questions hors corpus. 0.3 sépare nettement les deux groupes.
     seuil_garde_fou_retrieval: float = 0.3
 
+    # Résultats demandés à chaque recherche (sens, mots-clés) avant fusion, et
+    # candidats de la fusion soumis au reclasseur. Mesuré sur le golden dataset
+    # (ablation --rerank, 2026-10-03) : 30/30 au lieu de 20/20 fait remonter
+    # l'article 18 de la loi de 1965 (missions du syndic, 23e en recherche par
+    # le sens) — hit@5 83,9 % → 87,1 %, MRR 0,655 → 0,686, questions hors
+    # corpus inchangées (max 0,13). 40/40 n'apporte rien de plus.
+    k_par_source: int = 30
+    k_avant_rerank: int = 30
+
+    # Nombre d'articles envoyés au LLM pour rédiger la réponse. Chaque article
+    # consomme du quota Groq gratuit (8000 tokens/minute). Mesuré sur le golden
+    # dataset (2026-09-29) : 5 au lieu de 10 réduit les tokens d'entrée de 38 %
+    # (médiane 3757 -> 2325) pour une seule question dont l'article attendu
+    # sort du lot (23/28 -> 22/28) ; 3 en écarte trop (19/28).
+    k_articles_generation: int = 5
+
     # Garde-fou étage 2 (cf. CLAUDE.md) : vérifie que chaque affirmation de la
     # réponse générée est bien impliquée par le texte des articles cités,
     # via un modèle NLI local et gratuit. Un modèle anglais-only échouerait
@@ -56,11 +72,9 @@ class Settings(BaseSettings):
     nli_model: str = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
     nli_max_length: int = 512
     # Au-dessus de seuil_nli_haut, l'affirmation est jugée fondée sans recours
-    # au LLM. En dessous de seuil_nli_bas, elle est jugée non fondée, refus
-    # direct. Entre les deux, le score du NLI seul ne permet pas de trancher :
+    # au LLM. En dessous, le score du NLI seul ne permet pas de trancher :
     # repli sur un juge LLM (cf. CLAUDE.md, "cas limites").
     seuil_nli_haut: float = 0.7
-    seuil_nli_bas: float = 0.3
     # Même au-dessus de seuil_nli_haut, une affirmation qu'un extrait de
     # l'article contredit au-delà de ce seuil passe au juge LLM : signaux
     # opposés, le NLI seul ne tranche pas (cf. generator.verifier_fidelite).
@@ -71,5 +85,20 @@ class Settings(BaseSettings):
     # d'usage doit rester dans ses limites.
     llm_provider: Literal["groq"] = "groq"
     llm_model: str = "openai/gpt-oss-20b"
+    # Modèles de relais quand llm_model a épuisé son quota par minute : Groq
+    # compte le quota séparément pour chaque modèle, deux modèles doublent
+    # donc le débit (cf. generator.LLMEnCascade). qwen/qwen3.8-27b est écarté :
+    # sa limite de 1000 tokens de sortie par minute est sous le max_tokens de
+    # 1024 que réserve chaque appel. Liste vide : un seul modèle, sans cascade.
+    llm_modeles_relais: list[str] = ["openai/gpt-oss-120b"]
+    # Juge de repli du garde-fou étage 2 : essayé en premier pour le juge, les
+    # autres modèles servant de relais. Mesuré le 2026-10-02 : le 20b rejetait
+    # « l'état des lieux est obligatoire » (art. 3-2 : « est établi »), le
+    # 120b l'accepte, et les deux refusent les réponses fausses testées.
+    llm_modele_juge: str = "openai/gpt-oss-120b"
 
     groq_api_key: str | None = None
+
+    # Origines autorisées à appeler l'API depuis un navigateur (front, phase 3).
+    # Format JSON dans .env, ex. ["http://localhost:5173"] ; vide par défaut.
+    cors_origins: list[str] = []

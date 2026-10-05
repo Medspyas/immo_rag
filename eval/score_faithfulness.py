@@ -17,6 +17,7 @@ pourraient entrer en conflit avec les versions dont `generator.py` a besoin.
 Lancement (depuis .venv-eval) :
     python -m eval.score_faithfulness                  # tous les cas de la trace
     python -m eval.score_faithfulness --limit 10
+    python -m eval.score_faithfulness --traces .cache/traces_golden_20261005.jsonl
 """
 from __future__ import annotations
 
@@ -35,6 +36,11 @@ from deepeval.test_case import LLMTestCase
 
 RACINE = Path(__file__).resolve().parent.parent
 FICHIER_TRACES = RACINE / ".cache" / "eval_traces.jsonl"
+# Résultats écrits au fil de l'eau : le quota journalier gratuit de Groq
+# (200 000 tokens pour gpt-oss-120b) ne couvre pas tout le golden en une
+# journée, chaque cas envoyant des articles entiers au juge. Un lancement
+# suivant reprend les cas non encore notés.
+FICHIER_RESULTATS = RACINE / ".cache" / "faithfulness_resultats.jsonl"
 
 # Verdicts de run_eval.py qui correspondent à une réponse notée par
 # verifier_fidelite (donc comparable à la mesure indépendante). Les refus
@@ -92,9 +98,12 @@ def charger_traces(fichier: Path) -> list[dict]:
         return [json.loads(ligne) for ligne in f if ligne.strip()]
 
 
-def comparer(traces: list[dict], metric: FaithfulnessMetric) -> list[dict]:
+def comparer(
+    traces: list[dict], metric: FaithfulnessMetric, sur_resultat=None
+) -> list[dict]:
     """Calcule le score deepeval pour chaque trace comparable et le confronte
-    au verdict de notre garde-fou en ligne."""
+    au verdict de notre garde-fou en ligne. sur_resultat, s'il est fourni,
+    reçoit chaque résultat dès qu'il est calculé (sauvegarde au fil de l'eau)."""
     resultats = []
     for t in traces:
         if t["verdict_local"] not in VERDICTS_COMPARABLES:
@@ -104,16 +113,23 @@ def comparer(traces: list[dict], metric: FaithfulnessMetric) -> list[dict]:
         )
         metric.measure(cas_test)
         verdict_deepeval = "fondee" if metric.success else "refus_fidelite"
-        resultats.append(
-            {
-                "id": t["id"],
-                "verdict_local": t["verdict_local"],
-                "score_deepeval": metric.score,
-                "verdict_deepeval": verdict_deepeval,
-                "accord": t["verdict_local"] == verdict_deepeval,
-            }
-        )
+        resultat = {
+            "id": t["id"],
+            "verdict_local": t["verdict_local"],
+            "score_deepeval": metric.score,
+            "verdict_deepeval": verdict_deepeval,
+            "accord": t["verdict_local"] == verdict_deepeval,
+        }
+        resultats.append(resultat)
+        if sur_resultat is not None:
+            sur_resultat(resultat)
     return resultats
+
+
+def _quota_journalier(exc: Exception) -> bool:
+    """Vrai si Groq refuse pour quota journalier (et non par minute) : seul le
+    message distingue les deux, sous le même code 429."""
+    return "per day" in str(exc)
 
 
 def _tableau(resultats: list[dict]) -> str:
@@ -131,6 +147,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=None, help="limiter aux N premiers cas comparables")
     parser.add_argument("--threshold", type=float, default=0.5, help="seuil de succès deepeval (défaut 0.5)")
+    parser.add_argument(
+        "--traces", type=Path, default=FICHIER_TRACES, help="fichier de traces JSONL (run_eval.py)"
+    )
+    parser.add_argument(
+        "--resultats", type=Path, default=FICHIER_RESULTATS,
+        help="résultats déjà notés (reprise) et nouveaux résultats",
+    )
     args = parser.parse_args()
 
     if "GROQ_API_KEY" not in os.environ:
@@ -143,15 +166,18 @@ def main() -> None:
     if "GROQ_API_KEY" not in os.environ:
         raise SystemExit("GROQ_API_KEY manquant (ni dans l'environnement, ni dans .env).")
 
-    if not FICHIER_TRACES.exists():
+    if not args.traces.exists():
         raise SystemExit(
-            f"{FICHIER_TRACES} introuvable — lancer d'abord run_eval.py (venv .venv, cf. CLAUDE.md)."
+            f"{args.traces} introuvable — lancer d'abord run_eval.py (venv .venv, cf. CLAUDE.md)."
         )
 
-    traces = charger_traces(FICHIER_TRACES)
+    traces = charger_traces(args.traces)
     comparables = [t for t in traces if t["verdict_local"] in VERDICTS_COMPARABLES]
+    deja = charger_traces(args.resultats) if args.resultats.exists() else []
+    notes = {r["id"] for r in deja}
+    a_noter = [t for t in comparables if t["id"] not in notes]
     if args.limit:
-        comparables = comparables[: args.limit]
+        a_noter = a_noter[: args.limit]
 
     # openai/gpt-oss-20b (modèle par défaut de la production, generator.py)
     # génère parfois un JSON mal formé sur les sorties longues de deepeval
@@ -164,11 +190,31 @@ def main() -> None:
     llm = GroqDeepEvalLLM(model="openai/gpt-oss-120b")
     metric = FaithfulnessMetric(threshold=args.threshold, model=llm, include_reason=False, async_mode=False)
 
-    print(f"Notation deepeval de {len(comparables)} cas comparables (appels Groq indépendants)…")
-    resultats = comparer(comparables, metric)
+    print(
+        f"Notation deepeval de {len(a_noter)} cas comparables "
+        f"({len(notes)} déjà notés, appels Groq indépendants)…"
+    )
+    args.resultats.parent.mkdir(exist_ok=True)
 
+    def sauver(resultat: dict) -> None:
+        with args.resultats.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(resultat, ensure_ascii=False) + "\n")
+
+    from groq import RateLimitError
+
+    try:
+        comparer(a_noter, metric, sur_resultat=sauver)
+    except RateLimitError as exc:
+        if not _quota_journalier(exc):
+            raise
+        print("\nQuota journalier Groq atteint : relancer plus tard, la notation reprendra.")
+
+    resultats = charger_traces(args.resultats) if args.resultats.exists() else []
+    restants = len(comparables) - len({r["id"] for r in resultats})
     print()
     print(_tableau(resultats))
+    if restants:
+        print(f"\n{restants} cas restent à noter.")
     accord = sum(r["accord"] for r in resultats)
     print(f"\nAccord garde-fou local / deepeval : {accord}/{len(resultats)}")
 

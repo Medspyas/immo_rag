@@ -23,6 +23,8 @@ Contenu du fichier :
 - ReponseGeneree : la réponse rédigée, ou un refus motivé, avec ses citations.
 - LLM : contrat commun aux fournisseurs de modèle de langage.
 - GroqLLM : implémentation Groq (gratuite, par défaut).
+- ModeleIndisponible : erreur d'un modèle saturé ou momentanément en panne.
+- LLMEnCascade : passe au modèle suivant quand le premier est saturé.
 - get_llm : sélectionne l'implémentation selon .env.
 - generer_reponse : construit la consigne, appelle le modèle, lit sa réponse.
 - verifier_citations : confronte chaque passage cité au texte des articles.
@@ -53,10 +55,20 @@ connaissance extérieure, même si tu penses la connaître.
 - Si les articles ne permettent pas de répondre, refuse : il vaut mieux ne pas \
 répondre qu'inventer, dans un domaine réglementé.
 - Un article signalé « ABROGÉ » ne doit pas être présenté comme le droit en vigueur.
+- La ligne « Situé dans » indique le régime auquel un article s'applique \
+(par exemple les logements meublés, ou le bail mobilité). Une règle propre à \
+un régime particulier ne doit jamais être présentée comme la règle générale : \
+précise toujours le régime concerné, et donne d'abord la règle générale \
+lorsqu'un article la fournit.
+- N'affirme pas qu'une règle ou une exception est la seule (« uniquement », \
+« seulement ») si l'article ne le dit pas : d'autres textes peuvent en prévoir.
 - Réponds en français, dans une langue claire, en structurant la réponse quand \
 c'est utile (cas, étapes, conditions).
 - Pour chaque affirmation, cite le passage EXACT qui la fonde : recopie mot pour \
 mot une phrase ou une portion de phrase de l'article, pas l'article entier.
+- Une citation contient UNE seule phrase ou UN seul élément de liste, sans rien \
+retirer au milieu. Pour appuyer une liste, fais une citation par élément, ou \
+cite seulement la phrase qui introduit la liste.
 
 Réponds au format JSON, sans texte autour :
 {"refus": false, "reponse": "<ta réponse en français>", "citations": [{"doc_id": \
@@ -119,17 +131,47 @@ class LLM(ABC):
 class GroqLLM(LLM):
     """Implémentation Groq : gratuite, retenue par défaut."""
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, max_essais: int = GROQ_MAX_ESSAIS):
         from groq import Groq
 
         # Le forfait gratuit Groq plafonne les tokens par minute : deux appels
         # rapprochés (rédaction puis juge de repli) peuvent le dépasser
         # (429, constaté le 2026-09-24). Le client réessaie alors après
         # l'attente indiquée par Groq ; 2 essais par défaut ne suffisaient pas.
-        self._client = Groq(api_key=api_key, max_retries=GROQ_MAX_ESSAIS)
+        # Dans une cascade (LLMEnCascade), max_essais=0 : un modèle saturé
+        # passe la main au suivant au lieu d'attendre.
+        self._client = Groq(api_key=api_key, max_retries=max_essais)
         self._model = model
+        self.nom = model
 
     def generer(self, consigne: str, question: str) -> str:
+        from groq import (
+            APIConnectionError,
+            APIStatusError,
+            InternalServerError,
+            RateLimitError,
+        )
+
+        try:
+            return self._appeler(consigne, question)
+        except RateLimitError as exc:
+            # Groq signale le plafond journalier (« tokens per day (TPD) »,
+            # « requests per day ») par le même code 429 que le plafond par
+            # minute : seul le message les distingue.
+            if "per day" in str(exc):
+                raise QuotaJournalierEpuise(f"{self._model} : {exc}") from exc
+            raise ModeleIndisponible(f"{self._model} : {exc}") from exc
+        except (InternalServerError, APIConnectionError) as exc:
+            raise ModeleIndisponible(f"{self._model} : {exc}") from exc
+        except APIStatusError as exc:
+            # 413 : une seule requête dépasse le plafond de tokens par minute du
+            # modèle. Un autre modèle de la cascade peut l'accepter ; sinon
+            # l'API répond 503 plutôt que de planter.
+            if exc.status_code == 413:
+                raise ModeleIndisponible(f"{self._model} : {exc}") from exc
+            raise
+
+    def _appeler(self, consigne: str, question: str) -> str:
         reponse = self._client.chat.completions.create(
             model=self._model,
             messages=[
@@ -150,13 +192,85 @@ class GroqLLM(LLM):
         return reponse.choices[0].message.content
 
 
-def get_llm(settings: Settings) -> LLM:
-    """Sélectionne l'implémentation selon le réglage LLM_PROVIDER de .env."""
+class ModeleIndisponible(Exception):
+    """Le modèle ne peut pas répondre maintenant : quota atteint, surcharge ou
+    coupure réseau. Un autre modèle peut prendre le relais."""
+
+
+class QuotaJournalierEpuise(ModeleIndisponible):
+    """Le quota du jour du modèle est consommé : attendre quelques secondes
+    n'y change rien, il ne répondra plus avant des heures."""
+
+
+class LLMEnCascade(LLM):
+    """Répartit les appels sur plusieurs modèles pour contourner le quota.
+
+    Le forfait gratuit Groq plafonne chaque modèle séparément (8000 tokens par
+    minute chacun, vérifié le 2026-09-29 sur les compteurs renvoyés par Groq).
+    Un modèle saturé renvoie aussitôt ModeleIndisponible et l'appel passe au
+    suivant, sans attente. Si tous sont saturés, un modèle de
+    `derniers_recours` (même modèle, mais qui attend la fin de la limite puis
+    réessaie) répond : celui du premier modèle dont le quota du jour n'est pas
+    épuisé. Attendre un modèle épuisé pour la journée bloquait l'appel puis
+    échouait, alors qu'un autre modèle pouvait répondre (constaté le
+    2026-10-03 : quota journalier du juge gpt-oss-120b consommé).
+    """
+
+    def __init__(self, modeles: list[LLM], derniers_recours: list[LLM]):
+        if len(modeles) != len(derniers_recours):
+            raise ValueError("un dernier recours par modèle de la cascade")
+        self._modeles = modeles
+        self._derniers_recours = derniers_recours
+        # Modèles qui ont effectivement répondu, dans l'ordre des appels : les
+        # modèles ne jugent pas tous pareil, l'évaluation doit savoir lequel a
+        # tranché (run_eval.py).
+        self.historique: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        epuises: set[int] = set()
+        for rang, modele in enumerate(self._modeles):
+            try:
+                brut = modele.generer(consigne, question)
+                self.historique.append(getattr(modele, "nom", "?"))
+                return brut
+            except QuotaJournalierEpuise:
+                epuises.add(rang)
+            except ModeleIndisponible:
+                continue
+        for rang, recours in enumerate(self._derniers_recours):
+            if rang not in epuises:
+                brut = recours.generer(consigne, question)
+                self.historique.append(f"{getattr(recours, 'nom', '?')} (attente)")
+                return brut
+        raise QuotaJournalierEpuise("quota du jour épuisé pour tous les modèles")
+
+
+def get_llm(settings: Settings, premier: str | None = None) -> LLM:
+    """Sélectionne l'implémentation selon le réglage LLM_PROVIDER de .env.
+
+    Avec des modèles de relais (llm_modeles_relais), les appels passent par
+    une cascade : llm_model d'abord, puis les relais dans l'ordre. premier
+    place un autre modèle en tête (cf. get_llm_juge).
+    """
     if settings.llm_provider == "groq":
         if not settings.groq_api_key:
             raise ValueError("GROQ_API_KEY manquant dans .env")
-        return GroqLLM(settings.groq_api_key, settings.llm_model)
+        cle = settings.groq_api_key
+        tete = premier or settings.llm_model
+        noms = list(dict.fromkeys([tete, settings.llm_model, *settings.llm_modeles_relais]))
+        if len(noms) == 1:
+            return GroqLLM(cle, tete)
+        return LLMEnCascade(
+            [GroqLLM(cle, nom, max_essais=0) for nom in noms],
+            derniers_recours=[GroqLLM(cle, nom) for nom in noms],
+        )
     raise ValueError(f"Fournisseur LLM inconnu : {settings.llm_provider}")
+
+
+def get_llm_juge(settings: Settings) -> LLM:
+    """LLM du juge de repli de verifier_fidelite : llm_modele_juge en tête,
+    les modèles de génération en relais."""
+    return get_llm(settings, premier=settings.llm_modele_juge)
 
 
 # Budget de caractères pour le bloc d'articles envoyé au LLM. Le forfait
@@ -170,7 +284,9 @@ def get_llm(settings: Settings) -> LLM:
 LONGUEUR_MAX_CONTEXTE_CARACTERES = 24_000
 
 
-def _bloc_articles(resultats: list[_ResultatRecherche]) -> str:
+def _bloc_articles(
+    resultats: list[_ResultatRecherche], budget: int = LONGUEUR_MAX_CONTEXTE_CARACTERES
+) -> str:
     """Met en forme les articles récupérés pour la consigne.
 
     Les articles arrivent déjà triés par pertinence (retriever.py) : au-delà
@@ -185,8 +301,14 @@ def _bloc_articles(resultats: list[_ResultatRecherche]) -> str:
     for i, r in enumerate(resultats, start=1):
         article = r.metadata.get("article", "?")
         marque = " — ABROGÉ" if r.metadata.get("abroge") else ""
-        bloc = f"[{i}] Document : {r.doc_id} — Article {article}{marque}\n{r.content}"
-        if blocs and longueur + len(bloc) > LONGUEUR_MAX_CONTEXTE_CARACTERES:
+        section = r.metadata.get("section")
+        # L'intitulé (« Titre Ier bis : … logements meublés … ») dit à quel
+        # régime l'article s'applique, ce que son texte ne répète pas toujours.
+        situation = f"\nSitué dans : {section}" if section else ""
+        bloc = (
+            f"[{i}] Document : {r.doc_id} — Article {article}{marque}{situation}\n{r.content}"
+        )
+        if blocs and longueur + len(bloc) > budget:
             break
         blocs.append(bloc)
         longueur += len(bloc)
@@ -236,6 +358,16 @@ SEUIL_CITATION = 0.85
 # exact est retenu : un fragment court se retrouverait trop facilement par
 # hasard dans un long article.
 _LONGUEUR_MIN_APPROX = 15
+# Tolérance aux fautes de frappe dans une citation : longueur minimale d'un
+# mot pour l'admettre, similarité minimale avec le mot d'origine, et marge
+# (en caractères) autour de la zone de l'article où le passage est ancré.
+_BLOC_MIN_APPROX = 5
+_SIMILARITE_FAUTE_DE_FRAPPE = 0.8
+_MARGE_APPROX = 20
+
+# Points de suspension par lesquels le modèle abrège une citation : « ... »,
+# « … » ou « [...] ».
+_ELLIPSE = re.compile(r"\[?(?:\.{3}|…)\]?")
 
 
 def _normaliser(texte: str) -> str:
@@ -250,22 +382,72 @@ def _normaliser(texte: str) -> str:
 def _passage_present(passage: str, contenu: str, seuil: float) -> bool:
     """Indique si le passage figure dans le contenu de l'article.
 
-    Un passage présent tel quel (après normalisation) est accepté. Sinon, pour
-    un passage assez long, un écart mineur est toléré tant que la plus longue
-    portion commune couvre au moins `seuil` du passage.
+    Un passage abrégé par des points de suspension est découpé en fragments :
+    chacun doit figurer dans l'article, dans l'ordre de la citation.
     """
-    p = _normaliser(passage)
     c = _normaliser(contenu)
-    if not p:
+    fragments = [f for f in (_normaliser(m) for m in _ELLIPSE.split(passage)) if f]
+    if not fragments:
         return False
-    if p in c:
-        return True
+    debut = 0
+    for fragment in fragments:
+        position = c.find(fragment, debut)
+        if position >= 0:
+            debut = position + len(fragment)
+        elif not _fragment_approche(fragment, c[debut:], seuil):
+            return False
+    return True
+
+
+def _fragment_approche(p: str, c: str, seuil: float) -> bool:
+    """Rapprochement approché d'un fragment déjà normalisé : pour un fragment
+    assez long, un écart mineur est toléré tant que la plus longue portion
+    commune couvre au moins `seuil` du fragment.
+
+    Une faute de frappe au milieu d'une longue citation (« alinéau ») coupe
+    cette portion commune en deux : le fragment est alors comparé mot à mot à
+    la zone de l'article où il s'ancre (_fautes_de_frappe_seulement)."""
     if len(p) < _LONGUEUR_MIN_APPROX:
         return False
-    bloc = SequenceMatcher(None, p, c, autojunk=False).find_longest_match(
+    ancre = SequenceMatcher(None, p, c, autojunk=False).find_longest_match(
         0, len(p), 0, len(c)
     )
-    return bloc.size / len(p) >= seuil
+    if ancre.size / len(p) >= seuil:
+        return True
+    debut = max(ancre.b - ancre.a - _MARGE_APPROX, 0)
+    zone = c[debut : ancre.b - ancre.a + len(p) + _MARGE_APPROX]
+    return _fautes_de_frappe_seulement(p.split(), zone.split())
+
+
+def _fautes_de_frappe_seulement(mots: list[str], zone: list[str]) -> bool:
+    """Indique si les mots du fragment se retrouvent à la suite dans la zone,
+    chacun à l'identique ou à une faute de frappe près.
+
+    Aucun mot ajouté, retiré ou remplacé n'est toléré : « six mois » au lieu
+    de « trois mois » change le sens. Une faute de frappe n'est admise que sur
+    un mot long et sans chiffre, très proche de l'original."""
+    operations = SequenceMatcher(None, mots, zone, autojunk=False).get_opcodes()
+    # Seules comptent les opérations qui touchent le fragment, entre son
+    # premier et son dernier mot : la zone déborde du passage de part et d'autre.
+    internes = [op for op in operations if op[1] < op[2] or 0 < op[1] < len(mots)]
+    for operation, i1, i2, j1, j2 in internes:
+        if operation == "equal":
+            continue
+        if operation != "replace" or i2 - i1 != j2 - j1:
+            return False
+        if not all(_faute_de_frappe(a, b) for a, b in zip(mots[i1:i2], zone[j1:j2])):
+            return False
+    return True
+
+
+def _faute_de_frappe(mot: str, original: str) -> bool:
+    """Un mot long, sans chiffre, qui ne diffère de l'original que d'une ou
+    deux lettres (« alineau » pour « alinea »)."""
+    if min(len(mot), len(original)) < _BLOC_MIN_APPROX:
+        return False
+    if any(ch.isdigit() for ch in mot + original):
+        return False
+    return SequenceMatcher(None, mot, original).ratio() >= _SIMILARITE_FAUTE_DE_FRAPPE
 
 
 def _articles_candidats(
@@ -281,6 +463,86 @@ def _articles_candidats(
         and str(r.metadata.get("article")) == str(citation.article)
     ]
     return exacts or list(resultats)
+
+
+def citations_introuvables(
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    seuil: float = SEUIL_CITATION,
+) -> list[Citation]:
+    """Citations de la réponse qui ne se retrouvent dans aucun article récupéré."""
+    return [
+        citation
+        for citation in reponse.citations
+        if not any(
+            _passage_present(citation.passage, r.content, seuil)
+            for r in _articles_candidats(citation, resultats)
+        )
+    ]
+
+
+def _phrase_la_plus_proche(citation: Citation, resultats: list[_ResultatRecherche]) -> str:
+    """Phrase des articles candidats la plus ressemblante au passage cité,
+    proposée au modèle comme modèle exact à recopier."""
+    cible = _normaliser(citation.passage)
+    phrases = [
+        texte
+        for r in _articles_candidats(citation, resultats)
+        for _, texte in _phrases_source(r.content)
+    ]
+    return max(
+        phrases,
+        key=lambda p: SequenceMatcher(None, cible, _normaliser(p), autojunk=False).ratio(),
+        default="",
+    )
+
+
+def corriger_citations(
+    question: str,
+    resultats: list[_ResultatRecherche],
+    llm: LLM,
+    reponse: ReponseGeneree,
+    seuil: float = SEUIL_CITATION,
+) -> ReponseGeneree:
+    """Seconde chance, unique, pour une réponse dont des citations sont
+    introuvables.
+
+    Un LLM reformule parfois légèrement le passage qu'il recopie (« Lorsque le
+    congé émane » pour « Lorsqu'il émane ») : la vérification refuse à juste
+    titre, mais la réponse pouvait être juste. Le modèle reçoit alors les
+    citations fautives et doit renvoyer sa réponse avec des citations
+    recopiées mot pour mot. La vérification n'est pas assouplie : la nouvelle
+    réponse repasse ensuite par verifier_citations comme la première.
+
+    Renvoie la réponse telle quelle si elle est un refus ou si toutes ses
+    citations sont retrouvées (aucun appel supplémentaire).
+    """
+    if reponse.refus:
+        return reponse
+    introuvables = citations_introuvables(reponse, resultats, seuil)
+    if not introuvables:
+        return reponse
+    fautives = "\n".join(
+        f"- Article {c.article} ({c.doc_id}) : « {c.passage} »\n"
+        f"  phrase exacte la plus proche dans l'article : « {_phrase_la_plus_proche(c, resultats)} »"
+        for c in introuvables
+    )
+    suite = (
+        f"\n\nTa réponse précédente :\n{reponse.model_dump_json()}"
+        f"\n\nCes citations ne figurent pas mot pour mot dans les articles :\n{fautives}"
+        "\n\nRenvoie ta réponse complète, au même format JSON, en recopiant chaque "
+        "citation exactement comme dans l'article (mêmes mots, même ordre). Une "
+        "citation qui recolle plusieurs phrases ou éléments de liste doit être "
+        "découpée en plusieurs citations, une par phrase ou élément, recopiés en "
+        "entier. Si un passage exact ne fonde pas une affirmation, retire cette "
+        "affirmation."
+    )
+    # La réponse précédente et les citations fautives s'ajoutent aux articles :
+    # le bloc d'articles leur cède la place, sans quoi la requête dépassait le
+    # plafond de Groq (413, 8412 tokens pour 8000, q02 le 2026-10-05).
+    articles = _bloc_articles(resultats, LONGUEUR_MAX_CONTEXTE_CARACTERES - len(suite))
+    message = f"Question : {question}\n\nArticles disponibles :\n\n{articles}{suite}"
+    return _lire_reponse(llm.generer(CONSIGNE, message))
 
 
 def verifier_citations(
@@ -300,14 +562,7 @@ def verifier_citations(
     if not reponse.citations:
         return ReponseGeneree(refus=True, motif="réponse sans citation")
 
-    introuvables = [
-        citation
-        for citation in reponse.citations
-        if not any(
-            _passage_present(citation.passage, r.content, seuil)
-            for r in _articles_candidats(citation, resultats)
-        )
-    ]
+    introuvables = citations_introuvables(reponse, resultats, seuil)
     if introuvables:
         exemple = introuvables[0].passage
         return ReponseGeneree(
@@ -321,35 +576,84 @@ def verifier_citations(
 # --- Garde-fou étage 2 : fidélité de la réponse aux articles cités ----------
 
 # Découpe une ligne de réponse en phrases : un point, un point d'exclamation ou
-# d'interrogation suivi d'une espace.
-_SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])\s+")
+# d'interrogation suivi d'une espace. Le point d'une référence légale (« L. 126-26 »,
+# « R. 111-1 », « art. 3 ») ne termine pas la phrase : couper là produisait
+# des fragments sans contenu (« 126-26 du code de la construction ») refusés
+# par le juge (mesuré sur q03, q14, q22, q28 le 2026-10-03).
+_SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])(?<!\b[LRDA]\.)(?<!\bart\.)\s+")
 # Début d'un élément de liste : « 1. », « 2) », « - », « • », « * ».
 _PUCE = re.compile(r"^\s*(?:\d+[.)]|[-•*])\s+")
+# Élément de liste numérotée écrit à la suite du précédent, sur la même ligne
+# (« 1. Assurer … communes. 2. Mettre à jour … ») : remis à la ligne pour être
+# vérifié seul.
+_PUCE_EN_LIGNE = re.compile(r"(?<=[.;:])[ \t]+(?=\d{1,2}[.)][ \t])")
 # « Oui, » / « Non. » en tête de réponse : une réaction à la question, pas une
 # affirmation que le texte source pourrait impliquer.
 _OUI_NON = re.compile(r"^(?:oui|non)\s*[,.:]\s*", re.IGNORECASE)
+# « Par ailleurs, l'article 19 précise que … » : une formule d'attribution que
+# le texte de l'article ne contient pas, et qui suffit à faire échouer le NLI
+# alors que le fond est fidèle. L'attribution elle-même relève de
+# verifier_citations ; seul le contenu rapporté est confronté aux sources.
+_ATTRIBUTION = re.compile(
+    r"^(?:(?:par ailleurs|en effet|de plus|en outre|ainsi|enfin)\s*,\s*)?"
+    r"l['’]article\s+[^,«»]{1,60}?\s+"
+    r"(?:précise|dispose|prévoit|indique|énonce|ajoute|stipule)\s+qu(?:e\s+|['’])",
+    re.IGNORECASE,
+)
+# Fragments qui n'affirment rien et que la découpe en phrases isole : un
+# numéro d'étape écrit dans le texte (« article 20. 1. Le notaire… » donne
+# « 1. », ou « 3 bis. » dans la numérotation légale), ou un renvoi seul
+# après « etc. » (« (article 18-1 AA). »). La référence elle-même relève de
+# verifier_citations.
+_SANS_CONTENU = re.compile(
+    r"^\(?\s*(?:\d+°?(?:\s*(?:bis|ter|quater))?|(?:articles?|art\.)\s+[\w\s.,‑-]{1,40})\s*\)?\s*[.;:]?$",
+    re.IGNORECASE,
+)
 # Découpe d'un article en phrases : ponctuation forte, point-virgule ou
 # deux-points (qui séparent les éléments d'une énumération légale).
 _SEPARATEUR_PHRASE_SOURCE = re.compile(r"(?<=[.!?;:])\s+")
+# Début d'un élément d'énumération légale : « a) », « 2° », « 3o » (PDF).
+_ELEMENT_ENUMERATION = re.compile(r"^«?\s*(?:[a-z]\)|\d+\s*(?:°|o\b))")
 
 # Un extrait regroupe quelques phrases consécutives de l'article : assez pour
 # garder le contexte immédiat d'une phrase, assez court pour le modèle NLI,
 # entraîné sur des prémisses de la taille d'une phrase (un article entier lui
 # fait rejeter même des paraphrases quasi littérales — mesuré le 2026-09-24).
 _PHRASES_PAR_EXTRAIT = 3
+# Longueur maximale (en caractères) d'une énumération soumise d'un bloc au
+# NLI : au-delà, le modèle tronque le texte et perd la fin de la liste.
+_LONGUEUR_MAX_ENUMERATION = 1500
+# Intitulé d'un régime à part : « Dispositions particulières aux syndicats dont
+# le nombre de voix est réparti entre deux copropriétaires », logements meublés,
+# bail mobilité, résidences-services. Le NLI ne lit que le texte de l'article,
+# pas cet intitulé : il validait une règle propre aux copropriétés à deux
+# présentée comme générale (q21, art. 41-15, mesuré le 2026-10-05).
+_REGIME_PARTICULIER = re.compile(r"particuli|meublé|mobilité|résidences-services", re.IGNORECASE)
 # Nombre d'extraits soumis au NLI pour chaque affirmation, retenus parmi ceux
 # qui partagent le plus de mots avec elle : évite de passer tout l'article au
 # modèle, ce qui coûterait un passage NLI par extrait.
 _EXTRAITS_PAR_AFFIRMATION = 8
 
-CONSIGNE_JUGE_FIDELITE = """Tu vérifies si une affirmation est fondée sur un texte source, dans le \
+CONSIGNE_JUGE_FIDELITE = """Tu vérifies si des affirmations sont fondées sur un texte source, dans le \
 cadre d'un assistant juridique qui ne doit rien avancer que le texte ne dise \
 vraiment.
 
-Réponds UNIQUEMENT par ce JSON, sans texte autour :
-{"fondee": true} si le texte source implique l'affirmation (dit la même chose, \
-même reformulée) ; {"fondee": false} sinon (l'affirmation va au-delà du texte, \
-le contredit, ou n'a pas de rapport avec lui)."""
+Les affirmations sont numérotées. Pour chacune, réponds true si le texte source \
+l'implique (dit la même chose, même reformulée, y compris le régime indiqué par \
+l'intitulé « Situé dans ») ; false sinon (elle va au-delà du texte, le contredit, \
+ou n'a pas de rapport avec lui). En droit, le présent de l'indicatif exprime une \
+obligation : « un état des lieux est établi » signifie qu'il doit l'être. Si le \
+texte réserve la règle à une condition ou à un cas particulier (« quand », \
+« lorsque », « toutefois », un régime précis) et que l'affirmation la présente \
+comme la règle générale sans cette condition, réponds false.
+
+La réponse complète est fournie seulement pour comprendre les renvois d'une \
+affirmation (« ce délai », « il ») : elle n'est pas une source, seul le texte \
+source fonde une affirmation.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour, une valeur par affirmation \
+dans l'ordre :
+{"fondees": [true, false, ...]}"""
 
 
 class _NLI(Protocol):
@@ -373,46 +677,119 @@ def _decouper_en_affirmations(texte: str) -> list[str]:
     sujet. Chaque élément de liste est donc rattaché à la phrase qui
     l'introduit (celle qui se termine par « : »), pour former une affirmation
     complète que le NLI peut vérifier.
+
+    Une liste écrite sur une seule ligne est d'abord remise à raison d'un
+    élément par ligne : vérifiée d'un bloc, elle passait grâce à ses éléments
+    exacts même quand l'un d'eux était faux (mesuré sur q22 le 2026-10-03 :
+    implication 0,99 pour trois missions dont une prêtée à tort au syndic).
     """
     affirmations: list[str] = []
     introduction: str | None = None
-    for ligne in texte.splitlines():
+    # Introduction de la liste principale, rétablie après une sous-liste.
+    introduction_principale: str | None = None
+    for ligne in _PUCE_EN_LIGNE.sub("\n", texte).splitlines():
         if not ligne.strip():
             continue
         if _PUCE.match(ligne):
+            if not ligne[:1].isspace():
+                introduction = introduction_principale
+            # Un élément de plusieurs phrases donne une affirmation par phrase ;
+            # seule la première porte l'introduction de la liste.
             element = _PUCE.sub("", ligne).strip()
-            affirmations.append(f"{introduction} {element}" if introduction else element)
+            sous_introduction: str | None = None
+            for rang, phrase in enumerate(p.strip() for p in _SEPARATEUR_PHRASE.split(element)):
+                if not phrase:
+                    continue
+                if phrase.endswith(":"):
+                    # « 3. Saisine du juge : … Le juge peut : » puis une
+                    # sous-liste : la phrase introduit les éléments suivants
+                    # et n'affirme rien seule (q16, refus à tort le 2026-10-05).
+                    sous_introduction = phrase[:-1].strip()
+                    continue
+                avec_introduction = introduction and rang == 0
+                affirmations.append(f"{introduction} notamment : {phrase}" if avec_introduction else phrase)
+            if sous_introduction:
+                introduction = sous_introduction
             continue
         for phrase in _SEPARATEUR_PHRASE.split(ligne.strip()):
             phrase = phrase.strip()
             if not phrase:
                 continue
             if phrase.endswith(":"):
-                introduction = phrase[:-1].strip()
+                introduction = introduction_principale = phrase[:-1].strip()
                 continue
-            introduction = None
+            introduction = introduction_principale = None
             affirmations.append(phrase)
-    affirmations = [_OUI_NON.sub("", a).strip() for a in affirmations]
-    return [a for a in affirmations if a]
+    affirmations = [_ATTRIBUTION.sub("", _OUI_NON.sub("", a)).strip() for a in affirmations]
+    # Une ligne faite seulement de ponctuation (un guillemet fermant « » »)
+    # n'affirme rien.
+    return [a for a in affirmations if re.search(r"\w", a) and not _SANS_CONTENU.match(a)]
+
+
+def _phrases_source(contexte: str) -> list[tuple[str | None, str]]:
+    """Découpe un article en phrases, chacune avec l'introduction de
+    l'énumération à laquelle elle appartient (ou None).
+
+    Les textes issus de PDF gardent les retours à la ligne de la mise en page,
+    y compris au milieu d'une phrase : les lignes sont donc recollées avant la
+    découpe, seule la ponctuation marque une fin de phrase.
+
+    Dans une énumération légale (« … doivent préciser : » puis des éléments
+    terminés par « ; »), un élément seul n'a pas de sujet. L'introduction reste
+    attachée aux éléments jusqu'au point qui clôt l'énumération. Un élément
+    peut lui-même contenir un point (« a) … à l'article 24. Lorsque … ; ») :
+    l'élément suivant (« b) », « 2° ») reprend alors la dernière introduction.
+    """
+    texte = " ".join(ligne.strip() for ligne in contexte.splitlines() if ligne.strip())
+    phrases: list[tuple[str | None, str]] = []
+    introduction: str | None = None
+    derniere_introduction: str | None = None
+    for phrase in _SEPARATEUR_PHRASE_SOURCE.split(texte):
+        phrase = phrase.strip()
+        if not phrase:
+            continue
+        if introduction is None and _ELEMENT_ENUMERATION.match(phrase):
+            introduction = derniere_introduction
+        phrases.append((introduction, phrase))
+        if phrase.endswith(":"):
+            introduction = derniere_introduction = phrase
+        elif phrase.endswith((".", "!", "?")):
+            introduction = None
+    return phrases
 
 
 def _extraits(contextes: list[str]) -> list[str]:
     """Découpe les articles en extraits de quelques phrases consécutives, qui
     se chevauchent (fenêtre glissante d'une phrase) pour qu'aucune phrase ne
-    soit séparée de ses voisines immédiates."""
+    soit séparée de ses voisines immédiates.
+
+    Un extrait qui commence au milieu d'une énumération reprend en tête
+    l'introduction de celle-ci, pour que le NLI sache de quoi parlent les
+    éléments.
+
+    Chaque énumération assez courte donne en plus un extrait complet
+    (introduction et tous ses éléments) : une affirmation qui résume toute la
+    liste ne peut être impliquée par une fenêtre de trois phrases."""
     extraits: list[str] = []
     for contexte in contextes:
-        phrases = [
-            p.strip()
-            for ligne in contexte.splitlines()
-            for p in _SEPARATEUR_PHRASE_SOURCE.split(ligne)
-            if p.strip()
-        ]
+        phrases = _phrases_source(contexte)
         n = _PHRASES_PAR_EXTRAIT
-        if len(phrases) <= n:
-            extraits.append(" ".join(phrases))
-        else:
-            extraits.extend(" ".join(phrases[i : i + n]) for i in range(len(phrases) - n + 1))
+        debuts = range(max(len(phrases) - n + 1, 1)) if phrases else range(0)
+        for i in debuts:
+            fenetre = phrases[i : i + n]
+            introduction = fenetre[0][0]
+            textes = [texte for _, texte in fenetre]
+            if introduction:
+                textes.insert(0, introduction)
+            extraits.append(" ".join(textes))
+        elements: dict[str, list[str]] = {}
+        for introduction, texte in phrases:
+            if introduction:
+                elements.setdefault(introduction, []).append(texte)
+        for introduction, textes in elements.items():
+            complet = " ".join([introduction, *textes])
+            if len(textes) > n - 1 and len(complet) <= _LONGUEUR_MAX_ENUMERATION:
+                extraits.append(complet)
     return [e for e in extraits if e]
 
 
@@ -428,10 +805,10 @@ def _preselectionner(extraits: list[str], affirmation: str) -> list[str]:
     ]
 
 
-def _contextes_cites(
+def _articles_cites(
     reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
-) -> list[str]:
-    """Textes des articles cités par la réponse, à confronter aux affirmations.
+) -> list[_ResultatRecherche]:
+    """Articles cités par la réponse, à confronter aux affirmations.
 
     Restreint aux articles réellement cités : c'est leur contenu, et non celui
     de tous les articles récupérés, que la réponse est censée refléter. Repli
@@ -440,24 +817,46 @@ def _contextes_cites(
     utilisable seule).
     """
     cites = {(c.doc_id, str(c.article)) for c in reponse.citations}
-    contextes = [
-        r.content
-        for r in resultats
-        if (r.doc_id, str(r.metadata.get("article"))) in cites
+    articles = [
+        r for r in resultats if (r.doc_id, str(r.metadata.get("article"))) in cites
     ]
-    return contextes or [r.content for r in resultats]
+    return articles or list(resultats)
 
 
-def _juger_fidelite(affirmation: str, contexte: str, llm: LLM) -> bool:
-    """Repli pour les cas ambigus : demande à un LLM si le texte source fonde
-    l'affirmation. Une réponse illisible est traitée comme non fondée, par
-    prudence dans un domaine réglementé."""
-    message = f"Texte source :\n{contexte}\n\nAffirmation à vérifier :\n{affirmation}"
+def _contextes_cites(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> list[str]:
+    """Textes des articles cités par la réponse (cf. _articles_cites)."""
+    return [r.content for r in _articles_cites(reponse, resultats)]
+
+
+def _juger_fidelite(
+    affirmations: list[str], contexte: str, llm: LLM, reponse_complete: str = ""
+) -> list[bool]:
+    """Repli pour les affirmations que le NLI n'a pas validées : demande à un
+    LLM si le texte source fonde chacune d'elles.
+
+    Toutes les affirmations douteuses d'une réponse partent dans un seul
+    appel : le quota gratuit de Groq ne permet pas un appel par phrase. Une
+    réponse illisible, ou qui ne donne pas une décision par affirmation, est
+    traitée comme non fondée, par prudence dans un domaine réglementé.
+
+    La réponse complète accompagne les affirmations : une phrase découpée
+    (« Ce délai est réduit à un mois… ») ne dit pas seule de quoi elle parle,
+    et le juge la rejetait à tort (mesuré sur q02 le 2026-10-03)."""
+    liste = "\n".join(f"{i}. {a}" for i, a in enumerate(affirmations, 1))
+    message = f"Texte source :\n{contexte}\n\n"
+    if reponse_complete:
+        message += f"Réponse complète (pour comprendre les renvois) :\n{reponse_complete}\n\n"
+    message += f"Affirmations à vérifier :\n{liste}"
     brut = llm.generer(CONSIGNE_JUGE_FIDELITE, message)
     try:
-        return bool(json.loads(brut).get("fondee", False))
+        fondees = json.loads(brut).get("fondees")
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return False
+        return [False] * len(affirmations)
+    if not isinstance(fondees, list) or len(fondees) != len(affirmations):
+        return [False] * len(affirmations)
+    return [f is True for f in fondees]
 
 
 def verifier_fidelite(
@@ -465,7 +864,6 @@ def verifier_fidelite(
     resultats: list[_ResultatRecherche],
     nli: _NLI,
     seuil_haut: float,
-    seuil_bas: float,
     seuil_contradiction: float,
     llm: LLM | None = None,
 ) -> ReponseGeneree:
@@ -481,11 +879,15 @@ def verifier_fidelite(
     Pour chaque affirmation, on retient le meilleur score d'implication et le
     plus fort score de contradiction parmi ces extraits :
     - implication au-dessus de seuil_haut ET aucune contradiction au-dessus de
-      seuil_contradiction : fondée ;
-    - implication en dessous de seuil_bas : non fondée, refus direct ;
-    - sinon (score ambigu, ou signaux opposés) : le NLI seul ne suffit pas,
-      llm sert de juge de repli sur les articles entiers s'il est fourni ;
-      sans llm, traité comme non fondé (prudence, domaine réglementé).
+      seuil_contradiction, tirée d'un article de régime général : fondée ;
+    - sinon : le NLI seul ne suffit pas, llm sert de juge de repli sur les
+      articles entiers s'il est fourni ; sans llm, traité comme non fondé
+      (prudence, domaine réglementé).
+
+    Un score NLI bas n'entraîne pas de refus direct : mesuré le 2026-09-30, le
+    NLI note bas des affirmations justes (régime déduit de l'intitulé,
+    abréviations, phrases de renvoi). Le NLI sert donc de voie rapide
+    d'acceptation, et le juge tranche le reste, en un seul appel par réponse.
 
     Le contrôle de contradiction protège d'un piège des extraits courts : un
     extrait qui partage les mots de l'affirmation (« dépôt de garantie »,
@@ -502,21 +904,44 @@ def verifier_fidelite(
     if not affirmations:
         return reponse
 
-    contextes = _contextes_cites(reponse, resultats)
-    extraits = _extraits(contextes)
+    cites = _articles_cites(reponse, resultats)
+    extraits = _extraits([r.content for r in cites])
+    # Extraits d'articles d'un régime particulier : une affirmation que le NLI
+    # fonde sur l'un d'eux part au juge, seul à voir l'intitulé « Situé dans ».
+    particuliers = set(
+        _extraits(
+            [r.content for r in cites if _REGIME_PARTICULIER.search(r.metadata.get("section") or "")]
+        )
+    )
+    # Le juge reçoit tous les articles cités ensemble, avec leur intitulé :
+    # une affirmation de synthèse (« trois mois en location vide, un mois en
+    # meublé ») s'appuie sur plusieurs articles à la fois, et seul l'intitulé
+    # dit qu'un article concerne les logements meublés.
+    # Les passages cités viennent en tête : dans plus de 15 000 caractères
+    # d'articles, le juge passait à côté de la phrase utile (mesuré sur q02
+    # le 2026-10-02 : rejet à tort, accepté une fois les passages en tête).
+    passages = "\n".join(f"- Article {c.article} : « {c.passage} »" for c in reponse.citations)
+    texte_cite = f"Passages cités par la réponse :\n{passages}\n\nArticles complets :\n{_bloc_articles(cites)}"
 
+    douteuses: list[str] = []
     for affirmation in affirmations:
-        scores = nli.evaluer(_preselectionner(extraits, affirmation), affirmation)
+        selection = _preselectionner(extraits, affirmation)
+        scores = nli.evaluer(selection, affirmation)
         implication = max((s.implication for s in scores), default=0.0)
         contradiction = max((s.contradiction for s in scores), default=0.0)
-        if implication >= seuil_haut and contradiction < seuil_contradiction:
-            continue
-        if implication <= seuil_bas:
-            fondee = False
-        else:
-            fondee = llm is not None and any(
-                _juger_fidelite(affirmation, c, llm) for c in contextes
-            )
+        regime = any(
+            e in particuliers and s.implication == implication for e, s in zip(selection, scores)
+        )
+        if implication < seuil_haut or contradiction >= seuil_contradiction or regime:
+            douteuses.append(affirmation)
+
+    if not douteuses:
+        return reponse
+    if llm is None:
+        fondees = [False] * len(douteuses)
+    else:
+        fondees = _juger_fidelite(douteuses, texte_cite, llm, reponse.reponse)
+    for affirmation, fondee in zip(douteuses, fondees):
         if not fondee:
             return ReponseGeneree(
                 refus=True,

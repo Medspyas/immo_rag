@@ -9,11 +9,14 @@ Contenu du fichier :
 - Chunk : un morceau prêt à être rangé (texte, vecteur, métadonnées).
 - SearchResult : un morceau retrouvé, avec son score de proximité.
 - MorceauStocke : un morceau rangé, sans son vecteur (cf. VectorStore.tous).
-- VectorStore : ajout, remplacement, suppression et recherche des morceaux.
+- DocumentIndexe : résumé d'un document en base (cf. VectorStore.documents).
+- VectorStore : ajout, remplacement, suppression et recherche des morceaux,
+  liste des documents.
 """
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from uuid import UUID
 
 import psycopg
@@ -52,6 +55,16 @@ class MorceauStocke(BaseModel):
     doc_id: str
     content: str
     metadata: dict
+
+
+class DocumentIndexe(BaseModel):
+    """Résumé d'un document présent en base : ce que la page « documents » du
+    front affiche, sans charger le texte des morceaux."""
+
+    doc_id: str
+    titre: str | None
+    morceaux: int
+    mis_a_jour: datetime
 
 
 class VectorStore:
@@ -117,13 +130,15 @@ class VectorStore:
             )
             conn.commit()
 
-    def delete_by_doc(self, doc_id: str) -> None:
-        """Supprime tous les morceaux d'un document. Opération à effectuer avant
-        la réingestion d'une version à jour, faute de quoi d'anciens morceaux
-        subsistent en base."""
+    def delete_by_doc(self, doc_id: str) -> int:
+        """Supprime tous les morceaux d'un document et renvoie leur nombre (0 :
+        document inconnu). Opération à effectuer avant la réingestion d'une
+        version à jour, faute de quoi d'anciens morceaux subsistent en base."""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
+            supprimes = cur.rowcount
             conn.commit()
+        return supprimes
 
     def search(self, query_embedding: list[float], k: int = 10) -> list[SearchResult]:
         """Renvoie les k morceaux les plus proches du vecteur donné.
@@ -164,4 +179,21 @@ class VectorStore:
             rows = cur.fetchall()
         return [
             MorceauStocke(id=r[0], doc_id=r[1], content=r[2], metadata=r[3]) for r in rows
+        ]
+
+    def documents(self) -> list[DocumentIndexe]:
+        """Liste les documents indexés, avec leur nombre de morceaux et la date
+        de la dernière ingestion. Le titre vient des métadonnées posées au
+        découpage (chunking.titre_document), absent pour un texte sans titre."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT doc_id, max(metadata->>'titre'), count(*), max(updated_at)
+                FROM chunks GROUP BY doc_id ORDER BY doc_id
+                """
+            )
+            rows = cur.fetchall()
+        return [
+            DocumentIndexe(doc_id=r[0], titre=r[1], morceaux=r[2], mis_a_jour=r[3])
+            for r in rows
         ]

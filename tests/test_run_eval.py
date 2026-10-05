@@ -7,6 +7,7 @@ pas la qualité d'un vrai modèle.
 from __future__ import annotations
 
 import json
+import re
 
 from app.config import Settings
 from app.rag.generator import CONSIGNE, CONSIGNE_JUGE_FIDELITE
@@ -42,7 +43,8 @@ class _LLMFake:
 
     def generer(self, consigne: str, question: str) -> str:
         if consigne == CONSIGNE_JUGE_FIDELITE:
-            return json.dumps({"fondee": self._fondee})
+            liste = question.split("Affirmations à vérifier :")[-1]
+            return json.dumps({"fondees": [self._fondee] * len(re.findall(r"^\d+\. ", liste, re.MULTILINE))})
         assert consigne == CONSIGNE
         return self._sortie_generation
 
@@ -108,6 +110,19 @@ def test_verdict_refus_citation_si_la_citation_est_introuvable():
     assert traces[0]["verdict_local"] == "refus_citation"
 
 
+def test_trace_garde_la_generation_brute_et_les_articles():
+    # Même refusée, la réponse brute du LLM est conservée avec ses citations,
+    # pour pouvoir rejouer les garde-fous hors-ligne.
+    traces = list(evaluer(
+        [_CAS_TROUVE], _RetrieverFake(RESULTATS), _LLMFake(_REPONSE_CITATION_INVENTEE), _NLIFake(), _settings()
+    ))
+    generation = traces[0]["generation"]
+    assert generation["citations"][0]["passage"] == "passage qui n'existe pas dans la source"
+    assert traces[0]["articles"] == [
+        {"doc_id": "loi-89-462", "content": "Le délai de préavis est de trois mois.", "metadata": {"article": "15", "abroge": False}}
+    ]
+
+
 def test_verdict_fondee_quand_nli_haut_confirme():
     traces = list(evaluer(
         [_CAS_TROUVE], _RetrieverFake(RESULTATS), _LLMFake(_REPONSE_OK), _NLIFake(score=0.9), _settings()
@@ -143,3 +158,14 @@ def test_traces_existantes_ecarte_une_ligne_coupee(tmp_path):
     fichier.write_text(complete + "\n" + '{"id": "q02", "verd', encoding="utf-8")
     assert [t["id"] for t in traces_existantes(fichier)] == ["q01"]
 
+
+
+def test_evaluer_transmet_k_a_la_recherche():
+    class _RetrieverEspion(_RetrieverFake):
+        def search(self, question: str, k: int) -> list[_Resultat]:
+            self.k = k
+            return super().search(question, k)
+
+    retriever = _RetrieverEspion(RESULTATS)
+    list(evaluer([_CAS_TROUVE], retriever, _LLMFake(_REPONSE_OK), _NLIFake(score=0.9), _settings(), k=5))
+    assert retriever.k == 5

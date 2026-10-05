@@ -150,3 +150,17 @@ def test_evaluer_systeme_calcule_hit_et_mrr():
     assert res.hit_at[1] == 0.5
     assert all(res.hit_at[k] == 0.5 for k in KS)
     assert res.mrr == (1.0 + 0.0) / 2
+
+
+def test_recherche_hybride_ne_soumet_que_k_avant_rerank_passages_au_reclasseur(tmp_path):
+    corpus = _corpus(tmp_path)
+    recus: list[int] = []
+
+    class _Compteur:
+        def rerank(self, query, documents):
+            recus.append(len(documents))
+            return [(i, 0.9) for i in range(len(documents))]
+
+    recherche_hybride(corpus, reranker=_Compteur(), k_avant_rerank=2)("carte professionnelle", 3)
+    assert recus == [2]
+

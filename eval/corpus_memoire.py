@@ -11,7 +11,7 @@ Les embeddings sont calculés une seule fois puis mis en cache sur disque
 usage CPU notable.
 
 Contenu du fichier :
-- FICHIERS_COEUR : les quatre lois immo de référence.
+- FICHIERS_COEUR : les trois lois immo de référence.
 - ResultatMemoire : une source retrouvée (forme attendue par HybridRetriever).
 - RechercheDenseMemoire : recherche par le sens par produit scalaire numpy.
 - CorpusMemoire : chunks + recherche dense + index BM25, prêts à interroger.
@@ -39,9 +39,9 @@ CACHE = RACINE / ".cache"
 
 # Corpus de référence : les lois directement utiles au métier, sans le code des
 # impôts (plusieurs milliers d'articles, hors périmètre du premier checkpoint).
+# La loi ALUR n'y figure pas : cf. TEXTES_NON_CONSOLIDES (scripts/ingerer_corpus.py).
 FICHIERS_COEUR = [
     "loi_06_07_1989.txt",
-    "loi_ALUR.txt",
     "Loi_hoguet.txt",
     "loi-n°65-557_du_10_juillet_1965.txt",
 ]
@@ -166,7 +166,9 @@ def construire_corpus(
             doc_id=a.doc_id,
             content=a.content,
             embedding=vecteur.tolist(),
-            metadata={"article": a.article, "abroge": a.abroge},
+            metadata={
+                "article": a.article, "abroge": a.abroge, "section": a.section, "titre": a.titre
+            },
         )
         for a, vecteur in zip(articles, matrice, strict=True)
     ]

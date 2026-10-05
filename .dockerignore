@@ -1,0 +1,15 @@
+# Seuls app/, init.sql et requirements.txt entrent dans l'image : le reste
+# alourdirait le contexte de construction (environnements virtuels, modèles,
+# corpus) ou contient des secrets (.env).
+.venv/
+.venv-eval/
+.cache/
+.git/
+.env
+data/
+eval/
+scripts/
+tests/
+terraform/
+SESSION_*.md
+**/__pycache__/

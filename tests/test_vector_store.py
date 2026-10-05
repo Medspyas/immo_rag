@@ -81,3 +81,23 @@ def test_tous_renvoie_les_morceaux_ranges_sans_leur_vecteur():
     assert morceaux[chunk.id].metadata == {"article": "15"}
 
     store.delete_by_doc(doc_id)
+
+
+def test_documents_resume_chaque_document_indexe():
+    store = VectorStore(DSN, DIMENSION)
+    doc_id = f"doc-test-{uuid.uuid4()}"
+    store.upsert([
+        Chunk(
+            id=uuid.uuid4(), doc_id=doc_id, content=f"article {i}",
+            embedding=_vecteur(i), metadata={"titre": "Loi test"},
+        )
+        for i in range(2)
+    ])
+
+    documents = {d.doc_id: d for d in store.documents()}
+
+    assert documents[doc_id].morceaux == 2
+    assert documents[doc_id].titre == "Loi test"
+
+    store.delete_by_doc(doc_id)
+    assert doc_id not in {d.doc_id for d in store.documents()}

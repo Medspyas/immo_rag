@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+QUESTION_MAX_CARACTERES = 1000
+
 
 class HealthResponse(BaseModel):
     status: str
@@ -27,4 +29,7 @@ class IngestRequest(BaseModel):
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=1)
+    # Plafond de longueur : une question métier tient en quelques phrases, et
+    # un texte démesuré consommerait le quota du LLM (et du reclasseur) pour
+    # rien.
+    question: str = Field(min_length=1, max_length=QUESTION_MAX_CARACTERES)

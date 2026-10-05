@@ -23,6 +23,8 @@ Lancement :
     python -m eval.run_eval                # tout le golden dataset (dans corpus)
     python -m eval.run_eval --limit 10      # se limiter aux 10 premiers cas
     python -m eval.run_eval --reprendre     # compléter une trace interrompue
+    python -m eval.run_eval --k 5 --sortie .cache/traces_k5.jsonl
+                                            # 5 articles envoyés au LLM au lieu de 10
 
 Chaque trace est écrite dès qu'elle est prête : une interruption (quota
 Groq, coupure) ne perd que le cas en cours. `--reprendre` saute alors les cas
@@ -44,8 +46,10 @@ from app.config import Settings
 from app.rag.embeddings import get_embedding_provider
 from app.rag.generator import (
     _contextes_cites,
+    corriger_citations,
     generer_reponse,
     get_llm,
+    get_llm_juge,
     verifier_citations,
     verifier_fidelite,
 )
@@ -59,9 +63,13 @@ RACINE = Path(__file__).resolve().parent.parent
 FICHIER_TRACES = RACINE / ".cache" / "eval_traces.jsonl"
 
 
-def _trace(cas, resultats, reponse, verdict_local: str) -> dict:
+def _trace(cas, resultats, reponse, verdict_local: str, brute=None, juges=None) -> dict:
     """Un cas du golden dataset, prêt à être écrit en JSONL : les champs dont
-    score_faithfulness.py a besoin pour rejouer la mesure indépendante."""
+    score_faithfulness.py a besoin pour rejouer la mesure indépendante.
+
+    `generation` (réponse brute du LLM, citations comprises) et `articles`
+    (articles récupérés) permettent de rejouer les garde-fous hors-ligne sur
+    exactement la même réponse, sans nouvel appel Groq (rejouer.py)."""
     return {
         "id": cas.id,
         "question": cas.question,
@@ -70,29 +78,45 @@ def _trace(cas, resultats, reponse, verdict_local: str) -> dict:
         "contexts": _contextes_cites(reponse, resultats) if reponse and not reponse.refus else [],
         "verdict_local": verdict_local,
         "articles_attendus": [f"{cas.doc_id}:{a}" for a in cas.articles],
+        "generation": brute.model_dump() if brute else None,
+        # Modèle(s) qui ont jugé la fidélité (juge en cascade seulement).
+        "modeles_juge": juges or [],
+        "articles": [
+            {"doc_id": r.doc_id, "content": r.content, "metadata": r.metadata}
+            for r in resultats
+        ],
     }
 
 
-def evaluer(cas_golden, retriever, llm, nli, settings: Settings) -> Iterator[dict]:
+def evaluer(
+    cas_golden, retriever, llm, nli, settings: Settings, k: int = 10, juge=None
+) -> Iterator[dict]:
     """Fait tourner recherche + génération + garde-fou étage 2 sur chaque cas,
     et produit une trace par cas (voir `_trace`) au fur et à mesure, pour
-    qu'elle puisse être écrite avant de passer au cas suivant."""
+    qu'elle puisse être écrite avant de passer au cas suivant.
+
+    `k` est le nombre d'articles récupérés, donc envoyés au LLM : moins
+    d'articles consomme moins du quota Groq par réponse, au risque d'écarter
+    l'article utile."""
     for cas in cas_golden:
-        resultats = retriever.search(cas.question, k=10)
+        resultats = retriever.search(cas.question, k=k)
         if not resultats:
             yield _trace(cas, resultats, None, "refus_retrieval")
             continue
 
         reponse_brute = generer_reponse(cas.question, resultats, llm)
+        reponse_brute = corriger_citations(cas.question, resultats, llm, reponse_brute)
         if reponse_brute.refus:
-            yield _trace(cas, resultats, reponse_brute, "refus_generation")
+            yield _trace(cas, resultats, reponse_brute, "refus_generation", reponse_brute)
             continue
 
         reponse_citations = verifier_citations(reponse_brute, resultats)
         if reponse_citations.refus:
-            yield _trace(cas, resultats, reponse_citations, "refus_citation")
+            yield _trace(cas, resultats, reponse_citations, "refus_citation", reponse_brute)
             continue
 
+        historique = getattr(juge or llm, "historique", None)
+        debut = len(historique) if historique is not None else 0
         # reponse_citations est ce qu'on confronte à la mesure indépendante :
         # le texte tel que rédigé, avant que notre propre garde-fou étage 2 ne
         # le transforme éventuellement en refus.
@@ -101,12 +125,12 @@ def evaluer(cas_golden, retriever, llm, nli, settings: Settings) -> Iterator[dic
             resultats,
             nli,
             settings.seuil_nli_haut,
-            settings.seuil_nli_bas,
             settings.seuil_nli_contradiction,
-            llm,
+            juge or llm,
         )
         verdict = "refus_fidelite" if reponse_apres.refus else "fondee"
-        yield _trace(cas, resultats, reponse_citations, verdict)
+        juges = historique[debut:] if historique is not None else []
+        yield _trace(cas, resultats, reponse_citations, verdict, reponse_brute, juges)
 
 
 def traces_existantes(fichier: Path) -> list[dict]:
@@ -132,39 +156,55 @@ def main() -> None:
     parser.add_argument(
         "--reprendre", action="store_true", help="compléter la trace existante au lieu de l'écraser"
     )
+    parser.add_argument("--k", type=int, default=10, help="articles envoyés au LLM (défaut 10)")
+    parser.add_argument(
+        "--sortie", type=Path, default=FICHIER_TRACES, help="fichier de traces JSONL"
+    )
+    parser.add_argument("--ids", nargs="+", help="ne traiter que ces cas (ex. q22 q35)")
+    parser.add_argument(
+        "--avec-hors-corpus",
+        action="store_true",
+        help="inclure les cas hors corpus (l'assistant doit refuser)",
+    )
     args = parser.parse_args()
+    fichier = args.sortie
 
     settings = Settings()
     embeddings = get_embedding_provider(settings)
     reranker = get_rerank_provider(settings)
     llm = get_llm(settings)
+    juge = get_llm_juge(settings)
     nli = get_nli_provider(settings)
 
     print("Préparation du corpus en mémoire…")
     corpus = construire_corpus(embeddings)
     retriever = HybridRetriever(
         embeddings, corpus.dense, corpus.bm25, reranker=reranker,
+        k_par_source=settings.k_par_source,
+        k_avant_rerank=settings.k_avant_rerank,
         seuil_rerank=settings.seuil_garde_fou_retrieval,
     )
 
-    cas_golden = [c for c in charger_golden() if not c.hors_corpus]
+    cas_golden = [c for c in charger_golden() if args.avec_hors_corpus or not c.hors_corpus]
+    if args.ids:
+        cas_golden = [c for c in cas_golden if c.id in args.ids]
     if args.limit:
         cas_golden = cas_golden[: args.limit]
 
-    traces = traces_existantes(FICHIER_TRACES) if args.reprendre else []
+    traces = traces_existantes(fichier) if args.reprendre else []
     deja_faits = {t["id"] for t in traces}
     a_faire = [c for c in cas_golden if c.id not in deja_faits]
     if deja_faits:
         print(f"Reprise : {len(deja_faits)} cas déjà tracés, conservés.")
 
     print(f"Génération de {len(a_faire)} traces (appels Groq + NLI réels)…")
-    FICHIER_TRACES.parent.mkdir(exist_ok=True)
+    fichier.parent.mkdir(exist_ok=True)
     # Le fichier est réécrit avec les seules traces valides conservées, puis
     # chaque nouvelle trace y est ajoutée et vidée sur disque aussitôt.
-    with FICHIER_TRACES.open("w", encoding="utf-8") as f:
+    with fichier.open("w", encoding="utf-8") as f:
         for t in traces:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings), start=1):
+        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k, juge=juge), start=1):
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
             f.flush()
             traces.append(t)
@@ -173,7 +213,7 @@ def main() -> None:
     comptes: dict[str, int] = {}
     for t in traces:
         comptes[t["verdict_local"]] = comptes.get(t["verdict_local"], 0) + 1
-    print(f"\nTraces écrites dans {FICHIER_TRACES}")
+    print(f"\nTraces écrites dans {fichier}")
     for verdict, n in sorted(comptes.items()):
         print(f"  {verdict:<18} {n}")
     print(

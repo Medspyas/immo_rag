@@ -51,6 +51,7 @@ from app.rag.chunking import decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
 from app.rag.generator import (
     ReponseGeneree,
+    corriger_citations,
     generer_reponse,
     verifier_citations,
     verifier_fidelite,
@@ -158,7 +159,12 @@ def preparer_morceaux(
             doc_id=doc_id,
             content=article.content,
             embedding=vecteur,
-            metadata={"article": article.article, "abroge": article.abroge},
+            metadata={
+                "article": article.article,
+                "abroge": article.abroge,
+                "section": article.section,
+                "titre": article.titre,
+            },
         )
         for article, vecteur in zip(articles, vecteurs, strict=True)
     ]
@@ -258,6 +264,8 @@ def construire_retriever(
         recherche_dense=vector_store,
         recherche_sparse=bm25_index,
         reranker=reranker,
+        k_par_source=settings.k_par_source,
+        k_avant_rerank=settings.k_avant_rerank,
         seuil_rerank=settings.seuil_garde_fou_retrieval if reranker is not None else None,
     )
 
@@ -269,7 +277,8 @@ def repondre(
     llm: _LLM,
     nli: _NLI,
     settings: Settings,
-    k: int = 10,
+    k: int | None = None,
+    juge: _LLM | None = None,
 ) -> ReponseGeneree:
     """Orchestration complète d'une requête : recherche puis génération sous
     deux garde-fous (cf. CLAUDE.md, section garde-fou anti-hallucination).
@@ -279,18 +288,25 @@ def repondre(
     vides si aucun morceau n'est assez fiable, ce que generer_reponse traite
     comme un refus. Les étages suivants agissent ici, dans l'ordre :
       1. génération de la réponse (le LLM peut lui-même refuser) ;
-      2. vérification des citations contre le texte réellement récupéré ;
+      2. vérification des citations contre le texte réellement récupéré,
+         après une seconde chance unique si certaines sont introuvables ;
       3. vérification de la fidélité de la réponse aux articles cités (NLI).
+
+    k fixe le nombre d'articles envoyés au LLM ; par défaut
+    settings.k_articles_generation. juge sert de juge de repli pour la
+    fidélité ; par défaut llm.
     """
+    if k is None:
+        k = settings.k_articles_generation
     resultats = retriever.search(question, k=k)
     reponse = generer_reponse(question, resultats, llm)
+    reponse = corriger_citations(question, resultats, llm, reponse)
     reponse = verifier_citations(reponse, resultats)
     return verifier_fidelite(
         reponse,
         resultats,
         nli,
         settings.seuil_nli_haut,
-        settings.seuil_nli_bas,
         settings.seuil_nli_contradiction,
-        llm=llm,
+        llm=juge or llm,
     )

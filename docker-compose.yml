@@ -20,11 +20,21 @@ services:
   api:
     build: .
     env_file: .env
+    environment:
+      # Dans le réseau compose, la base s'appelle « db » et écoute sur 5432 ;
+      # l'adresse de .env (localhost:5433) ne vaut que depuis l'hôte.
+      DATABASE_URL: postgresql://immo:immo@db:5432/immo_rag
+      # Le reclasseur ONNX dépend d'un modèle exporté hors de l'image.
+      RERANK_PROVIDER: local
     ports:
       - "8000:8000"
+    volumes:
+      # Modèles Hugging Face téléchargés une seule fois, gardés entre redémarrages.
+      - hf_cache:/app/.cache/huggingface
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   db_data:
+  hf_cache:
