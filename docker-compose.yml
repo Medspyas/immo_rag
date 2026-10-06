@@ -35,6 +35,14 @@ services:
       db:
         condition: service_healthy
 
+  web:
+    build: ./frontend
+    ports:
+      # Interface web : http://localhost:8080
+      - "8080:80"
+    depends_on:
+      - api
+
 volumes:
   db_data:
   hf_cache:

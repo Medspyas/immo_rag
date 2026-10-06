@@ -9,6 +9,8 @@ Dans un domaine réglementé, une réponse inventée coûte plus cher qu'une abs
 de réponse : le garde-fou anti-hallucination est le cœur du produit, pas une
 option.
 
+![Assistant : réponse citée et vérifiée, puis refus motivé sur une question hors corpus](docs/capture-assistant.png)
+
 ## Fonctionnement
 
 ```
@@ -77,6 +79,7 @@ Chaque brique a été gardée ou écartée sur mesure, pas sur intuition :
 - Évaluation : métriques de recherche maison (hit@k, MRR), DeepEval
   (`faithfulness`)
 - Observabilité : Langfuse (désactivé sans configuration)
+- Interface : React 19, Vite, TypeScript, Tailwind CSS, shadcn/ui, servie par nginx
 - Docker, GitHub Actions
 
 Chaque modèle passe par une interface (`get_*_provider`) réglée dans `.env` :
@@ -86,8 +89,17 @@ changer de modèle ne touche pas au code du pipeline.
 
 ```bash
 cp .env.example .env            # renseigner GROQ_API_KEY
-docker compose up -d            # API sur :8000, base sur :5433
+docker compose up -d            # interface :8080, API :8000, base :5433
 python scripts/ingerer_corpus.py  # indexe data/clean (une fois)
+```
+
+Interface : <http://localhost:8080>. Deux pages : l'assistant (question, réponse
+avec ses citations vérifiées ou refus motivé) et les textes indexés.
+
+Développement du front avec rechargement à chaud (l'API doit tourner sur :8000) :
+
+```bash
+cd frontend && npm install && npm run dev   # http://localhost:5173
 ```
 
 | Route                     | Rôle                                        |

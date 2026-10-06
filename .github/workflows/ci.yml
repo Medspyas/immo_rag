@@ -1,5 +1,6 @@
 # Intégration continue : lint + tests à chaque push et pull request, puis gate
-# d'évaluation du retrieval (eval/gate.py) qui bloque une régression de qualité.
+# d'évaluation du retrieval (eval/gate.py) qui bloque une régression de qualité,
+# et vérification du front (lint + compilation TypeScript).
 name: CI
 
 on:
@@ -41,6 +42,23 @@ jobs:
       - run: ruff check .
       - run: psql postgresql://immo:immo@localhost:5433/immo_rag -f init.sql
       - run: pytest -q
+
+  front:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      # Compile aussi les types : une erreur TypeScript fait échouer la CI.
+      - run: npm run build
 
   gate:
     needs: tests

@@ -13,3 +13,4 @@ tests/
 terraform/
 SESSION_*.md
 **/__pycache__/
+frontend/
