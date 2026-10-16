@@ -39,6 +39,13 @@ _REF_LEGALE = re.compile(
 
 _MOT = re.compile(r"[a-z0-9]+")
 
+# « plus-value » et « moins-value » forment un seul mot. Découpés, « plus » et
+# « moins » partaient avec les mots-outils et « plus-value » se réduisait à
+# « value ». Toutes les graphies (« plus value », « plus-valus ») donnent la
+# même forme, fautes de frappe comprises (constaté le 2026-10-14 : « les règles
+# des taxes plus valus » ne retrouvait aucun article).
+_PLUS_MOINS_VALUE = re.compile(r"\b(plus|moins)[\s-]*valu[a-z]*")
+
 # Mots-outils français courants (sans accents : la comparaison se fait après
 # normalisation). Liste volontairement courte : trop large, elle retirerait des
 # mots utiles en droit ("plus", "sans", "contre").
@@ -83,15 +90,32 @@ def tokeniser_fr(texte: str) -> list[str]:
     # Références retirées avant le découpage normal : sinon le "111" et le "1"
     # de "L. 111-1" reviendraient comme des nombres isolés parasites.
     texte_sans_refs = _REF_LEGALE.sub(" ", texte)
-    mots = _MOT.findall(_sans_accents(texte_sans_refs).lower())
+    texte_normalise = _PLUS_MOINS_VALUE.sub(
+        lambda m: m.group(1) + "value", _sans_accents(texte_sans_refs).lower()
+    )
+    mots = _MOT.findall(texte_normalise)
 
     stemmer = _stemmer()
     tokens = [
-        stemmer.stemWord(mot)
+        _racine_commune(stemmer.stemWord(mot))
         for mot in mots
         if len(mot) > 1 and mot not in _STOPWORDS_FR
     ]
     return refs + tokens
+
+
+def _racine_commune(racine: str) -> str:
+    """Rapproche les racines d'un verbe et de son nom, que Snowball sépare.
+
+    « révoque » donne "revoqu", « révocation » donne "revoc" : la question
+    (verbe) ne retrouvait pas l'article (nom). Même écart pour « convoque » /
+    « convocation » et « résilie » / « résiliation » ("resil" / "resili").
+    """
+    if racine.endswith("qu"):
+        return racine[:-2] + "c"
+    if racine.endswith("ili"):
+        return racine[:-1]
+    return racine
 
 
 class BM25Document(BaseModel):
@@ -102,6 +126,11 @@ class BM25Document(BaseModel):
     doc_id: str = Field(min_length=1)
     content: str = Field(min_length=1)
     metadata: dict = Field(default_factory=dict)
+    # Texte indexé en plus du contenu, jamais renvoyé : les questions auxquelles
+    # l'article répond (doc2query, cf. questions_articles.py). Il aide à
+    # retrouver l'article, mais n'est pas du texte de loi : il ne doit atteindre
+    # ni le reclasseur, ni le LLM, ni la vérification des citations.
+    complement: str = ""
 
 
 class BM25Result(BaseModel):
@@ -125,7 +154,7 @@ class BM25Index:
         from rank_bm25 import BM25Okapi
 
         self._documents = list(documents)
-        corpus_tokens = [tokeniser_fr(d.content) for d in self._documents]
+        corpus_tokens = [tokeniser_fr(d.content + "\n" + d.complement) for d in self._documents]
         # rank-bm25 refuse un corpus vide : il reste à None et search renvoie
         # une liste vide.
         self._bm25 = BM25Okapi(corpus_tokens) if corpus_tokens else None

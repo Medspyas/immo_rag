@@ -17,7 +17,19 @@ export interface ReponseGeneree {
   motif: string | null
   reponse: string
   citations: Citation[]
+  // Question réellement traitée quand une question de suivi a été réécrite
+  // à partir de la conversation (app/rag/suivi.py) ; null sinon.
+  question_comprise: string | null
 }
+
+// Un échange précédent, transmis pour comprendre une question de suivi.
+export interface EchangePrecedent {
+  question: string
+  reponse: string
+}
+
+// Nombre d'échanges précédents acceptés par l'API (ECHANGES_MAX, suivi.py).
+export const ECHANGES_MAX = 3
 
 export interface DocumentIndexe {
   doc_id: string
@@ -78,8 +90,11 @@ async function messageErreur(reponse: Response): Promise<string> {
 
 export const api = {
   sante: () => appeler<Sante>('/health'),
-  poser: (question: string) =>
-    appeler<ReponseGeneree>('/query', { method: 'POST', body: JSON.stringify({ question }) }),
+  poser: (question: string, historique: EchangePrecedent[] = []) =>
+    appeler<ReponseGeneree>('/query', {
+      method: 'POST',
+      body: JSON.stringify({ question, historique: historique.slice(-ECHANGES_MAX) }),
+    }),
   documents: () => appeler<DocumentIndexe[]>('/documents'),
   supprimer: (docId: string) =>
     appeler<void>(`/documents/${encodeURIComponent(docId)}`, { method: 'DELETE' }),

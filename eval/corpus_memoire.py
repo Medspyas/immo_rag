@@ -1,7 +1,7 @@
 """Construction du corpus en mémoire pour l'évaluation, sans base de données.
 
-L'évaluation indexe les lois « cœur » puis interroge la recherche un grand
-nombre de fois. Monter PostgreSQL pour cela n'apporte rien : les vecteurs des
+L'évaluation indexe les mêmes textes que la production (fichiers_du_corpus,
+pipeline.py) puis interroge la recherche un grand nombre de fois. Monter PostgreSQL pour cela n'apporte rien : les vecteurs des
 articles tiennent largement en mémoire (quelques Mo). Ce module fait le même
 découpage que le pipeline d'ingestion, mais range le résultat dans un tableau
 numpy plutôt que dans pgvector.
@@ -11,7 +11,6 @@ Les embeddings sont calculés une seule fois puis mis en cache sur disque
 usage CPU notable.
 
 Contenu du fichier :
-- FICHIERS_COEUR : les trois lois immo de référence.
 - ResultatMemoire : une source retrouvée (forme attendue par HybridRetriever).
 - RechercheDenseMemoire : recherche par le sens par produit scalaire numpy.
 - CorpusMemoire : chunks + recherche dense + index BM25, prêts à interroger.
@@ -30,21 +29,12 @@ from app.rag.bm25_index import BM25Index
 from app.rag.chunking import RawChunk, decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
 from app.rag.embeddings import EmbeddingProvider
-from app.rag.pipeline import documents_bm25, identifiant_chunk
+from app.rag.pipeline import documents_bm25, fichiers_du_corpus, identifiant_chunk
 from app.rag.vector_store import Chunk
 
 RACINE = Path(__file__).resolve().parent.parent
 DOSSIER_CORPUS = RACINE / "data" / "clean"
 CACHE = RACINE / ".cache"
-
-# Corpus de référence : les lois directement utiles au métier, sans le code des
-# impôts (plusieurs milliers d'articles, hors périmètre du premier checkpoint).
-# La loi ALUR n'y figure pas : cf. TEXTES_NON_CONSOLIDES (scripts/ingerer_corpus.py).
-FICHIERS_COEUR = [
-    "loi_06_07_1989.txt",
-    "Loi_hoguet.txt",
-    "loi-n°65-557_du_10_juillet_1965.txt",
-]
 
 
 @dataclass
@@ -119,12 +109,15 @@ def _matrice_embeddings(
     """Renvoie la matrice des vecteurs d'articles, calculée en une passe la
     première fois puis relue depuis le cache disque.
 
-    La clé de cache dépend du texte des articles : changer le corpus (ou le
-    découpage) invalide automatiquement l'ancien cache.
+    La clé de cache dépend du texte des articles et du modèle : changer le
+    corpus, le découpage ou le modèle d'embeddings invalide l'ancien cache.
     """
     cache_dir.mkdir(exist_ok=True)
+    # Le modèle e5 par défaut garde l'ancienne clé : son cache reste valable.
+    modele = getattr(embeddings, "_model_name", "")
+    signature = "" if modele == "intfloat/multilingual-e5-base" else modele
     empreinte = hashlib.sha1(
-        "".join(a.content for a in articles).encode("utf-8")
+        (signature + "".join(a.content for a in articles)).encode("utf-8")
     ).hexdigest()[:16]
     fichier = cache_dir / f"embeddings_eval_{empreinte}.npy"
     if fichier.exists():
@@ -153,8 +146,13 @@ def construire_corpus(
     chaque article est précédé du résumé de son document (un appel au modèle
     par fichier, cf. contextualizer.py) avant l'embedding — le cache disque
     distingue les deux (la clé dépend du texte réellement indexé)."""
-    fichiers = fichiers or FICHIERS_COEUR
     dossier = dossier or DOSSIER_CORPUS
+    # Par défaut, tout le corpus de production. Jusqu'au 2026-10-13, seules les
+    # trois lois immo (284 articles) étaient indexées ici, contre 7894 morceaux
+    # en base (code civil, code des impôts) : rejoué sur la base réelle, le golden
+    # tombait de MRR 0,706 à 0,633 et 3 questions hors corpus sur 4 dépassaient
+    # le seuil de l'étage 1. Une mesure sur un sous-ensemble surestime le système.
+    fichiers = fichiers or fichiers_du_corpus(dossier)
     cache_dir = cache_dir or CACHE
 
     articles = _articles_du_corpus(fichiers, dossier, contextualizer)

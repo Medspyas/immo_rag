@@ -241,3 +241,81 @@ def test_le_reclasseur_recoit_le_titre_de_la_loi_devant_larticle():
     assert resultats[0].content == "Article 1\nLes dispositions…"
 
 
+def test_pour_un_code_le_reclasseur_recoit_aussi_lobjet_du_chapitre():
+    dense = SearchResult(
+        id=uuid4(), doc_id="code_impot", content="Article 977\n1. Le tarif de l'impôt…",
+        metadata={
+            "titre": "Code général des impôts",
+            "section": "Livre premier : Assiette > Chapitre II bis : Impôt sur la fortune "
+            "immobilière > Section VI : Calcul de l'impôt",
+        },
+        score=0.9,
+    )
+    reclasseur = _RerankerFake()
+    _retriever([dense], [], reranker=reclasseur).search("q")
+    assert reclasseur.textes_recus == [
+        "Code général des impôts — Impôt sur la fortune immobilière\nArticle 977\n1. Le tarif de l'impôt…"
+    ]
+
+
+def test_le_reclasseur_recoit_les_questions_generees_entre_titre_et_article(monkeypatch):
+    import app.rag.retriever as module
+
+    monkeypatch.setattr(
+        module, "charger_questions",
+        lambda: {("Loi_hoguet", "7"): ["Un mandat peut-il être sans date de fin ?"]},
+    )
+    dense = SearchResult(
+        id=uuid4(), doc_id="Loi_hoguet", content="Article 7\nSont nulles…",
+        metadata={"titre": "Loi Hoguet", "article": "7"}, score=0.9,
+    )
+    reclasseur = _RerankerFake()
+    resultats = _retriever([dense], [], reranker=reclasseur).search("q")
+    assert reclasseur.textes_recus == [
+        (
+            "Loi Hoguet\nQuestions auxquelles l'article répond : "
+            "Un mandat peut-il être sans date de fin ?\nArticle 7\nSont nulles…"
+        )
+    ]
+    # Les questions ne sont jamais renvoyées : le LLM ne voit que l'article.
+    assert resultats[0].content == "Article 7\nSont nulles…"
+
+
+def test_pour_une_loi_le_chapitre_nest_pas_ajoute():
+    dense = SearchResult(
+        id=uuid4(), doc_id="loi_06_07_1989", content="Article 15\nLe congé…",
+        metadata={"titre": "Loi n° 89-462", "section": "Titre Ier > Chapitre II : De la durée"},
+        score=0.9,
+    )
+    reclasseur = _RerankerFake()
+    _retriever([dense], [], reranker=reclasseur).search("q")
+    assert reclasseur.textes_recus == ["Loi n° 89-462\nArticle 15\nLe congé…"]
+
+
+
+
+def test_sigles_developpes_pour_les_trois_recherches():
+    recues: list[str] = []
+
+    class _Embeddings:
+        def embed_query(self, text: str) -> list[float]:
+            recues.append(text)
+            return [0.0]
+
+    class _Sparse(_RechercheSparseFake):
+        def search(self, query: str, k: int) -> list[BM25Result]:
+            recues.append(query)
+            return super().search(query, k)
+
+    class _Reranker(_RerankerFake):
+        def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
+            recues.append(query)
+            return super().rerank(query, documents)
+
+    a = uuid4()
+    retriever = HybridRetriever(
+        _Embeddings(), _RechercheDenseFake([_dense(a)]), _Sparse([_sparse(a)]),
+        reranker=_Reranker(),
+    )
+    retriever.search("Qui paie l'IFI ?")
+    assert recues == ["Qui paie l'IFI (impôt sur la fortune immobilière) ?"] * 3

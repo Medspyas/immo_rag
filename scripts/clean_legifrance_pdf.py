@@ -166,8 +166,19 @@ def marquer_les_articles_abroges(texte: str) -> str:
     return "\n".join(blocs)
 
 
+# Cellule de tableau collée à la fin de la cellule précédente par l'extraction
+# PDF : « 2 % PV-(60 000-PV) × 1/ 20De » puis « 60 001 à 100 000 » à la ligne
+# (barème de l'article 1609 nonies G du CGI). Le LLM recopiait « × 1/20 de ».
+CELLULE_COLLEE = re.compile(r"(?<=[0-9A-Z%)])(De|Supérieur)$", re.MULTILINE)
+
+
+def decoller_cellules_de_tableau(texte: str) -> str:
+    """Renvoie à la ligne le début de cellule collé en fin de ligne."""
+    return CELLULE_COLLEE.sub(lambda m: "\n" + m.group(1), texte)
+
+
 def nettoyer_pdf(chemin_pdf: Path) -> str:
-    texte_sans_bruit = extraire_texte_brut(chemin_pdf)
+    texte_sans_bruit = decoller_cellules_de_tableau(extraire_texte_brut(chemin_pdf))
     return marquer_les_articles_abroges(texte_sans_bruit)
 
 

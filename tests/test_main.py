@@ -132,3 +132,32 @@ def test_supprimer_un_document_inconnu_renvoie_404(monkeypatch):
 
     monkeypatch.setattr(main, "_vector_store", lambda: _BaseFactice(supprimes=0))
     assert client.delete("/documents/inconnu").status_code == 404
+
+
+def test_query_transmet_l_historique(monkeypatch):
+    from app import main
+    from app.rag.generator import ReponseGeneree
+
+    recu = {}
+
+    def _repondre(question, *args, historique=None, **kwargs):
+        recu["historique"] = historique
+        return ReponseGeneree(refus=True, motif="test")
+
+    monkeypatch.setattr(main, "_retriever", lambda: object())
+    monkeypatch.setattr(main, "_llm", lambda: object())
+    monkeypatch.setattr(main, "_juge", lambda: object())
+    monkeypatch.setattr(main, "_nli", lambda: object())
+    monkeypatch.setattr(main, "repondre", _repondre)
+    historique = [{"question": "Quel préavis ?", "reponse": "Trois mois."}]
+    reponse = client.post("/query", json={"question": "Et pour un meublé ?", "historique": historique})
+    assert reponse.status_code == 200
+    assert recu["historique"][0].question == "Quel préavis ?"
+
+
+def test_query_refuse_un_historique_trop_long():
+    from app.rag.suivi import ECHANGES_MAX
+
+    historique = [{"question": "q", "reponse": ""}] * (ECHANGES_MAX + 1)
+    response = client.post("/query", json={"question": "Et alors ?", "historique": historique})
+    assert response.status_code == 422

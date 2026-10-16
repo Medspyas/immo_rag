@@ -10,6 +10,7 @@ from app.rag.generator import (
     Citation,
     GroqLLM,
     LLMEnCascade,
+    MistralLLM,
     ModeleIndisponible,
     QuotaJournalierEpuise,
     ReponseGeneree,
@@ -27,7 +28,9 @@ from app.rag.nli import ScoreNLI
 
 
 def _settings(**overrides) -> Settings:
-    base = {"database_url": "postgresql://x", "groq_api_key": "fake-key"}
+    # Sans clé Mistral par défaut : celle du .env local ne doit pas changer
+    # la cascade attendue par les tests.
+    base = {"database_url": "postgresql://x", "groq_api_key": "fake-key", "mistral_api_key": None}
     base.update(overrides)
     return Settings(**base)
 
@@ -95,6 +98,84 @@ def test_juge_place_son_modele_en_tete_de_cascade():
     juge = get_llm_juge(_settings(llm_model="a", llm_modeles_relais=["b"], llm_modele_juge="b"))
     assert [m._model for m in juge._modeles] == ["b", "a"]
     assert [m._model for m in juge._derniers_recours] == ["b", "a"]
+
+
+def test_cle_mistral_ajoute_mistral_en_secours_seulement():
+    llm = get_llm(_settings(llm_model="a", llm_modeles_relais=[], mistral_api_key="cle-m"))
+    assert isinstance(llm, LLMEnCascade)
+    # Hors de la cascade : une saturation d'une minute de Groq ne suffit pas.
+    assert [type(m) for m in llm._modeles] == [GroqLLM]
+    assert isinstance(llm._secours, MistralLLM)
+    assert llm._secours._max_essais == GROQ_MAX_ESSAIS
+
+
+def _mistral(gestionnaire, max_essais=0):
+    import httpx
+
+    attentes: list[float] = []
+    client = httpx.Client(transport=httpx.MockTransport(gestionnaire))
+    llm = MistralLLM("cle-m", "m", max_essais=max_essais, client=client, dormir=attentes.append)
+    return llm, attentes
+
+
+def test_mistral_renvoie_le_contenu_de_la_reponse():
+    import httpx
+
+    recues = []
+
+    def _ok(requete):
+        recues.append(requete)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"refus": true}'}}]})
+
+    llm, _ = _mistral(_ok)
+    assert llm.generer("consigne", "question") == '{"refus": true}'
+    corps = json.loads(recues[0].content)
+    assert corps["response_format"] == {"type": "json_object"}
+    assert corps["messages"][0] == {"role": "system", "content": "consigne"}
+    assert recues[0].headers["Authorization"] == "Bearer cle-m"
+
+
+def test_mistral_impose_le_schema_selon_la_consigne():
+    import httpx
+
+    from app.rag.generator import CONSIGNE, CONSIGNE_JUGE_FIDELITE
+
+    recues = []
+
+    def _ok(requete):
+        recues.append(json.loads(requete.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    llm, _ = _mistral(_ok)
+    llm.generer(CONSIGNE, "q")
+    llm.generer(CONSIGNE_JUGE_FIDELITE, "q")
+    reponse, juge = (r["response_format"] for r in recues)
+    assert reponse["type"] == juge["type"] == "json_schema"
+    assert reponse["json_schema"]["schema"]["properties"]["reponse"] == {"type": "string"}
+    assert juge["json_schema"]["schema"]["required"] == ["fondees"]
+
+
+def test_mistral_sature_reessaie_apres_attente():
+    import httpx
+
+    reponses = iter(
+        [
+            httpx.Response(429, text="rate limit"),
+            httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]}),
+        ]
+    )
+    llm, attentes = _mistral(lambda requete: next(reponses), max_essais=2)
+    assert llm.generer("c", "q") == "{}"
+    assert len(attentes) == 1
+
+
+def test_mistral_sature_sans_essai_passe_la_main():
+    import httpx
+
+    llm, attentes = _mistral(lambda requete: httpx.Response(429, text="rate limit"))
+    with pytest.raises(ModeleIndisponible):
+        llm.generer("c", "q")
+    assert attentes == []
 
 
 class _LLMSature:
@@ -173,6 +254,27 @@ def test_cascade_tous_epuises_pour_la_journee_leve_quota_journalier():
         cascade.generer("c", "q")
 
 
+def test_cascade_saturee_ou_epuisee_passe_au_secours():
+    secours = _LLMRepond("secours")
+    secours.nom = "m"
+    cascade = LLMEnCascade(
+        [_LLMSature(), _LLMEpuiseDuJour()],
+        derniers_recours=[_LLMSature(), _LLMRepond("r2")],
+        secours=secours,
+    )
+    assert cascade.generer("c", "q") == "secours"
+    assert cascade.historique == ["m (secours)"]
+
+
+def test_cascade_n_appelle_pas_le_secours_si_groq_repond_apres_attente():
+    secours = _LLMRepond("secours")
+    cascade = LLMEnCascade(
+        [_LLMSature()], derniers_recours=[_LLMRepond("patient")], secours=secours
+    )
+    assert cascade.generer("c", "q") == "patient"
+    assert secours.appels == 0
+
+
 def test_cascade_ne_masque_pas_une_autre_erreur():
     class _LLMCasse:
         def generer(self, consigne, question):
@@ -215,6 +317,26 @@ def test_groq_traduit_une_requete_trop_longue_en_modele_indisponible(monkeypatch
         raise erreur
 
     monkeypatch.setattr(llm, "_appeler", _trop_longue)
+    with pytest.raises(ModeleIndisponible):
+        llm.generer("c", "q")
+
+
+def test_groq_traduit_un_json_invalide_en_modele_indisponible(monkeypatch):
+    import httpx
+    from groq import APIStatusError
+
+    llm = GroqLLM("fake-key", "a", max_essais=0)
+    requete = httpx.Request("POST", "https://api.groq.com")
+    erreur = APIStatusError(
+        "Error code: 400 - {'error': {'code': 'json_validate_failed'}}",
+        response=httpx.Response(400, request=requete),
+        body=None,
+    )
+
+    def _json_invalide(consigne, question):
+        raise erreur
+
+    monkeypatch.setattr(llm, "_appeler", _json_invalide)
     with pytest.raises(ModeleIndisponible):
         llm.generer("c", "q")
 
@@ -936,3 +1058,33 @@ def test_sous_liste_dans_un_element_numerote():
     assert "Le juge peut" not in affirmations
     assert "Le juge peut notamment : réduire le loyer ;" in affirmations
     assert "Le locataire dispose de recours notamment : Saisine de la commission : elle rend un avis." in affirmations
+
+
+def test_sous_liste_en_lettres():
+    # q03 (2026-10-14) : « a. » sortait comme une affirmation à part entière
+    texte = (
+        "Le préavis est d'un mois :\n"
+        "1. Pour un bail classique, si l'une des conditions est remplie :\n"
+        "   a. Le locataire obtient un premier emploi.\n"
+        "   b) Le locataire perd son emploi."
+    )
+    affirmations = _decouper_en_affirmations(texte)
+    assert "a." not in affirmations
+    assert (
+        "Pour un bail classique, si l'une des conditions est remplie notamment : "
+        "Le locataire obtient un premier emploi." in affirmations
+    )
+    assert any(a.endswith("Le locataire perd son emploi.") for a in affirmations)
+
+
+def test_decoupage_retire_la_mise_en_forme_markdown():
+    texte = (
+        "## Règle\n"
+        "**Règles générales :**\n"
+        "- Le préavis est de *trois mois*.\n"
+        "* Il court dès **réception** de la lettre."
+    )
+    assert _decouper_en_affirmations(texte) == [
+        "Règles générales notamment : Le préavis est de trois mois.",
+        "Règles générales notamment : Il court dès réception de la lettre.",
+    ]

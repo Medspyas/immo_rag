@@ -35,10 +35,14 @@ Contenu du fichier :
 """
 from __future__ import annotations
 
+import re
 from typing import Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+
+from app.rag.questions_articles import charger_questions
+from app.rag.sigles import developper_sigles
 
 
 def _scores_rrf(classements: list[list[UUID]], k: int = 60) -> dict[UUID, float]:
@@ -57,7 +61,9 @@ def _scores_rrf(classements: list[list[UUID]], k: int = 60) -> dict[UUID, float]
 
 
 def _texte_a_reclasser(resultat: _ResultatRecherche) -> str:
-    """Texte soumis au reclasseur : l'article précédé du titre de sa loi.
+    """Texte soumis au reclasseur : l'article précédé du titre de sa loi (et
+    du chapitre pour un code), puis des questions générées pour l'article
+    quand il en a (cf. PREFIXE_QUESTIONS).
 
     Le texte d'un article ne dit presque jamais de quelle loi il fait partie
     (l'article 1er de la loi Hoguet ne contient ni « Hoguet » ni « agent
@@ -76,8 +82,52 @@ def _texte_a_reclasser(resultat: _ResultatRecherche) -> str:
     écarté : MRR 0,655 → 0,618, et une question hors corpus montait à 0,61,
     au-dessus du seuil de l'étage 1 (plus de passages, plus de chances qu'un
     passage sans rapport obtienne une note élevée)."""
-    titre = (resultat.metadata or {}).get("titre")
-    return f"{titre}\n{resultat.content}" if titre else resultat.content
+    metadata = resultat.metadata or {}
+    titre = metadata.get("titre")
+    if not titre:
+        return resultat.content
+    chapitre = _chapitre_de_code(titre, metadata.get("section") or "")
+    if chapitre:
+        titre = f"{titre} — {chapitre}"
+    questions = charger_questions().get((resultat.doc_id, metadata.get("article")))
+    if questions:
+        titre = f"{titre}\n{PREFIXE_QUESTIONS}{' '.join(questions)}"
+    return f"{titre}\n{resultat.content}"
+
+
+# Annonce des questions générées (doc2query) placées entre le titre et
+# l'article : placées avant le texte, elles restent dans les ~512 tokens que
+# le reclasseur lit, même pour un long article. Mesuré le 2026-10-15 sur le
+# golden (corpus complet) : hit@1 60 % → 67,5 %, hit@5 90 % → 92,5 %, MRR
+# 0,725 → 0,765 ; Hoguet art. 7 (q31) introuvable → 1er. hit@3 90 % → 87,5 %
+# (deux questions passent du 3e au 4e rang, toujours parmi les 5 articles
+# envoyés au LLM). Scores hors corpus sous le seuil de l'étage 1 inchangés en
+# verdict (le plus haut d'entre eux 0,04 → 0,22). Après le texte : sans effet
+# (MRR 0,724), les questions tombaient hors de la fenêtre lue.
+PREFIXE_QUESTIONS = "Questions auxquelles l'article répond : "
+
+
+# Préfixe d'un intitulé de chapitre (« Chapitre II bis : »), retiré pour ne
+# garder que son objet.
+_PREFIXE_CHAPITRE = re.compile(r"^Chapitre\s+[^:]*:\s*")
+
+
+def _chapitre_de_code(titre: str, section: str) -> str:
+    """Objet du chapitre d'un article de code (« Impôt sur la fortune
+    immobilière »), vide pour une loi.
+
+    Pour un code, le titre seul (« Code général des impôts ») ne dit rien de
+    l'impôt dont traite l'article : l'article 977 parle de « l'impôt » sans
+    jamais nommer l'IFI, et le reclasseur le notait 0,15 face à « Quels sont
+    les taux de l'impôt sur la fortune immobilière ? ». Avec l'objet du
+    chapitre : 0,97, en tête. Mesuré le 2026-10-15 sur le golden : MRR
+    0,723 → 0,725, meilleur score hors corpus 0,83 → 0,78. Seul le chapitre
+    est ajouté, pas toute la hiérarchie (l'intitulé de section complet,
+    mesuré le 2026-10-02, remontait une question hors corpus)."""
+    if not titre.startswith("Code"):
+        return ""
+    chapitres = [n.strip() for n in section.split(">") if n.strip().startswith("Chapitre")]
+    return _PREFIXE_CHAPITRE.sub("", chapitres[-1]) if chapitres else ""
 
 
 def fusion_rrf(classements: list[list[UUID]], k: int = 60) -> list[UUID]:
@@ -194,12 +244,16 @@ class HybridRetriever:
         L'ordre vient de la fusion RRF, ou du reclasseur lorsqu'il est fourni.
         Renvoie une liste vide lorsque les deux recherches ne renvoient rien.
 
-        La question est cherchée telle quelle. La reformuler avant la recherche
+        La question est cherchée telle quelle, ses sigles seulement développés
+        (sigles.py). La reformuler avant la recherche
         (dans les mots de la loi, ou en passage de loi hypothétique « HyDE ») a
         été mesuré le 2026-10-03 et écarté : MRR 0,686 → 0,657 et 0,644, et une
         question hors corpus montait au-dessus du seuil de l'étage 1 (jusqu'à
         0,47) ; le passage hypothétique inventait en outre des chiffres.
         """
+        # Sigles développés (« IFI » → « IFI (impôt sur la fortune
+        # immobilière) ») pour les trois étapes : cf. sigles.py.
+        query = developper_sigles(query)
         embedding_requete = self._embeddings.embed_query(query)
         resultats_denses = self._dense.search(embedding_requete, k=self._k_par_source)
         resultats_sparses = self._sparse.search(query, k=self._k_par_source)

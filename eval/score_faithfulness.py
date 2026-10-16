@@ -109,7 +109,9 @@ def comparer(
         if t["verdict_local"] not in VERDICTS_COMPARABLES:
             continue
         cas_test = LLMTestCase(
-            input=t["question"], actual_output=t["reponse"], retrieval_context=t["contexts"]
+            # Question de suivi : la question réécrite, seule lisible sans la conversation.
+            input=t.get("question_comprise") or t["question"],
+            actual_output=t["reponse"], retrieval_context=t["contexts"],
         )
         metric.measure(cas_test)
         verdict_deepeval = "fondee" if metric.success else "refus_fidelite"

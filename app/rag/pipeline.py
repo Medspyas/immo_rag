@@ -26,11 +26,14 @@ les deux garde-fous (vérification des citations puis de la fidélité).
 Contenu du fichier :
 - RapportIngestion : bilan chiffré d'une ingestion (combien d'articles, dont
   combien d'abrogés).
+- TEXTES_NON_CONSOLIDES, fichiers_du_corpus : textes de data/clean/ indexés,
+  liste commune à l'ingestion réelle et à l'évaluation.
 - identifiant_chunk : identifiant stable d'un article — même loi et même numéro
   donnent toujours le même identifiant, d'une ingestion à l'autre.
 - preparer_morceaux : étapes 1 à 3, sans toucher à la base.
 - ingerer_document : les quatre étapes, rangement en base compris.
-- documents_bm25 : convertit des morceaux préparés en entrées pour l'index BM25.
+- documents_bm25 : convertit des morceaux préparés en entrées pour l'index BM25,
+  avec les questions de chaque article (questions_articles.py).
 - construire_index_bm25 : reconstruit l'index BM25 à partir de la base.
 - construire_retriever : assemble la recherche hybride à partir de ses
   composants et du réglage du garde-fou étage 1.
@@ -39,6 +42,7 @@ Contenu du fichier :
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 from uuid import UUID, uuid5
 
@@ -57,13 +61,34 @@ from app.rag.generator import (
     verifier_fidelite,
 )
 from app.rag.nli import ScoreNLI
+from app.rag.questions_articles import charger_questions
 from app.rag.retriever import HybridRetriever
+from app.rag.suivi import Echange, reformuler_question
 from app.rag.vector_store import Chunk
 
 # Espace de noms fixe pour dériver l'identifiant d'un article de façon
 # déterministe. Conséquence : réingérer la même loi réécrit les mêmes morceaux
 # (upsert) au lieu d'en créer des doublons.
 NS_CHUNK = UUID("00000000-0000-0000-0000-000000000001")
+
+# Lois modificatives en version Journal officiel, non indexées. Leurs articles
+# ne sont pas du droit autonome mais des consignes de modification d'autres
+# textes (« Après l'article 24-1 de la loi n° 89-462, il est inséré… »), figées
+# à la date de publication. Leur effet se lit dans les versions consolidées des
+# textes modifiés, déjà présentes dans le corpus. Les indexer fait citer du droit
+# périmé : la garantie universelle des loyers d'ALUR passait devant l'article 24
+# de la loi de 1989 pour une question sur les impayés. Mesuré sur le golden sans
+# ALUR : MRR 0,686 → 0,706, hit@3 81 % → 87 %.
+TEXTES_NON_CONSOLIDES = {"loi_ALUR.txt"}
+
+
+def fichiers_du_corpus(dossier: Path) -> list[str]:
+    """Noms des textes de dossier indexés en production : tous les .txt sauf
+    TEXTES_NON_CONSOLIDES. L'évaluation lit la même liste, pour mesurer le
+    système réellement interrogé et non un sous-ensemble plus facile."""
+    return sorted(
+        p.name for p in dossier.glob("*.txt") if p.name not in TEXTES_NON_CONSOLIDES
+    )
 
 
 class _Embeddings(Protocol):
@@ -198,12 +223,20 @@ def ingerer_document(
     )
 
 
-def documents_bm25(morceaux: list[Chunk]) -> list[BM25Document]:
+def documents_bm25(
+    morceaux: list[Chunk], questions: dict[tuple[str, str], list[str]] | None = None
+) -> list[BM25Document]:
     """Convertit des morceaux préparés en entrées pour l'index BM25, qui n'a pas
-    besoin des vecteurs."""
+    besoin des vecteurs. Les questions de chaque article (questions_articles.py)
+    sont indexées avec lui, sans entrer dans son texte."""
+    questions = charger_questions() if questions is None else questions
     return [
         BM25Document(
-            id=m.id, doc_id=m.doc_id, content=m.content, metadata=m.metadata
+            id=m.id,
+            doc_id=m.doc_id,
+            content=m.content,
+            metadata=m.metadata,
+            complement="\n".join(questions.get((m.doc_id, m.metadata.get("article")), [])),
         )
         for m in morceaux
     ]
@@ -279,6 +312,7 @@ def repondre(
     settings: Settings,
     k: int | None = None,
     juge: _LLM | None = None,
+    historique: list[Echange] | None = None,
 ) -> ReponseGeneree:
     """Orchestration complète d'une requête : recherche puis génération sous
     deux garde-fous (cf. CLAUDE.md, section garde-fou anti-hallucination).
@@ -295,9 +329,31 @@ def repondre(
     k fixe le nombre d'articles envoyés au LLM ; par défaut
     settings.k_articles_generation. juge sert de juge de repli pour la
     fidélité ; par défaut llm.
+
+    historique : les échanges précédents de la conversation. Une question de
+    suivi est d'abord réécrite en question autonome (suivi.py), qui sert
+    ensuite à la recherche et à la génération.
     """
     if k is None:
         k = settings.k_articles_generation
+    question_posee = question
+    question = reformuler_question(question, historique or [], llm)
+    reponse = _repondre_question(question, retriever, llm, nli, settings, k, juge)
+    if question != question_posee:
+        reponse = reponse.model_copy(update={"question_comprise": question})
+    return reponse
+
+
+def _repondre_question(
+    question: str,
+    retriever: HybridRetriever,
+    llm: _LLM,
+    nli: _NLI,
+    settings: Settings,
+    k: int,
+    juge: _LLM | None,
+) -> ReponseGeneree:
+    """Recherche, génération et garde-fous pour une question autonome."""
     resultats = retriever.search(question, k=k)
     reponse = generer_reponse(question, resultats, llm)
     reponse = corriger_citations(question, resultats, llm, reponse)

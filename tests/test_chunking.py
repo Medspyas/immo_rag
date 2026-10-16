@@ -128,3 +128,24 @@ def test_titre_arrete_avant_un_pictogramme_de_mise_a_jour():
 def test_chaque_article_porte_le_titre_de_sa_loi():
     chunks = decouper_en_articles(_EN_TETE_LEGIFRANCE, "Loi_hoguet")
     assert chunks[0].titre.endswith("(loi Hoguet)")
+
+
+def test_intitule_en_fin_d_article_appartient_au_suivant():
+    chunks = decouper_en_articles(TEXTE_AVEC_INTITULES, doc_id="loi-1989")
+    article = next(c for c in chunks if c.article == "15")
+    assert article.content == (
+        "Article 15\nLe délai de préavis applicable au congé est de trois mois."
+    )
+
+
+def test_intitule_de_code_en_fin_d_article_est_retire():
+    texte = """Article 31
+Les revenus fonciers sont déterminés sous déduction des charges.
+Première Partie : Impôts d'État
+I bis : Bénéfices industriels et commerciaux
+Article 32
+Un abattement de 30 % s'applique : il couvre les charges."""
+    chunks = decouper_en_articles(texte, doc_id="cgi")
+    contenus = {c.article: c.content for c in chunks}
+    assert contenus["31"].endswith("sous déduction des charges.")
+    assert contenus["32"].endswith("il couvre les charges.")

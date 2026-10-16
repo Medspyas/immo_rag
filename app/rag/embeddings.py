@@ -44,16 +44,24 @@ class LocalEmbeddings(EmbeddingProvider):
     calcul local. Implémentation retenue par défaut.
 
     Modèle retenu : intfloat/multilingual-e5-base. Cette famille attend un
-    préfixe "query: " ou "passage: " devant le texte ; ce préfixe est à retirer
-    pour un modèle qui ne suit pas cette convention.
+    préfixe "query: " ou "passage: " devant le texte ; les préfixes se règlent
+    dans la configuration (vides pour un modèle sans cette convention).
 
     Le modèle n'est chargé qu'au premier appel : la création de l'objet reste
     instantanée et les tests n'ont pas à le charger.
     """
 
-    def __init__(self, model_name: str, dimension: int):
+    def __init__(
+        self,
+        model_name: str,
+        dimension: int,
+        prefixe_requete: str = "query: ",
+        prefixe_passage: str = "passage: ",
+    ):
         self._model_name = model_name
         self.dimension = dimension
+        self._prefixe_requete = prefixe_requete
+        self._prefixe_passage = prefixe_passage
         self._model = None
 
     def _get_model(self):
@@ -64,16 +72,21 @@ class LocalEmbeddings(EmbeddingProvider):
         return self._model
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        prefixed = [f"passage: {t}" for t in texts]
+        prefixed = [f"{self._prefixe_passage}{t}" for t in texts]
         return self._get_model().encode(prefixed, normalize_embeddings=True).tolist()
 
     def embed_query(self, text: str) -> list[float]:
-        prefixed = f"query: {text}"
+        prefixed = f"{self._prefixe_requete}{text}"
         return self._get_model().encode([prefixed], normalize_embeddings=True).tolist()[0]
 
 
 def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
     """Sélectionne l'implémentation selon le réglage EMBEDDINGS_PROVIDER de .env."""
     if settings.embeddings_provider == "local":
-        return LocalEmbeddings(settings.embeddings_model, settings.embeddings_dimension)
+        return LocalEmbeddings(
+            settings.embeddings_model,
+            settings.embeddings_dimension,
+            settings.embeddings_prefixe_requete,
+            settings.embeddings_prefixe_passage,
+        )
     raise ValueError(f"Fournisseur d'embeddings inconnu : {settings.embeddings_provider}")

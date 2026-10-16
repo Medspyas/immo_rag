@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Composer } from '@/components/chat/composer'
 import { Attente, Erreur, Refus, ReponseFondee, type Titres } from '@/components/chat/reponse'
 import { useDocuments } from '@/hooks/use-documents'
-import { api, type ReponseGeneree } from '@/lib/api'
+import { api, type EchangePrecedent, type ReponseGeneree } from '@/lib/api'
 
 interface Echange {
   id: string
@@ -42,6 +42,19 @@ function lireConversation(): Echange[] {
   } catch {
     return []
   }
+}
+
+// Échanges terminés qui précèdent une question, sous la forme attendue par
+// l'API. La question retenue est celle comprise par l'assistant : une suite de
+// questions de suivi (« et pour un meublé ? » puis « et le délai ? ») reste
+// ainsi rattachée au sujet de départ.
+function historiqueAvant(echanges: Echange[]): EchangePrecedent[] {
+  return echanges
+    .filter((e) => e.reponse)
+    .map((e) => ({
+      question: e.reponse?.question_comprise ?? e.question,
+      reponse: e.reponse?.refus ? '' : (e.reponse?.reponse ?? ''),
+    }))
 }
 
 function Accueil({ choisir }: { choisir: (q: string) => void }) {
@@ -105,9 +118,9 @@ export function PageChat() {
   const majEchange = (id: string, maj: Partial<Echange>) =>
     setEchanges((liste) => liste.map((e) => (e.id === id ? { ...e, ...maj } : e)))
 
-  const interroger = async (id: string, question: string) => {
+  const interroger = async (id: string, question: string, historique: EchangePrecedent[]) => {
     try {
-      majEchange(id, { reponse: await api.poser(question) })
+      majEchange(id, { reponse: await api.poser(question, historique) })
     } catch (e) {
       majEchange(id, { erreur: e instanceof Error ? e.message : String(e) })
     }
@@ -116,12 +129,13 @@ export function PageChat() {
   const envoyer = (question: string) => {
     const id = crypto.randomUUID()
     setEchanges((liste) => [...liste, { id, question }])
-    void interroger(id, question)
+    void interroger(id, question, historiqueAvant(echanges))
   }
 
   const reessayer = (echange: Echange) => {
     majEchange(echange.id, { erreur: undefined })
-    void interroger(echange.id, echange.question)
+    const precedents = echanges.slice(0, echanges.findIndex((e) => e.id === echange.id))
+    void interroger(echange.id, echange.question, historiqueAvant(precedents))
   }
 
   return (
@@ -136,6 +150,11 @@ export function PageChat() {
                 <p className="max-w-[85%] self-end rounded-2xl rounded-br-sm bg-secondary px-4 py-2.5 text-secondary-foreground">
                   {e.question}
                 </p>
+                {e.reponse?.question_comprise && (
+                  <p className="max-w-[85%] self-end text-right text-xs text-muted-foreground">
+                    Question comprise : {e.reponse.question_comprise}
+                  </p>
+                )}
                 {e.erreur ? (
                   <Erreur message={e.erreur} reessayer={() => reessayer(e)} />
                 ) : !e.reponse ? (

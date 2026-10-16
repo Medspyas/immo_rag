@@ -184,7 +184,10 @@ def query(payload: QueryRequest) -> ReponseGeneree:
     except _ERREURS_COMPOSANT_INDISPONIBLE as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
-        return repondre(payload.question, retriever, llm, nli, settings, juge=juge)
+        return repondre(
+            payload.question, retriever, llm, nli, settings, juge=juge,
+            historique=payload.historique,
+        )
     except ModeleIndisponible as exc:
         # Tous les modèles saturés, même après attente : service momentanément
         # indisponible, pas une erreur du serveur.

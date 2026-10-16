@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     embeddings_provider: Literal["local"] = "local"
     embeddings_model: str = "intfloat/multilingual-e5-base"
     embeddings_dimension: int = 768
+    # Préfixes attendus par la famille e5 devant la question et devant
+    # l'article. Vides pour un modèle sans cette convention (BAAI/bge-m3).
+    embeddings_prefixe_requete: str = "query: "
+    embeddings_prefixe_passage: str = "passage: "
 
     # Reclassement des résultats de recherche : modèle local et gratuit. Un
     # autre modèle local se choisit via rerank_model. "onnx" (OnnxReranker,
@@ -98,6 +102,10 @@ class Settings(BaseSettings):
     llm_modele_juge: str = "openai/gpt-oss-120b"
 
     groq_api_key: str | None = None
+    # Relais en fin de cascade quand les quotas Groq sont consommés (offre
+    # gratuite Mistral « Experiment »). Sans clé, la cascade reste 100 % Groq.
+    mistral_api_key: str | None = None
+    mistral_model: str = "ministral-14b-latest"
 
     # Origines autorisées à appeler l'API depuis un navigateur (front, phase 3).
     # Format JSON dans .env, ex. ["http://localhost:5173"] ; vide par défaut.

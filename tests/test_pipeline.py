@@ -15,12 +15,14 @@ from app.rag.pipeline import (
     construire_index_bm25,
     construire_retriever,
     documents_bm25,
+    fichiers_du_corpus,
     identifiant_chunk,
     ingerer_document,
     preparer_morceaux,
     repondre,
 )
 from app.rag.retriever import HybridRetriever
+from app.rag.suivi import CONSIGNE_SUIVI, Echange
 from app.rag.vector_store import Chunk
 
 # Deux articles, dont un abrogé (marqueurs posés par le nettoyage en amont).
@@ -142,12 +144,26 @@ def test_ingerer_document_signale_la_contextualisation():
     assert rapport.contextualise is True
 
 
+def test_fichiers_du_corpus_ecarte_les_textes_non_consolides(tmp_path):
+    for nom in ("loi_b.txt", "loi_ALUR.txt", "loi_a.txt", "notes.md"):
+        (tmp_path / nom).write_text("x", encoding="utf-8")
+    assert fichiers_du_corpus(tmp_path) == ["loi_a.txt", "loi_b.txt"]
+
+
 def test_documents_bm25_reprend_id_contenu_et_metadonnees():
     morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
     docs = documents_bm25(morceaux)
     assert [d.id for d in docs] == [m.id for m in morceaux]
     assert docs[0].metadata["article"] == "1"
     assert "préavis" in docs[0].content
+
+
+def test_documents_bm25_indexe_les_questions_sans_toucher_au_contenu():
+    morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
+    docs = documents_bm25(morceaux, {("loi-essai", "1"): ["Combien de temps dure le préavis ?"]})
+    assert docs[0].complement == "Combien de temps dure le préavis ?"
+    assert "Combien de temps" not in docs[0].content
+    assert all(d.complement == "" for d in docs[1:])
 
 
 # --- construire_index_bm25 ---------------------------------------------------
@@ -347,6 +363,37 @@ def test_repondre_affirmation_non_fondee_bascule_en_refus():
     )
     assert reponse.refus is True
     assert "non fondée" in reponse.motif
+
+
+class _LLMSuivi:
+    """Réécrit la question de suivi, puis répond comme _LLMFake."""
+
+    def __init__(self, reecrite: str):
+        self._reecrite = reecrite
+
+    def generer(self, consigne: str, question: str) -> str:
+        if consigne == CONSIGNE_SUIVI:
+            return json.dumps({"question": self._reecrite})
+        return _REPONSE_OK
+
+
+def test_repondre_reecrit_la_question_de_suivi():
+    retriever = _RetrieverFake([_ARTICLE_15])
+    historique = [Echange(question="Quel préavis pour le locataire ?", reponse="Trois mois.")]
+    reponse = repondre(
+        "Et pour un meublé ?", retriever, _LLMSuivi("Quel préavis pour un meublé ?"),
+        _NLIToujoursFonde(), _settings(), historique=historique,
+    )
+    assert retriever.question_recue == "Quel préavis pour un meublé ?"
+    assert reponse.question_comprise == "Quel préavis pour un meublé ?"
+
+
+def test_repondre_sans_historique_ne_signale_aucune_reecriture():
+    reponse = repondre(
+        "Quel préavis ?", _RetrieverFake([_ARTICLE_15]), _LLMFake(_REPONSE_OK),
+        _NLIToujoursFonde(), _settings(),
+    )
+    assert reponse.question_comprise is None
 
 
 def test_repondre_transmet_k_au_retriever():

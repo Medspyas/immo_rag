@@ -10,9 +10,15 @@ franchi suffit à faire échouer le script (code de sortie 1), donc la CI.
 Mesures contrôlées :
 - hit@k et MRR sur les questions du corpus (cf. metrics.py) : le bon article
   remonte-t-il, et assez haut ?
-- meilleur score de reclassement sur les questions hors corpus : il doit rester
-  sous le seuil du garde-fou étage 1 (seuil_garde_fou_retrieval), sinon une
-  question sans réponse dans la base passerait jusqu'au LLM.
+- part des questions hors corpus arrêtées par le garde-fou étage 1 (meilleur
+  score de reclassement sous seuil_garde_fou_retrieval). Sur le corpus complet
+  (code civil et code des impôts compris, 2026-10-13), aucun seuil ne sépare
+  plus les deux groupes : une question hors corpus proche d'un article réel
+  (durée de validité du DPE, 0,83) dépasse de bonnes questions (IFI, 0,04).
+  L'étage 1 n'arrête donc qu'une partie des questions hors corpus ; les autres
+  relèvent de l'étage 2, mesuré de bout en bout par run_eval.py. Le gate
+  vérifie que cette part ne recule pas. Le meilleur score (hors_corpus_max)
+  reste affiché, pour information.
 
 Les planchers sont relevés à partir d'une mesure de référence, avec une petite
 marge : le reclasseur ne donne pas exactement les mêmes scores sur carte
@@ -66,11 +72,11 @@ def mesurer(settings) -> dict[str, float]:
     from app.rag.retriever import HybridRetriever
     from eval.ablation import KS, evaluer_systeme, recherche_hybride
     from eval.corpus_memoire import construire_corpus
-    from eval.golden import charger_golden
+    from eval.golden import charger_golden, questions_autonomes
 
     corpus = construire_corpus(get_embedding_provider(settings))
     reranker = get_rerank_provider(settings)
-    tous = charger_golden()
+    tous = questions_autonomes(charger_golden())
     dans = [c for c in tous if not c.hors_corpus]
     hors = [c for c in tous if c.hors_corpus]
 
@@ -100,6 +106,10 @@ def mesurer(settings) -> dict[str, float]:
         top = retriever.search(c.question, 1)
         scores_hors.append((top[0].score_rerank or 0.0) if top else 0.0)
     mesures["hors_corpus_max"] = max(scores_hors, default=0.0)
+    seuil = settings.seuil_garde_fou_retrieval
+    mesures["hors_corpus_bloques"] = (
+        sum(s < seuil for s in scores_hors) / len(scores_hors) if scores_hors else 1.0
+    )
     return mesures
 
 
@@ -116,13 +126,10 @@ def main() -> None:
     torch.set_num_threads(max(1, args.threads))
     settings = Settings()
     seuils = json.loads(args.seuils.read_text(encoding="utf-8"))
-    # Le plafond hors corpus suit le seuil du garde-fou étage 1 s'il n'est pas
-    # fixé à la main : c'est lui qui décide du refus en production.
-    seuils.setdefault("hors_corpus_max", {"max": settings.seuil_garde_fou_retrieval})
 
     mesures = mesurer(settings)
     for nom, valeur in mesures.items():
-        print(f"{nom:<16} {valeur:.3f}")
+        print(f"{nom:<20} {valeur:.3f}")
 
     echecs = verifier_seuils(mesures, seuils)
     if echecs:

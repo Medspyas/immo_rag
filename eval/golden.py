@@ -9,6 +9,11 @@ résultats.
 Quelques cas sont volontairement hors du corpus ingéré (hors_corpus) : ils
 vérifient que l'assistant refuse de répondre plutôt que d'inventer.
 
+D'autres sont des questions de suivi (historique non vide) : « Et pour un
+meublé ? » n'a de sens qu'après l'échange précédent. Ils mesurent la
+réécriture en question autonome (suivi.py), qui demande un appel au LLM : les
+mesures de recherche seule (gate, ablation) les laissent de côté.
+
 Contenu du fichier :
 - CasGolden : une question de référence.
 - charger_golden : lit le fichier .jsonl et renvoie la liste des cas validés.
@@ -18,7 +23,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
+
+from app.rag.suivi import ECHANGES_MAX, Echange
 
 FICHIER_GOLDEN = Path(__file__).with_name("golden_dataset.jsonl")
 
@@ -31,6 +38,9 @@ class CasGolden(BaseModel):
 
     reponse_type : « reponse » quand une réponse fondée est attendue, « refus »
     quand l'assistant doit décliner (cas hors_corpus).
+
+    historique : les échanges qui précèdent une question de suivi (vide pour
+    une question autonome).
     """
 
     id: str
@@ -41,6 +51,7 @@ class CasGolden(BaseModel):
     hors_corpus: bool = False
     reponse_type: str
     note: str = ""
+    historique: list[Echange] = Field(default_factory=list, max_length=ECHANGES_MAX)
 
     @model_validator(mode="after")
     def _coherence(self) -> CasGolden:
@@ -85,3 +96,8 @@ def charger_golden(chemin: Path | None = None) -> list[CasGolden]:
     if doublons:
         raise ValueError(f"Identifiants en double dans le golden : {doublons}")
     return cas
+
+
+def questions_autonomes(cas: list[CasGolden]) -> list[CasGolden]:
+    """Les cas sans historique : ceux qu'une recherche seule peut traiter."""
+    return [c for c in cas if not c.historique]

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from app.rag.chunking import decouper_en_articles
-from eval.golden import charger_golden
+from eval.golden import charger_golden, questions_autonomes
 
 RACINE = Path(__file__).resolve().parent.parent
 DOSSIER_CORPUS = RACINE / "data" / "clean"
@@ -65,3 +65,10 @@ def test_les_articles_cibles_existent_dans_le_corpus():
             }
         manquants = set(c.articles) - articles_par_doc[c.doc_id]
         assert not manquants, f"{c.id} : articles absents de {c.doc_id} : {sorted(manquants)}"
+
+
+def test_presence_de_questions_de_suivi_et_exclusion_de_la_recherche_seule():
+    tous = charger_golden()
+    suivis = [c for c in tous if c.historique]
+    assert len(suivis) >= 3
+    assert len(questions_autonomes(tous)) == len(tous) - len(suivis)

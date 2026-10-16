@@ -27,6 +27,23 @@ def test_singulier_et_pluriel_meme_racine():
     assert tokeniser_fr("logements")[0] == tokeniser_fr("logement")[0]
 
 
+def test_plus_value_un_seul_mot_quelle_que_soit_la_graphie():
+    attendu = tokeniser_fr("plus-values")
+    assert attendu == ["plusvalu"]
+    for graphie in ("Plus-value", "plus value", "plus valus"):
+        assert tokeniser_fr(graphie) == attendu
+    assert tokeniser_fr("moins-values") != attendu
+    # « plus » seul reste un mot-outil
+    assert tokeniser_fr("plus de valeur") == tokeniser_fr("valeur")
+
+
+def test_verbe_et_nom_meme_racine():
+    # Snowball sépare "revoqu" / "revoc" et "resil" / "resili"
+    assert tokeniser_fr("révoque") == tokeniser_fr("révocation")
+    assert tokeniser_fr("convoquer") == tokeniser_fr("convocation")
+    assert tokeniser_fr("résilie") == tokeniser_fr("résiliation")
+
+
 # --- l'index et ses recherches -------------------------------------------
 
 DOCS = [
@@ -63,6 +80,16 @@ def test_search_ignore_les_scores_nuls():
     # "copropriété" ne concerne qu'un seul morceau : 3 demandés, 1 renvoyé
     resultats = BM25Index(DOCS).search("copropriété", k=3)
     assert [r.doc_id for r in resultats] == ["loi-65"]
+
+
+def test_complement_indexe_mais_jamais_renvoye():
+    doc = BM25Document(
+        id=uuid4(), doc_id="hoguet", content="Le mandat comporte une limitation dans le temps.",
+        complement="Un mandat peut-il être à durée indéterminée ?",
+    )
+    resultats = BM25Index([doc, *DOCS]).search("durée indéterminée")
+    assert [r.doc_id for r in resultats] == ["hoguet"]
+    assert "indéterminée" not in resultats[0].content
 
 
 def test_index_vide():

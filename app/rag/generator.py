@@ -23,6 +23,7 @@ Contenu du fichier :
 - ReponseGeneree : la réponse rédigée, ou un refus motivé, avec ses citations.
 - LLM : contrat commun aux fournisseurs de modèle de langage.
 - GroqLLM : implémentation Groq (gratuite, par défaut).
+- MistralLLM : implémentation Mistral (gratuite), relais quand Groq est épuisé.
 - ModeleIndisponible : erreur d'un modèle saturé ou momentanément en panne.
 - LLMEnCascade : passe au modèle suivant quand le premier est saturé.
 - get_llm : sélectionne l'implémentation selon .env.
@@ -54,6 +55,10 @@ Règles impératives :
 connaissance extérieure, même si tu penses la connaître.
 - Si les articles ne permettent pas de répondre, refuse : il vaut mieux ne pas \
 répondre qu'inventer, dans un domaine réglementé.
+- Réponds à la question posée, pas à une question voisine. Si elle demande une \
+information précise (une durée, un délai, un montant, un taux, un seuil, une \
+majorité) et qu'aucun article ne la donne, refuse, même si les articles \
+traitent du même sujet.
 - Un article signalé « ABROGÉ » ne doit pas être présenté comme le droit en vigueur.
 - La ligne « Situé dans » indique le régime auquel un article s'applique \
 (par exemple les logements meublés, ou le bail mobilité). Une règle propre à \
@@ -98,12 +103,17 @@ class ReponseGeneree(BaseModel):
     de répondre ; motif en donne alors la raison et reponse reste vide. Sinon,
     reponse contient le texte rédigé et citations la liste des passages
     invoqués.
+
+    question_comprise : la question réellement traitée, quand une question de
+    suivi a été réécrite à partir de la conversation (suivi.py) ; None sinon.
+    Affichée à l'utilisateur, qui voit ainsi comment sa question a été lue.
     """
 
     refus: bool
     motif: str | None = None
     reponse: str = ""
     citations: list[Citation] = Field(default_factory=list)
+    question_comprise: str | None = None
 
 
 class _ResultatRecherche(Protocol):
@@ -169,6 +179,11 @@ class GroqLLM(LLM):
             # l'API répond 503 plutôt que de planter.
             if exc.status_code == 413:
                 raise ModeleIndisponible(f"{self._model} : {exc}") from exc
+            # 400 json_validate_failed : le modèle n'a pas produit de JSON
+            # valide (sortie vide, constaté sur le juge, 2026-10-06). Un autre
+            # modèle de la cascade peut réussir ; sinon l'API répond 503.
+            if exc.status_code == 400 and "json_validate_failed" in str(exc):
+                raise ModeleIndisponible(f"{self._model} : {exc}") from exc
             raise
 
     def _appeler(self, consigne: str, question: str) -> str:
@@ -202,6 +217,76 @@ class QuotaJournalierEpuise(ModeleIndisponible):
     n'y change rien, il ne répondra plus avant des heures."""
 
 
+# Offre gratuite Mistral : seuls les modèles « ministral » y répondent
+# (ministral-14b : 30 requêtes par minute, mesuré le 2026-10-06 ; large,
+# medium et small refusés ou à 0 requête). Une requête refusée pour débit
+# est réessayée après une demi-minute.
+MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_ATTENTE_SECONDES = 31.0
+# Plafond de réponse plus haut que pour Groq : ministral-14b rédige plus
+# long, et 1024 tokens coupaient la réponse en pleine citation (JSON
+# illisible, constaté sur q14 le 2026-10-06). Le débit Mistral le permet.
+MISTRAL_MAX_TOKENS = 2048
+
+
+class MistralLLM(LLM):
+    """Implémentation Mistral (offre gratuite) : relais de Groq dans la
+    cascade, quand les quotas Groq du jour sont consommés (constaté le
+    2026-10-06 : évaluation du golden interrompue à 8 questions sur 35).
+
+    Appel HTTP direct à l'API (même forme que Groq : messages, réponse JSON),
+    sans bibliothèque dédiée. dormir est remplaçable dans les tests."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_essais: int = GROQ_MAX_ESSAIS,
+        client=None,
+        dormir=None,
+    ):
+        import time
+
+        import httpx
+
+        self._client = client or httpx.Client(timeout=120.0)
+        self._cle = api_key
+        self._model = model
+        self._max_essais = max_essais
+        self._dormir = dormir or time.sleep
+        self.nom = f"mistral/{model}"
+
+    def generer(self, consigne: str, question: str) -> str:
+        import httpx
+
+        corps = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": consigne},
+                {"role": "user", "content": question},
+            ],
+            "temperature": 0.0,
+            "response_format": _format_reponse_mistral(consigne),
+            "max_tokens": MISTRAL_MAX_TOKENS,
+        }
+        for essai in range(self._max_essais + 1):
+            try:
+                reponse = self._client.post(
+                    MISTRAL_URL, json=corps, headers={"Authorization": f"Bearer {self._cle}"}
+                )
+            except httpx.HTTPError as exc:
+                raise ModeleIndisponible(f"{self.nom} : {exc}") from exc
+            # 429 : débit dépassé ; 5xx : panne passagère.
+            if reponse.status_code == 429 or reponse.status_code >= 500:
+                if essai < self._max_essais:
+                    self._dormir(MISTRAL_ATTENTE_SECONDES)
+                    continue
+                raise ModeleIndisponible(f"{self.nom} : {reponse.status_code} {reponse.text[:200]}")
+            reponse.raise_for_status()
+            return reponse.json()["choices"][0]["message"]["content"]
+        raise ModeleIndisponible(f"{self.nom} : aucun essai")
+
+
 class LLMEnCascade(LLM):
     """Répartit les appels sur plusieurs modèles pour contourner le quota.
 
@@ -216,11 +301,18 @@ class LLMEnCascade(LLM):
     2026-10-03 : quota journalier du juge gpt-oss-120b consommé).
     """
 
-    def __init__(self, modeles: list[LLM], derniers_recours: list[LLM]):
+    def __init__(
+        self, modeles: list[LLM], derniers_recours: list[LLM], secours: LLM | None = None
+    ):
         if len(modeles) != len(derniers_recours):
             raise ValueError("un dernier recours par modèle de la cascade")
         self._modeles = modeles
         self._derniers_recours = derniers_recours
+        # Secours (Mistral) : appelé seulement quand aucun modèle ne répond,
+        # même après attente. Placé dans la cascade, il prenait la main à
+        # chaque saturation d'une minute de Groq et rédigeait des réponses
+        # plus faibles (q15, q25 refusées, constaté le 2026-10-11).
+        self._secours = secours
         # Modèles qui ont effectivement répondu, dans l'ordre des appels : les
         # modèles ne jugent pas tous pareil, l'évaluation doit savoir lequel a
         # tranché (run_eval.py).
@@ -239,9 +331,18 @@ class LLMEnCascade(LLM):
                 continue
         for rang, recours in enumerate(self._derniers_recours):
             if rang not in epuises:
-                brut = recours.generer(consigne, question)
+                try:
+                    brut = recours.generer(consigne, question)
+                except ModeleIndisponible:
+                    if self._secours is None:
+                        raise
+                    break
                 self.historique.append(f"{getattr(recours, 'nom', '?')} (attente)")
                 return brut
+        if self._secours is not None:
+            brut = self._secours.generer(consigne, question)
+            self.historique.append(f"{getattr(self._secours, 'nom', '?')} (secours)")
+            return brut
         raise QuotaJournalierEpuise("quota du jour épuisé pour tous les modèles")
 
 
@@ -250,7 +351,9 @@ def get_llm(settings: Settings, premier: str | None = None) -> LLM:
 
     Avec des modèles de relais (llm_modeles_relais), les appels passent par
     une cascade : llm_model d'abord, puis les relais dans l'ordre. premier
-    place un autre modèle en tête (cf. get_llm_juge).
+    place un autre modèle en tête (cf. get_llm_juge). Avec MISTRAL_API_KEY,
+    Mistral sert de secours : il ne répond que si Groq échoue même après
+    attente (quota du jour épuisé).
     """
     if settings.llm_provider == "groq":
         if not settings.groq_api_key:
@@ -258,12 +361,16 @@ def get_llm(settings: Settings, premier: str | None = None) -> LLM:
         cle = settings.groq_api_key
         tete = premier or settings.llm_model
         noms = list(dict.fromkeys([tete, settings.llm_model, *settings.llm_modeles_relais]))
-        if len(noms) == 1:
-            return GroqLLM(cle, tete)
-        return LLMEnCascade(
-            [GroqLLM(cle, nom, max_essais=0) for nom in noms],
-            derniers_recours=[GroqLLM(cle, nom) for nom in noms],
+        modeles: list[LLM] = [GroqLLM(cle, nom, max_essais=0) for nom in noms]
+        recours: list[LLM] = [GroqLLM(cle, nom) for nom in noms]
+        secours = (
+            MistralLLM(settings.mistral_api_key, settings.mistral_model)
+            if settings.mistral_api_key
+            else None
         )
+        if len(modeles) == 1 and secours is None:
+            return GroqLLM(cle, tete)
+        return LLMEnCascade(modeles, derniers_recours=recours, secours=secours)
     raise ValueError(f"Fournisseur LLM inconnu : {settings.llm_provider}")
 
 
@@ -581,12 +688,21 @@ def verifier_citations(
 # des fragments sans contenu (« 126-26 du code de la construction ») refusés
 # par le juge (mesuré sur q03, q14, q22, q28 le 2026-10-03).
 _SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])(?<!\b[LRDA]\.)(?<!\bart\.)\s+")
-# Début d'un élément de liste : « 1. », « 2) », « - », « • », « * ».
-_PUCE = re.compile(r"^\s*(?:\d+[.)]|[-•*])\s+")
+# Début d'un élément de liste : « 1. », « 2) », « a. », « b) », « - », « • », « * ».
+# Sans les lettres, « a. Le locataire … » était coupé en deux phrases et « a. »
+# devenait une affirmation refusée par le juge (q03, 2026-10-14).
+_PUCE = re.compile(r"^\s*(?:\d+[.)]|[a-z][.)]|[-•*])\s+")
 # Élément de liste numérotée écrit à la suite du précédent, sur la même ligne
 # (« 1. Assurer … communes. 2. Mettre à jour … ») : remis à la ligne pour être
 # vérifié seul.
 _PUCE_EN_LIGNE = re.compile(r"(?<=[.;:])[ \t]+(?=\d{1,2}[.)][ \t])")
+# Mise en forme markdown (gras, italique, titres) : le NLI la lit comme du
+# texte, et « **Règles générales :** » ne finit plus par « : », donc passait
+# pour une affirmation (réponses de Mistral surtout, constaté le 2026-10-11).
+_GRAS = re.compile(r"\*\*|__")
+_ITALIQUE = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
+# Un titre (« ## Règle ») n'affirme rien : la ligne est retirée entière.
+_TITRE = re.compile(r"^[ \t]*#{1,6}[ \t].*$", re.MULTILINE)
 # « Oui, » / « Non. » en tête de réponse : une réaction à la question, pas une
 # affirmation que le texte source pourrait impliquer.
 _OUI_NON = re.compile(r"^(?:oui|non)\s*[,.:]\s*", re.IGNORECASE)
@@ -656,6 +772,53 @@ dans l'ordre :
 {"fondees": [true, false, ...]}"""
 
 
+# Schémas JSON imposés à Mistral. Le simple mode JSON ne suffit pas :
+# ministral-14b rendait « reponse » sous forme d'objet imbriqué (un cas par
+# régime) au lieu d'un texte, et la réponse, trop longue, était coupée en
+# plein JSON (constaté sur q01 le 2026-10-06). Le schéma strict fixe la
+# forme exacte attendue par _lire_reponse et _juger_fidelite.
+_SCHEMA_REPONSE = {
+    "type": "object",
+    "properties": {
+        "refus": {"type": "boolean"},
+        "motif": {"type": "string"},
+        "reponse": {"type": "string"},
+        "citations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string"},
+                    "article": {"type": "string"},
+                    "passage": {"type": "string"},
+                },
+                "required": ["doc_id", "article", "passage"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["refus", "motif", "reponse", "citations"],
+    "additionalProperties": False,
+}
+
+_SCHEMA_JUGE = {
+    "type": "object",
+    "properties": {"fondees": {"type": "array", "items": {"type": "boolean"}}},
+    "required": ["fondees"],
+    "additionalProperties": False,
+}
+
+
+def _format_reponse_mistral(consigne: str) -> dict:
+    """Format de réponse demandé à Mistral selon la consigne : schéma strict
+    pour les deux formats connus, simple mode JSON sinon."""
+    schemas = {CONSIGNE: ("reponse", _SCHEMA_REPONSE), CONSIGNE_JUGE_FIDELITE: ("juge", _SCHEMA_JUGE)}
+    if consigne not in schemas:
+        return {"type": "json_object"}
+    nom, schema = schemas[consigne]
+    return {"type": "json_schema", "json_schema": {"name": nom, "schema": schema, "strict": True}}
+
+
 class _NLI(Protocol):
     """Partie d'un fournisseur NLI utilisée ici : les scores d'implication et
     de contradiction d'extraits de texte source face à une affirmation."""
@@ -683,6 +846,7 @@ def _decouper_en_affirmations(texte: str) -> list[str]:
     exacts même quand l'un d'eux était faux (mesuré sur q22 le 2026-10-03 :
     implication 0,99 pour trois missions dont une prêtée à tort au syndic).
     """
+    texte = _TITRE.sub("", _ITALIQUE.sub(r"\1", _GRAS.sub("", texte)))
     affirmations: list[str] = []
     introduction: str | None = None
     # Introduction de la liste principale, rétablie après une sous-liste.

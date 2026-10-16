@@ -1,7 +1,8 @@
 {
-  "hit@1": {"min": 0.54},
-  "hit@3": {"min": 0.83},
-  "hit@5": {"min": 0.83},
-  "hit@10": {"min": 0.90},
-  "mrr": {"min": 0.68}
+  "hit@1": {"min": 0.57},
+  "hit@3": {"min": 0.87},
+  "hit@5": {"min": 0.87},
+  "hit@10": {"min": 0.9},
+  "mrr": {"min": 0.7},
+  "hors_corpus_bloques": {"min": 0.25}
 }

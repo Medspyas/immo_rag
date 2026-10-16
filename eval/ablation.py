@@ -53,7 +53,7 @@ from app.config import Settings
 from app.rag.embeddings import get_embedding_provider
 from app.rag.retriever import HybridRetriever
 from eval.corpus_memoire import CorpusMemoire, construire_corpus
-from eval.golden import CasGolden, charger_golden
+from eval.golden import CasGolden, charger_golden, questions_autonomes
 from eval.metrics import Source, mrr, rang_premier_pertinent, taux_hit_at_k
 
 # Rangs examinés. On récupère toujours K_MAX résultats ; hit@k se lit pour
@@ -260,7 +260,7 @@ def main() -> None:
     corpus = construire_corpus(embeddings, contextualizer=contextualizer)
     print(f"{len(corpus.chunks)} articles indexés" + (" (contextualisés).\n" if args.contexte else ".\n"))
 
-    tous = charger_golden()
+    tous = questions_autonomes(charger_golden())
     dans_corpus = [c for c in tous if not c.hors_corpus]
 
     systemes: list[tuple[str, Recherche]] = [

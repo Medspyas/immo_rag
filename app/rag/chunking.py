@@ -50,6 +50,12 @@ INTITULE = re.compile(
 NIVEAUX = ["Partie", "Livre", "Titre", "Chapitre", "Section", "Sous-section", "Paragraphe"]
 # Renvoi « (Articles 25-3 à 25-11) » en fin d'intitulé : sans intérêt pour le sens.
 RENVOI_ARTICLES = re.compile(r"\s*\(Articles?\b.*$")
+# Ligne d'intitulé au sens large, y compris ceux des codes que INTITULE ne
+# reconnaît pas (« Première Partie : Impôts d'État », « I bis : Bénéfices
+# industriels… », « 1° : Généralités ») : un repère court, « : », un libellé.
+# Une ligne de texte d'article finit en général par un point, un point-virgule
+# ou une virgule : ces lignes-là ne sont jamais prises pour un intitulé.
+INTITULE_LARGE = re.compile(r"^[^:.;]{1,40}\s:\s+\S")
 
 
 class RawChunk(BaseModel):
@@ -117,6 +123,13 @@ def titre_document(texte: str) -> str:
     return resultat
 
 
+def _est_intitule_large(ligne: str) -> bool:
+    """Vrai pour une ligne d'intitulé, y compris ceux des codes (INTITULE_LARGE)."""
+    return bool(INTITULE.match(ligne)) or (
+        bool(INTITULE_LARGE.match(ligne)) and not ligne.endswith((".", ";", ","))
+    )
+
+
 def _hierarchie_texte(hierarchie: dict[int, str]) -> str:
     """Intitulés du plus haut niveau au plus bas, sans leurs renvois d'articles."""
     return " > ".join(
@@ -142,11 +155,19 @@ def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
     niveau_en_cours: int | None = None
     section_bloc = ""
     titre = titre_document(texte)
+    # Nombre de lignes d'intitulé (ou vides) en fin de bloc. Un intitulé
+    # précède l'article qu'il introduit : rencontré à la fin d'un bloc, il
+    # appartient à l'article suivant et n'entre pas dans le texte du bloc. L'y
+    # laisser rattachait l'article à un sujet qui n'est pas le sien (un article
+    # du code des impôts terminé par « Section 0I bis : Revenus fonciers ») dans
+    # les embeddings, l'index BM25 et le reclasseur : 1 287 articles sur 7 895
+    # concernés, presque tous dans les codes.
+    queue_intitules = 0
 
     def cloturer_bloc() -> None:
         if not bloc:
             return
-        contenu_brut = "\n".join(bloc).strip()
+        contenu_brut = "\n".join(bloc[: len(bloc) - queue_intitules]).strip()
         if not contenu_brut:
             return
         premiere_ligne = contenu_brut.splitlines()[0].strip()
@@ -169,9 +190,10 @@ def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
 
     for ligne in lignes:
         ligne_nettoyee = ligne.strip()
-        # Suivi des intitulés : ils restent aussi dans le contenu du bloc en
-        # cours, seul leur rattachement aux articles suivants est ajouté.
+        # Suivi des intitulés : rattachés aux articles suivants (section), et
+        # comptés en fin de bloc pour en être retirés (queue_intitules).
         intitule = INTITULE.match(ligne_nettoyee)
+        suite_intitule = False
         if intitule:
             niveau_en_cours = NIVEAUX.index(intitule.group(1))
             hierarchie = {n: t for n, t in hierarchie.items() if n < niveau_en_cours}
@@ -182,25 +204,33 @@ def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
             # Suite d'un intitulé coupé par la mise en page (« … résidence »
             # puis « principale (Articles 25-3 à 25-11) »).
             hierarchie[niveau_en_cours] += " " + ligne_nettoyee
+            suite_intitule = True
         else:
             niveau_en_cours = None
         if ligne_nettoyee == MARQUEUR_DEBUT_ABROGE:
             # Ce marqueur précède un article : le bloc précédent est clôturé.
             cloturer_bloc()
             bloc = [ligne]
+            queue_intitules = 0
         elif ligne_nettoyee == MARQUEUR_FIN_ABROGE:
             # L'article abrogé est clôturé immédiatement. Attendre l'article
             # suivant lui appliquerait à tort l'étiquette "abrogé".
             bloc.append(ligne)
+            queue_intitules = 0
             cloturer_bloc()
             bloc = []
         elif DEBUT_ARTICLE.match(ligne_nettoyee) or DEBUT_TRAVAUX_PREPARATOIRES.search(ligne_nettoyee):
             cloturer_bloc()
             bloc = [ligne]
+            queue_intitules = 0
             # Après la clôture : le bloc précédent garde sa propre section.
             section_bloc = _hierarchie_texte(hierarchie)
         else:
             bloc.append(ligne)
+            if not ligne_nettoyee or suite_intitule or _est_intitule_large(ligne_nettoyee):
+                queue_intitules += 1
+            else:
+                queue_intitules = 0
     cloturer_bloc()
 
     return chunks

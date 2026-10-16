@@ -56,6 +56,7 @@ from app.rag.generator import (
 from app.rag.nli import get_nli_provider
 from app.rag.reranker import get_rerank_provider
 from app.rag.retriever import HybridRetriever
+from app.rag.suivi import reformuler_question
 from eval.corpus_memoire import construire_corpus
 from eval.golden import charger_golden
 
@@ -63,7 +64,10 @@ RACINE = Path(__file__).resolve().parent.parent
 FICHIER_TRACES = RACINE / ".cache" / "eval_traces.jsonl"
 
 
-def _trace(cas, resultats, reponse, verdict_local: str, brute=None, juges=None) -> dict:
+def _trace(
+    cas, resultats, reponse, verdict_local: str, brute=None, juges=None, generateurs=None,
+    motif_fidelite=None, question=None,
+) -> dict:
     """Un cas du golden dataset, prêt à être écrit en JSONL : les champs dont
     score_faithfulness.py a besoin pour rejouer la mesure indépendante.
 
@@ -73,14 +77,22 @@ def _trace(cas, resultats, reponse, verdict_local: str, brute=None, juges=None) 
     return {
         "id": cas.id,
         "question": cas.question,
+        # Question de suivi : la question réécrite, celle qui a été cherchée.
+        "question_comprise": question if question and question != cas.question else None,
         "reponse": reponse.reponse if reponse else "",
         "motif": reponse.motif if reponse else None,
         "contexts": _contextes_cites(reponse, resultats) if reponse and not reponse.refus else [],
         "verdict_local": verdict_local,
+        # Motif du refus de l'étage 2 (affirmation rejetée) : `motif` est celui
+        # de la réponse avant ce contrôle, vide pour une réponse rédigée.
+        "motif_fidelite": motif_fidelite,
         "articles_attendus": [f"{cas.doc_id}:{a}" for a in cas.articles],
         "generation": brute.model_dump() if brute else None,
         # Modèle(s) qui ont jugé la fidélité (juge en cascade seulement).
         "modeles_juge": juges or [],
+        # Modèle(s) qui ont rédigé la réponse : un relais (Mistral) n'écrit
+        # pas comme Groq, le verdict en dépend.
+        "modeles_generation": generateurs or [],
         "articles": [
             {"doc_id": r.doc_id, "content": r.content, "metadata": r.metadata}
             for r in resultats
@@ -99,20 +111,32 @@ def evaluer(
     d'articles consomme moins du quota Groq par réponse, au risque d'écarter
     l'article utile."""
     for cas in cas_golden:
-        resultats = retriever.search(cas.question, k=k)
+        # Comme pipeline.repondre : une question de suivi est d'abord rendue
+        # autonome, puis suit le chemin habituel.
+        question = reformuler_question(cas.question, cas.historique, llm)
+        resultats = retriever.search(question, k=k)
         if not resultats:
-            yield _trace(cas, resultats, None, "refus_retrieval")
+            yield _trace(cas, resultats, None, "refus_retrieval", question=question)
             continue
 
-        reponse_brute = generer_reponse(cas.question, resultats, llm)
-        reponse_brute = corriger_citations(cas.question, resultats, llm, reponse_brute)
+        historique_gen = getattr(llm, "historique", None)
+        debut_gen = len(historique_gen) if historique_gen is not None else 0
+        reponse_brute = generer_reponse(question, resultats, llm)
+        reponse_brute = corriger_citations(question, resultats, llm, reponse_brute)
+        generateurs = historique_gen[debut_gen:] if historique_gen is not None else []
         if reponse_brute.refus:
-            yield _trace(cas, resultats, reponse_brute, "refus_generation", reponse_brute)
+            yield _trace(
+                cas, resultats, reponse_brute, "refus_generation", reponse_brute,
+                generateurs=generateurs, question=question,
+            )
             continue
 
         reponse_citations = verifier_citations(reponse_brute, resultats)
         if reponse_citations.refus:
-            yield _trace(cas, resultats, reponse_citations, "refus_citation", reponse_brute)
+            yield _trace(
+                cas, resultats, reponse_citations, "refus_citation", reponse_brute,
+                generateurs=generateurs, question=question,
+            )
             continue
 
         historique = getattr(juge or llm, "historique", None)
@@ -130,7 +154,11 @@ def evaluer(
         )
         verdict = "refus_fidelite" if reponse_apres.refus else "fondee"
         juges = historique[debut:] if historique is not None else []
-        yield _trace(cas, resultats, reponse_citations, verdict, reponse_brute, juges)
+        yield _trace(
+            cas, resultats, reponse_citations, verdict, reponse_brute, juges, generateurs,
+            motif_fidelite=reponse_apres.motif if reponse_apres.refus else None,
+            question=question,
+        )
 
 
 def traces_existantes(fichier: Path) -> list[dict]:
@@ -156,7 +184,13 @@ def main() -> None:
     parser.add_argument(
         "--reprendre", action="store_true", help="compléter la trace existante au lieu de l'écraser"
     )
-    parser.add_argument("--k", type=int, default=10, help="articles envoyés au LLM (défaut 10)")
+    # Défaut : le réglage de production (k_articles_generation). Jusqu'au
+    # 2026-10-13, le défaut était 10, contre 5 en production : le golden
+    # mesurait un autre système que celui qui répond aux utilisateurs.
+    parser.add_argument(
+        "--k", type=int, default=None,
+        help="articles envoyés au LLM (défaut : k_articles_generation de la configuration)",
+    )
     parser.add_argument(
         "--sortie", type=Path, default=FICHIER_TRACES, help="fichier de traces JSONL"
     )
@@ -204,7 +238,7 @@ def main() -> None:
     with fichier.open("w", encoding="utf-8") as f:
         for t in traces:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k, juge=juge), start=1):
+        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge), start=1):
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
             f.flush()
             traces.append(t)

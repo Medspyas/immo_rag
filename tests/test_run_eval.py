@@ -12,6 +12,7 @@ import re
 from app.config import Settings
 from app.rag.generator import CONSIGNE, CONSIGNE_JUGE_FIDELITE
 from app.rag.nli import ScoreNLI
+from app.rag.suivi import CONSIGNE_SUIVI, Echange
 from eval.golden import CasGolden
 from eval.run_eval import evaluer, traces_existantes
 
@@ -139,6 +140,7 @@ def test_verdict_refus_fidelite_quand_le_juge_llm_dit_non_fondee():
         _settings(),
     ))
     assert traces[0]["verdict_local"] == "refus_fidelite"
+    assert traces[0]["motif_fidelite"]
     # La réponse comparée à la mesure indépendante reste celle AVANT le refus
     # du garde-fou : c'est elle que score_faithfulness.py doit noter.
     assert traces[0]["reponse"] == "Le préavis du locataire est de trois mois."
@@ -169,3 +171,32 @@ def test_evaluer_transmet_k_a_la_recherche():
     retriever = _RetrieverEspion(RESULTATS)
     list(evaluer([_CAS_TROUVE], retriever, _LLMFake(_REPONSE_OK), _NLIFake(score=0.9), _settings(), k=5))
     assert retriever.k == 5
+
+
+def test_question_de_suivi_reecrite_avant_la_recherche():
+    class _RetrieverEspion(_RetrieverFake):
+        def search(self, question: str, k: int) -> list[_Resultat]:
+            self.question = question
+            return super().search(question, k)
+
+    class _LLMSuivi(_LLMFake):
+        def generer(self, consigne: str, question: str) -> str:
+            if consigne == CONSIGNE_SUIVI:
+                return json.dumps({"question": "Quel est le préavis du locataire ?"})
+            return super().generer(consigne, question)
+
+    cas = CasGolden(
+        id="c3", question="et pour le locataire ?", categorie="x",
+        doc_id="loi-89-462", articles=["15"], reponse_type="reponse",
+        historique=[Echange(question="préavis du bailleur", reponse="Six mois.")],
+    )
+    retriever = _RetrieverEspion(RESULTATS)
+    [trace] = evaluer([cas], retriever, _LLMSuivi(_REPONSE_OK), _NLIFake(score=0.9), _settings())
+    assert retriever.question == "Quel est le préavis du locataire ?"
+    assert trace["question"] == "et pour le locataire ?"
+    assert trace["question_comprise"] == "Quel est le préavis du locataire ?"
+
+
+def test_question_autonome_sans_question_comprise():
+    [trace] = evaluer([_CAS_TROUVE], _RetrieverFake(RESULTATS), _LLMFake(_REPONSE_OK), _NLIFake(score=0.9), _settings())
+    assert trace["question_comprise"] is None

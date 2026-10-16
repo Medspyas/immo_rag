@@ -54,7 +54,7 @@ from app.config import Settings
 from app.rag.embeddings import get_embedding_provider
 from app.rag.retriever import HybridRetriever
 from eval.corpus_memoire import construire_corpus
-from eval.golden import charger_golden
+from eval.golden import charger_golden, questions_autonomes
 
 ETAPES = (
     "vecteur question",
@@ -221,7 +221,7 @@ def main() -> None:
         def executer(question: str) -> None:
             retriever.search(question, k=10)
 
-    questions = [c.question for c in charger_golden()][: args.questions]
+    questions = [c.question for c in questions_autonomes(charger_golden())][: args.questions]
     for i, question in enumerate(questions, start=1):
         chrono.nouvelle_requete()
         debut = time.perf_counter()
