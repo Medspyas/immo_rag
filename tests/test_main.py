@@ -76,14 +76,14 @@ class _BaseFactice:
         self.supprime: list[str] = []
 
     def documents(self):
-        from datetime import datetime, timezone
+        from datetime import UTC, datetime
 
         from app.rag.vector_store import DocumentIndexe
 
         return [
             DocumentIndexe(
                 doc_id="loi_06_07_1989", titre="Loi n° 89-462", morceaux=120,
-                mis_a_jour=datetime(2026, 10, 5, tzinfo=timezone.utc),
+                mis_a_jour=datetime(2026, 10, 5, tzinfo=UTC),
             )
         ]
 
