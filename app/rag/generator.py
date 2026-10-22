@@ -67,6 +67,8 @@ précise toujours le régime concerné, et donne d'abord la règle générale \
 lorsqu'un article la fournit.
 - N'affirme pas qu'une règle ou une exception est la seule (« uniquement », \
 « seulement ») si l'article ne le dit pas : d'autres textes peuvent en prévoir.
+- Ne transforme pas une règle de calcul en égalité (« est égale à ») : \
+garde le verbe de l'article (« établie d'après », « sous déduction de »).
 - Réponds en français, dans une langue claire, en structurant la réponse quand \
 c'est utile (cas, étapes, conditions).
 - Pour chaque affirmation, cite le passage EXACT qui la fonde : recopie mot pour \
@@ -439,17 +441,28 @@ def _lire_reponse(brut: str) -> ReponseGeneree:
 
 
 def generer_reponse(
-    question: str, resultats: list[_ResultatRecherche], llm: LLM
+    question: str,
+    resultats: list[_ResultatRecherche],
+    llm: LLM,
+    omission: str | None = None,
 ) -> ReponseGeneree:
     """Rédige une réponse à la question à partir des articles récupérés.
 
     Renvoie un refus immédiat si aucun article n'a été récupéré : il n'y a alors
     aucune source sur laquelle fonder une réponse.
+
+    omission : élément qu'une première réponse taisait (verifier_completude),
+    signalé au LLM pour qu'il l'intègre en rédigeant de nouveau.
     """
     if not resultats:
         return ReponseGeneree(refus=True, motif="aucun passage pertinent trouvé")
 
     message = f"Question : {question}\n\nArticles disponibles :\n\n{_bloc_articles(resultats)}"
+    if omission:
+        message += (
+            "\n\nUne première réponse taisait l'élément suivant, qui change la réponse "
+            f"à la question : {omission}\nIntègre-le, avec sa citation."
+        )
     brut = llm.generer(CONSIGNE, message)
     return _lire_reponse(brut)
 
@@ -501,6 +514,10 @@ def _passage_present(passage: str, contenu: str, seuil: float) -> bool:
         position = c.find(fragment, debut)
         if position >= 0:
             debut = position + len(fragment)
+        elif fragment.replace(" ", "") in c[debut:].replace(" ", ""):
+            # Mots collés par l'extraction du PDF (« suivantsdu ») : même texte,
+            # seules les espaces diffèrent.
+            continue
         elif not _fragment_approche(fragment, c[debut:], seuil):
             return False
     return True
@@ -686,8 +703,10 @@ def verifier_citations(
 # d'interrogation suivi d'une espace. Le point d'une référence légale (« L. 126-26 »,
 # « R. 111-1 », « art. 3 ») ne termine pas la phrase : couper là produisait
 # des fragments sans contenu (« 126-26 du code de la construction ») refusés
-# par le juge (mesuré sur q03, q14, q22, q28 le 2026-10-03).
-_SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])(?<!\b[LRDA]\.)(?<!\bart\.)\s+")
+# par le juge (mesuré sur q03, q14, q22, q28 le 2026-10-03). De même pour
+# « ex. » et « cf. » : « (ex. emploi, santé) » coupé laissait une affirmation
+# finissant par « (ex. », refusée par le juge (q02 juste refusée, 2026-10-22).
+_SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])(?<!\b[LRDA]\.)(?<!\bart\.)(?<!\bex\.)(?<!\bcf\.)\s+")
 # Début d'un élément de liste : « 1. », « 2) », « a. », « b) », « - », « • », « * ».
 # Sans les lettres, « a. Le locataire … » était coupé en deux phrases et « a. »
 # devenait une affirmation refusée par le juge (q03, 2026-10-14).
@@ -719,10 +738,13 @@ _ATTRIBUTION = re.compile(
 # Fragments qui n'affirment rien et que la découpe en phrases isole : un
 # numéro d'étape écrit dans le texte (« article 20. 1. Le notaire… » donne
 # « 1. », ou « 3 bis. » dans la numérotation légale), ou un renvoi seul
-# après « etc. » (« (article 18-1 AA). »). La référence elle-même relève de
-# verifier_citations.
+# après « etc. » (« (article 18-1 AA). »), éventuellement précédé de
+# l'identifiant du document (« (loi_06_07_1989, article 24, I‑1) », q17 refusée
+# à tort le 2026-10-16), ou désignant une plage d'éléments (« (Article 15, I,
+# 1°‑5°) », q03 refusée à tort le 2026-10-17). La référence elle-même relève
+# de verifier_citations.
 _SANS_CONTENU = re.compile(
-    r"^\(?\s*(?:\d+°?(?:\s*(?:bis|ter|quater))?|(?:articles?|art\.)\s+[\w\s.,‑-]{1,40})\s*\)?\s*[.;:]?$",
+    r"^\(?\s*(?:\d+°?(?:\s*(?:bis|ter|quater))?|(?:\w+\s*,\s*)?(?:articles?|art\.)\s+[\w\s.,°‑-]{1,40})\s*\)?\s*[.;:]?$",
     re.IGNORECASE,
 )
 # Découpe d'un article en phrases : ponctuation forte, point-virgule ou
@@ -745,6 +767,11 @@ _LONGUEUR_MAX_ENUMERATION = 1500
 # pas cet intitulé : il validait une règle propre aux copropriétés à deux
 # présentée comme générale (q21, art. 41-15, mesuré le 2026-10-05).
 _REGIME_PARTICULIER = re.compile(r"particuli|meublé|mobilité|résidences-services", re.IGNORECASE)
+# Extrait qui déroge à une règle posée ailleurs (« La limite mentionnée au
+# deuxième alinéa est rehaussée… ») : vraie mot à mot, une affirmation tirée
+# de lui seul peut taire la règle générale. Le NLI fondait ainsi « jusqu'à
+# 21 400 € » sans le plafond de 10 700 € (q58, art. 156, 2026-10-20).
+_DEROGATION = re.compile(r"par dérogation|par exception|rehauss", re.IGNORECASE)
 # Nombre d'extraits soumis au NLI pour chaque affirmation, retenus parmi ceux
 # qui partagent le plus de mots avec elle : évite de passer tout l'article au
 # modèle, ce qui coûterait un passage NLI par extrait.
@@ -770,6 +797,37 @@ source fonde une affirmation.
 Réponds UNIQUEMENT par ce JSON, sans texte autour, une valeur par affirmation \
 dans l'ordre :
 {"fondees": [true, false, ...]}"""
+
+
+CONSIGNE_COMPLETUDE = """Tu relis la réponse d'un assistant juridique destiné à des \
+professionnels de l'immobilier. Chaque phrase de la réponse a déjà été vérifiée : \
+elle est vraie d'après les articles qu'elle cite. Tu cherches un seul défaut : la réponse \
+présente comme la règle commune ce qui n'est qu'un régime d'exception.
+
+Test : un professionnel applique la réponse au cas ordinaire visé par la question \
+(location vide, copropriété ordinaire, contribuable sans situation particulière). \
+Obtient-il un résultat faux, parce que la réponse :
+- donne seulement le chiffre, le délai ou la règle d'une exception, d'une \
+dérogation, d'un plafond majoré ou d'un régime particulier (meublé, zone, \
+travaux…), sans la règle générale qui s'applique au cas ordinaire ;
+- ou donne une règle qui, d'après l'article, ne vaut que sous une condition que \
+le cas ordinaire ne remplit pas ?
+Si oui, la réponse est trompeuse.
+
+Ne sont PAS des défauts : une réponse qui donne la règle générale sans ses \
+exceptions ; une liste ou une énumération incomplète ; une modalité de procédure, \
+un délai annexe, une sanction ou une précision non demandés par la question. Si \
+la question porte elle-même sur l'exception (« dans quels cas… », « en meublé… »), \
+la réponse est complète. En cas de doute, la réponse est complète.
+
+Si la réponse est trompeuse, recopie mot pour mot, depuis les articles récupérés, la \
+phrase qui pose la règle générale omise : sans elle, ton verdict est ignoré.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour :
+{"complete": true, "regle_generale": "", "manque": ""}
+ou, si elle est trompeuse :
+{"complete": false, "regle_generale": "<phrase recopiée mot pour mot>", \
+"manque": "<la règle générale omise, en une phrase, avec son article>"}"""
 
 
 # Schémas JSON imposés à Mistral. Le simple mode JSON ne suffit pas :
@@ -809,10 +867,26 @@ _SCHEMA_JUGE = {
 }
 
 
+_SCHEMA_COMPLETUDE = {
+    "type": "object",
+    "properties": {
+        "complete": {"type": "boolean"},
+        "regle_generale": {"type": "string"},
+        "manque": {"type": "string"},
+    },
+    "required": ["complete", "regle_generale", "manque"],
+    "additionalProperties": False,
+}
+
+
 def _format_reponse_mistral(consigne: str) -> dict:
     """Format de réponse demandé à Mistral selon la consigne : schéma strict
-    pour les deux formats connus, simple mode JSON sinon."""
-    schemas = {CONSIGNE: ("reponse", _SCHEMA_REPONSE), CONSIGNE_JUGE_FIDELITE: ("juge", _SCHEMA_JUGE)}
+    pour les formats connus, simple mode JSON sinon."""
+    schemas = {
+        CONSIGNE: ("reponse", _SCHEMA_REPONSE),
+        CONSIGNE_JUGE_FIDELITE: ("juge", _SCHEMA_JUGE),
+        CONSIGNE_COMPLETUDE: ("completude", _SCHEMA_COMPLETUDE),
+    }
     if consigne not in schemas:
         return {"type": "json_object"}
     nom, schema = schemas[consigne]
@@ -1094,7 +1168,8 @@ def verifier_fidelite(
         implication = max((s.implication for s in scores), default=0.0)
         contradiction = max((s.contradiction for s in scores), default=0.0)
         regime = any(
-            e in particuliers and s.implication == implication for e, s in zip(selection, scores)
+            (e in particuliers or _DEROGATION.search(e)) and s.implication == implication
+            for e, s in zip(selection, scores)
         )
         if implication < seuil_haut or contradiction >= seuil_contradiction or regime:
             douteuses.append(affirmation)
@@ -1113,3 +1188,81 @@ def verifier_fidelite(
             )
 
     return reponse
+
+
+# --- Complétude ---------------------------------------------------------------
+
+
+def completude_a_verifier(reponse: ReponseGeneree, resultats: list[_ResultatRecherche]) -> bool:
+    """La réponse s'appuie-t-elle sur un passage qui peut cacher une règle
+    générale : un passage cité de dérogation (« est rehaussée », q58) ou un
+    article de régime particulier (meublé, q02) ?
+
+    Le contrôle de complétude appelé sur chaque réponse épuisait le quota
+    gratuit du juge : le golden s'arrêtait à q17 au lieu de passer en entier
+    (2026-10-22). Les omissions trouvées jusqu'ici viennent toutes de ces deux
+    cas ; les autres réponses ne paient plus l'appel."""
+    if reponse.refus:
+        return False
+    if any(_DEROGATION.search(c.passage) for c in reponse.citations):
+        return True
+    return any(
+        _REGIME_PARTICULIER.search(r.metadata.get("section") or "")
+        for r in _articles_cites(reponse, resultats)
+    )
+
+
+def verifier_completude(
+    question: str,
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    llm: LLM,
+) -> str | None:
+    """Élément des articles récupérés que la réponse tait alors qu'il change la
+    réponse à la question ; None si elle est complète.
+
+    verifier_fidelite contrôle que chaque phrase est vraie, pas que rien
+    d'essentiel ne manque : « jusqu'à 21 400 € » est vrai mot à mot (plafond
+    majoré pour travaux de rénovation énergétique), mais trompeur sans la
+    règle générale de 10 700 € (q58, art. 156 du CGI, 2026-10-20). Un LLM
+    relit donc la réponse en partant des articles cités.
+
+    Le juge lit tous les articles récupérés, pas seulement les articles
+    cités : la règle générale est souvent dans un article que la réponse n'a
+    pas cité (q02 : seul l'article des meublés est cité, la règle des trois
+    mois est à l'article 15). Il doit recopier la phrase qui pose la règle
+    omise, retrouvée ensuite dans ces articles comme une citation : sans cette preuve, il
+    signalait des omissions sans appui, articles inventés compris (mesuré sur
+    le golden le 2026-10-21 : q16, q23, q56).
+
+    Un refus n'a rien à compléter. Une réponse illisible du LLM vaut
+    « complète » : ce contrôle s'ajoute à un garde-fou déjà passé, et un
+    échec technique ne doit pas transformer une réponse vérifiée en refus.
+    """
+    if reponse.refus:
+        return None
+    message = f"Question : {question}\n\nRéponse :\n{reponse.reponse}\n\n"
+    # Un passage cité qui énonce une dérogation est signalé au juge : sans ce
+    # signal, il laissait passer « jusqu'à 21 400 € » seul une fois sur trois
+    # (q58, 2026-10-22), alors que le passage dit « rehaussée ».
+    derogations = [c.passage for c in reponse.citations if _DEROGATION.search(c.passage)]
+    if derogations:
+        liste = "\n".join(f"- « {p} »" for p in derogations)
+        message += (
+            "Attention : ces passages cités énoncent une dérogation ; vérifie que la "
+            f"réponse donne aussi la règle qu'ils modifient.\n{liste}\n\n"
+        )
+    message += f"Articles récupérés :\n{_bloc_articles(resultats)}"
+    try:
+        verdict = json.loads(llm.generer(CONSIGNE_COMPLETUDE, message))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(verdict, dict) or verdict.get("complete") is not False:
+        return None
+    regle = str(verdict.get("regle_generale") or "").strip()
+    manque = str(verdict.get("manque") or "").strip()
+    if not regle or not manque:
+        return None
+    if not any(_passage_present(regle, r.content, SEUIL_CITATION) for r in resultats):
+        return None
+    return f"{manque} (« {regle} »)"

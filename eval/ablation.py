@@ -116,6 +116,7 @@ def recherche_hybride(
         reranker=reranker,
         k_par_source=k_par_source,
         k_avant_rerank=k_avant_rerank,
+        index_articles=corpus.bm25,
     )
 
     def rechercher(question: str, k: int) -> list[Source]:
@@ -192,6 +193,7 @@ def _diagnostic_hors_corpus(
             reranker=reranker,
             k_par_source=k_par_source,
             k_avant_rerank=k_avant_rerank,
+            index_articles=corpus.bm25,
         )
 
         def meilleur_rerank(question: str) -> float:

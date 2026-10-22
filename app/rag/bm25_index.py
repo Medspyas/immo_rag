@@ -18,7 +18,8 @@ Contenu du fichier :
 - tokeniser_fr : découpe un texte français en mots pour l'index.
 - BM25Document : un morceau à indexer (texte et repères, sans vecteur).
 - BM25Result : un morceau retrouvé, avec son score.
-- BM25Index : construit l'index et répond aux recherches.
+- BM25Index : construit l'index, répond aux recherches et retrouve un
+  article par son numéro (renvois entre articles, cf. renvois.py).
 """
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ from functools import lru_cache
 from uuid import UUID
 
 from pydantic import BaseModel, Field
+
+from app.rag.renvois import famille_document
 
 # Une référence légale : lettre optionnelle (L/R/D/A) puis un numéro à tranches
 # ("L. 111-1", "R123-4"), ou un numéro composé seul ("89-462", "6-1"). Repérée
@@ -158,6 +161,18 @@ class BM25Index:
         # rank-bm25 refuse un corpus vide : il reste à None et search renvoie
         # une liste vide.
         self._bm25 = BM25Okapi(corpus_tokens) if corpus_tokens else None
+        # Tous les articles sont déjà en mémoire ici : les retrouver par leur
+        # numéro évite une requête en base pour chaque renvoi suivi.
+        self._par_article: dict[tuple[str, str], BM25Document] = {}
+        for d in self._documents:
+            numero = d.metadata.get("article")
+            if numero:
+                self._par_article.setdefault((famille_document(d.doc_id), numero), d)
+
+    def article(self, famille: str, numero: str) -> BM25Document | None:
+        """L'article numero du document famille (cf. renvois.famille_document),
+        ou None s'il n'est pas indexé."""
+        return self._par_article.get((famille, numero))
 
     def search(self, query: str, k: int = 10) -> list[BM25Result]:
         """Les k morceaux au meilleur score pour la question.

@@ -319,3 +319,82 @@ def test_sigles_developpes_pour_les_trois_recherches():
     )
     retriever.search("Qui paie l'IFI ?")
     assert recues == ["Qui paie l'IFI (impôt sur la fortune immobilière) ?"] * 3
+
+
+# --- Renvois : articles cités ajoutés au reclasseur --------------------------
+
+
+class _IndexArticlesFake:
+    def __init__(self, articles: dict[tuple[str, str], BM25Result]):
+        self._articles = articles
+
+    def article(self, famille: str, numero: str) -> BM25Result | None:
+        return self._articles.get((famille, numero))
+
+
+def _article(numero, doc_id="code_civil", content=None):
+    return BM25Result(
+        id=uuid4(), doc_id=doc_id, content=content or f"Article {numero}",
+        metadata={"article": numero}, score=0.0,
+    )
+
+
+def test_article_cite_par_un_candidat_est_soumis_au_reclasseur():
+    a = uuid4()
+    source = SearchResult(
+        id=a, doc_id="loi_06_07_1989", metadata={}, score=0.9,
+        content="Les deux derniers alinéas de l'article 1724 du code civil sont applicables.",
+    )
+    cite = _article("1724", content="si ces réparations durent plus de vingt et un jours")
+    reranker = _RerankerFake()
+    resultats = _retriever(
+        [source], [], reranker=reranker,
+        index_articles=_IndexArticlesFake({("code_civil", "1724"): cite}),
+    ).search("q")
+    assert cite.content in reranker.textes_recus
+    ajoute = next(r for r in resultats if r.id == cite.id)
+    assert ajoute.score_rrf == 0.0
+    assert ajoute.rang_dense is None and ajoute.rang_bm25 is None
+
+
+def test_article_cite_deja_candidat_n_est_pas_ajoute_deux_fois():
+    cite = _article("1724")
+    source = SearchResult(
+        id=uuid4(), doc_id="loi_06_07_1989", metadata={}, score=0.9,
+        content="l'article 1724 du code civil",
+    )
+    candidat = SearchResult(
+        id=cite.id, doc_id="code_civil", content=cite.content, metadata={}, score=0.8
+    )
+    reranker = _RerankerFake()
+    _retriever(
+        [source, candidat], [], reranker=reranker,
+        index_articles=_IndexArticlesFake({("code_civil", "1724"): cite}),
+    ).search("q")
+    assert len(reranker.textes_recus) == 2
+
+
+def test_renvois_plafonnes(monkeypatch):
+    import app.rag.retriever as module
+
+    monkeypatch.setattr(module, "N_MAX_RENVOIS", 2)
+    articles = {("code_civil", str(n)): _article(str(n)) for n in range(1, 6)}
+    source = SearchResult(
+        id=uuid4(), doc_id="loi_06_07_1989", metadata={}, score=0.9,
+        content="les articles 1, 2, 3, 4 et 5 du code civil",
+    )
+    reranker = _RerankerFake()
+    _retriever(
+        [source], [], reranker=reranker, index_articles=_IndexArticlesFake(articles)
+    ).search("q")
+    assert len(reranker.textes_recus) == 3
+
+
+def test_sans_index_d_articles_aucun_renvoi_suivi():
+    source = SearchResult(
+        id=uuid4(), doc_id="loi_06_07_1989", metadata={}, score=0.9,
+        content="l'article 1724 du code civil",
+    )
+    reranker = _RerankerFake()
+    _retriever([source], [], reranker=reranker).search("q")
+    assert len(reranker.textes_recus) == 1

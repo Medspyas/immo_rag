@@ -10,7 +10,7 @@ import json
 import re
 
 from app.config import Settings
-from app.rag.generator import CONSIGNE, CONSIGNE_JUGE_FIDELITE
+from app.rag.generator import CONSIGNE, CONSIGNE_COMPLETUDE, CONSIGNE_JUGE_FIDELITE
 from app.rag.nli import ScoreNLI
 from app.rag.suivi import CONSIGNE_SUIVI, Echange
 from eval.golden import CasGolden
@@ -35,18 +35,26 @@ class _RetrieverFake:
 
 
 class _LLMFake:
-    """Distingue l'appel de génération de l'appel du juge de fidélité par la
-    consigne reçue, comme le fait le vrai GroqLLM avec deux prompts différents."""
+    """Distingue l'appel de génération des appels du juge (fidélité,
+    complétude) par la consigne reçue, comme le fait le vrai GroqLLM avec des
+    prompts différents. Une réponse est jugée complète sauf si `manque` est
+    donné ; les messages de rédaction sont retenus."""
 
-    def __init__(self, sortie_generation: str, fondee: bool = True):
+    def __init__(self, sortie_generation: str, fondee: bool = True, manque: str = ""):
         self._sortie_generation = sortie_generation
         self._fondee = fondee
+        self._manque = manque
+        self.redactions: list[str] = []
 
     def generer(self, consigne: str, question: str) -> str:
+        if consigne == CONSIGNE_COMPLETUDE:
+            regle = "Le délai de préavis est de trois mois." if self._manque else ""
+            return json.dumps({"complete": not self._manque, "regle_generale": regle, "manque": self._manque})
         if consigne == CONSIGNE_JUGE_FIDELITE:
             liste = question.split("Affirmations à vérifier :")[-1]
             return json.dumps({"fondees": [self._fondee] * len(re.findall(r"^\d+\. ", liste, re.MULTILINE))})
         assert consigne == CONSIGNE
+        self.redactions.append(question)
         return self._sortie_generation
 
 
@@ -85,8 +93,8 @@ _REPONSE_CITATION_INVENTEE = json.dumps({
 })
 
 
-def _settings() -> Settings:
-    return Settings(database_url="postgresql://x", groq_api_key="fake-key")
+def _settings(**overrides) -> Settings:
+    return Settings(database_url="postgresql://x", groq_api_key="fake-key", **overrides)
 
 
 def test_verdict_refus_retrieval_si_aucun_resultat():
@@ -200,3 +208,45 @@ def test_question_de_suivi_reecrite_avant_la_recherche():
 def test_question_autonome_sans_question_comprise():
     [trace] = evaluer([_CAS_TROUVE], _RetrieverFake(RESULTATS), _LLMFake(_REPONSE_OK), _NLIFake(score=0.9), _settings())
     assert trace["question_comprise"] is None
+
+
+def test_reponse_complete_une_seule_redaction():
+    llm = _LLMFake(_REPONSE_OK)
+    [trace] = evaluer([_CAS_TROUVE], _RetrieverFake(RESULTATS), llm, _NLIFake(score=0.9), _settings())
+    assert trace["verdict_local"] == "fondee"
+    assert trace["omission"] is None
+    assert len(llm.redactions) == 1
+
+
+def test_omission_declenche_une_seconde_redaction_tracee():
+    llm = _LLMFake(_REPONSE_OK, manque="Réduit à un mois en zone tendue (art. 15).")
+    [trace] = evaluer([_CAS_TROUVE], _RetrieverFake(RESULTATS), llm, _NLIFake(score=0.9), _settings(controle_completude="toujours"))
+    assert trace["omission"].startswith("Réduit à un mois en zone tendue (art. 15).")
+    assert len(llm.redactions) == 2
+    assert "zone tendue" in llm.redactions[1]
+    assert trace["verdict_local"] == "fondee"
+
+
+def test_juge_de_completude_distinct():
+    juge_completude = _LLMFake(_REPONSE_OK, manque="Élément omis.")
+    llm = _LLMFake(_REPONSE_OK)
+    [trace] = evaluer(
+        [_CAS_TROUVE], _RetrieverFake(RESULTATS), llm, _NLIFake(score=0.9), _settings(controle_completude="toujours"),
+        juge_completude=juge_completude,
+    )
+    assert trace["omission"].startswith("Élément omis.")
+    assert len(llm.redactions) == 2
+
+
+def test_seconde_redaction_refusee_trace_la_premiere():
+    class _LLMDeuxRedactions(_LLMFake):
+        def generer(self, consigne, question):
+            sortie = super().generer(consigne, question)
+            # Seconde rédaction : citation inventée, refusée par les garde-fous.
+            return _REPONSE_CITATION_INVENTEE if len(self.redactions) >= 2 and consigne == CONSIGNE else sortie
+
+    llm = _LLMDeuxRedactions(_REPONSE_OK, manque="Élément omis.")
+    [trace] = evaluer([_CAS_TROUVE], _RetrieverFake(RESULTATS), llm, _NLIFake(score=0.9), _settings(controle_completude="toujours"))
+    assert trace["verdict_local"] == "fondee"
+    assert trace["reponse"] == "Le préavis du locataire est de trois mois."
+    assert trace["seconde_refusee"] is True

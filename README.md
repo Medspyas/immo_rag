@@ -39,19 +39,31 @@ deux.
 
 ## Résultats mesurés
 
-Golden dataset : 31 questions métier avec l'article attendu, et 4 questions hors
-corpus qui doivent être refusées.
+Golden dataset : 50 questions métier avec l'article attendu, 4 questions de
+suivi (« Et si le logement est loué meublé ? ») et 4 questions hors corpus qui
+doivent être refusées. Corpus complet : 7 894 articles (lois de 1989, 1965,
+Hoguet, Code civil, Code général des impôts).
 
 | Recherche (hybride + reclasseur) | Valeur |
 |----------------------------------|--------|
-| hit@1                            | 58,1 % |
-| hit@3                            | 87,1 % |
-| hit@10                           | 93,5 % |
-| MRR                              | 0,706  |
-| meilleur score hors corpus       | 0,131 (seuil de refus : 0,3) |
+| hit@1                            | 70,0 % |
+| hit@3                            | 92,0 % |
+| hit@5                            | 96,0 % |
+| hit@10                           | 100 %  |
+| MRR                              | 0,802  |
 
-De bout en bout, avec de vrais appels LLM : 26 réponses fondées sur 31, et 4
-refus sur 4 pour les questions hors corpus.
+Questions hors corpus : l'étage 1 (score du reclasseur) en arrête la moitié ;
+les autres, proches d'un article réel (durée de validité du DPE), sont
+refusées par l'étage 2.
+
+De bout en bout, avec de vrais appels LLM (44 premières questions) : 43
+réponses fondées sur 44, et 4 refus sur 4 hors corpus ; le seul refus restant
+porte sur une réponse fausse.
+
+Renvois entre textes : un article cite souvent un autre article au lieu d'en
+recopier la règle (« l'article 1724 du code civil est applicable »). Les
+articles cités par les meilleurs candidats sont ajoutés à ceux que le
+reclasseur note, qui juge ensuite chacun sur son texte.
 
 Chaque brique a été gardée ou écartée sur mesure, pas sur intuition :
 
@@ -63,6 +75,12 @@ Chaque brique a été gardée ou écartée sur mesure, pas sur intuition :
 | Titre de la loi dans les embeddings         | MRR 0,66 → 0,62           | écarté   |
 | Reformulation de requête, HyDE              | question hors corpus au-dessus du seuil | écarté |
 | Retrait de la loi ALUR (version JO, non consolidée) | MRR 0,686 → 0,706 | gardé    |
+| Questions générées par article (doc2query), BM25 | MRR 0,686 → 0,723   | gardé    |
+| Ces questions montrées au reclasseur        | MRR 0,725 → 0,765         | gardé    |
+| Fenêtres de 1 000 car. pour les articles longs (dense) | MRR 0,765 → 0,790 | gardé |
+| Mêmes fenêtres dans l'index BM25            | MRR 0,790 → 0,740         | écarté   |
+| Un vecteur par élément d'énumération        | MRR 0,790 → 0,769         | écarté   |
+| Articles cités par les candidats ajoutés au reclasseur | MRR 0,789 → 0,802, hit@10 96 % → 100 % | gardé |
 | Reclasseur ONNX sur carte graphique         | ~22 s → ~0,6 s par requête | gardé (option) |
 
 ## Stack
@@ -91,6 +109,14 @@ changer de modèle ne touche pas au code du pipeline.
 cp .env.example .env            # renseigner GROQ_API_KEY
 docker compose up -d            # interface :8080, API :8000, base :5433
 python scripts/ingerer_corpus.py  # indexe data/clean (une fois)
+```
+
+`init.sql` ne s'applique qu'à la création de la base. Pour une base créée avant
+un changement de schéma (table `fenetres`, 2026-10-16), le réappliquer puis
+réingérer (les instructions existantes sont ignorées) :
+
+```bash
+docker compose exec -T db psql -U immo -d immo_rag < init.sql
 ```
 
 Interface : <http://localhost:8080>. Deux pages : l'assistant (question, réponse

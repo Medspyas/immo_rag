@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 .env
+.env.eval
 data/*.pdf
 .pytest_cache/
 .ruff_cache/

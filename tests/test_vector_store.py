@@ -101,3 +101,36 @@ def test_documents_resume_chaque_document_indexe():
 
     store.delete_by_doc(doc_id)
     assert doc_id not in {d.doc_id for d in store.documents()}
+
+
+def test_search_retrouve_un_article_par_sa_fenetre():
+    store = VectorStore(DSN, DIMENSION)
+    doc_id = f"doc-test-{uuid.uuid4()}"
+    long = Chunk(
+        id=uuid.uuid4(), doc_id=doc_id, content="article long",
+        embedding=_vecteur(1), metadata={}, fenetres=[_vecteur(2), _vecteur(0)],
+    )
+    store.upsert([long])
+
+    resultats = store.search(_vecteur(0), k=1)
+
+    assert resultats[0].id == long.id
+    assert resultats[0].score == pytest.approx(1.0, abs=1e-6)
+
+    store.delete_by_doc(doc_id)
+
+
+def test_upsert_remplace_les_fenetres_d_un_article():
+    store = VectorStore(DSN, DIMENSION)
+    doc_id = f"doc-test-{uuid.uuid4()}"
+    identifiant = uuid.uuid4()
+    store.upsert([Chunk(id=identifiant, doc_id=doc_id, content="v1", embedding=_vecteur(1),
+                        fenetres=[_vecteur(0)])])
+    store.upsert([Chunk(id=identifiant, doc_id=doc_id, content="v2", embedding=_vecteur(1))])
+
+    # L'ancienne fenêtre (identique à la requête) ne doit plus le faire remonter.
+    resultats = store.search(_vecteur(0), k=5)
+
+    assert all(r.score < 0.5 for r in resultats if r.id == identifiant)
+
+    store.delete_by_doc(doc_id)

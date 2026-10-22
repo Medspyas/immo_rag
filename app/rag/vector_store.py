@@ -23,6 +23,17 @@ import psycopg
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field, field_validator
 
+# Fenêtres lues par résultat demandé (cf. VectorStore.search) : à 4, le
+# classement est celui du calcul exact sur tout le golden (2026-10-16).
+FENETRES_PAR_RESULTAT = 4
+# Candidats explorés par l'index HNSW, par résultat demandé : l'index est
+# approché, et à 40 (défaut de pgvector) il perdait jusqu'à 7 des 30 meilleurs
+# articles d'une question (q30). Mesuré le 2026-10-16 pour 30 résultats : 120
+# candidats, 98,5 % des 30 meilleurs retrouvés ; 300, 100 % (105 → 110 ms par
+# recherche). pgvector n'accepte pas plus de EF_SEARCH_MAX.
+EF_SEARCH_PAR_RESULTAT = 10
+EF_SEARCH_MAX = 1000
+
 
 class Chunk(BaseModel):
     id: UUID
@@ -30,6 +41,9 @@ class Chunk(BaseModel):
     content: str = Field(min_length=1)
     embedding: list[float]
     metadata: dict = Field(default_factory=dict)
+    # Vecteurs des fenêtres d'un article long (fenetres.py), vide sinon : ils
+    # servent à retrouver l'article, jamais renvoyés par la recherche.
+    fenetres: list[list[float]] = Field(default_factory=list)
 
     @field_validator("embedding")
     @classmethod
@@ -113,6 +127,8 @@ class VectorStore:
             return
         for c in chunks:
             self._verifier_longueur(c.embedding)
+            for f in c.fenetres:
+                self._verifier_longueur(f)
         with self._connect() as conn, conn.cursor() as cur:
             cur.executemany(
                 """
@@ -127,6 +143,15 @@ class VectorStore:
                     (c.id, c.doc_id, c.content, c.embedding, json.dumps(c.metadata))
                     for c in chunks
                 ],
+            )
+            # Les fenêtres d'un article remplacé sont remplacées avec lui : un
+            # article raccourci n'en garde pas d'anciennes.
+            cur.execute(
+                "DELETE FROM fenetres WHERE chunk_id = ANY(%s)", ([c.id for c in chunks],)
+            )
+            cur.executemany(
+                "INSERT INTO fenetres (chunk_id, rang, embedding) VALUES (%s, %s, %s)",
+                [(c.id, rang, f) for c in chunks for rang, f in enumerate(c.fenetres)],
             )
             conn.commit()
 
@@ -149,17 +174,37 @@ class VectorStore:
         La conversion `::vector` dans la requête est nécessaire : sans elle,
         PostgreSQL reçoit une simple liste de nombres et ne peut pas la
         comparer.
+
+        Un article long est aussi comparé par ses fenêtres (fenetres.py) : il
+        prend la plus petite distance entre son texte entier et ses fenêtres.
+        Plusieurs fenêtres d'un même article peuvent se suivre en tête : on en
+        lit donc FENETRES_PAR_RESULTAT fois plus que de résultats demandés.
         """
         self._verifier_longueur(query_embedding)
         with self._connect() as conn, conn.cursor() as cur:
+            # Réglage limité à cette transaction (troisième argument).
+            cur.execute(
+                "SELECT set_config('hnsw.ef_search', %s, true)",
+                (str(min(EF_SEARCH_MAX, max(40, k * EF_SEARCH_PAR_RESULTAT))),),
+            )
             cur.execute(
                 """
-                SELECT id, doc_id, content, metadata, 1 - (embedding <=> %s::vector) AS score
-                FROM chunks
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
+                WITH proches AS (
+                    (SELECT id AS chunk_id, embedding <=> %(q)s::vector AS distance
+                     FROM chunks ORDER BY embedding <=> %(q)s::vector LIMIT %(k)s)
+                    UNION ALL
+                    (SELECT chunk_id, embedding <=> %(q)s::vector AS distance
+                     FROM fenetres ORDER BY embedding <=> %(q)s::vector LIMIT %(k_fenetres)s)
+                ),
+                meilleurs AS (
+                    SELECT chunk_id, min(distance) AS distance
+                    FROM proches GROUP BY chunk_id ORDER BY distance LIMIT %(k)s
+                )
+                SELECT c.id, c.doc_id, c.content, c.metadata, 1 - m.distance AS score
+                FROM meilleurs m JOIN chunks c ON c.id = m.chunk_id
+                ORDER BY m.distance
                 """,
-                (query_embedding, query_embedding, k),
+                {"q": query_embedding, "k": k, "k_fenetres": k * FENETRES_PAR_RESULTAT},
             )
             rows = cur.fetchall()
         return [

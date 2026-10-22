@@ -7,7 +7,8 @@ des morceaux indexés sortent.
 Étapes enchaînées (cf. CLAUDE.md, section Flux) :
   1. découper le texte en articles            (chunking.py)
   2. situer chaque article dans la loi         (contextualizer.py, facultatif)
-  3. transformer chaque article en vecteur     (embeddings.py)
+  3. transformer chaque article en vecteur,
+     plus un par fenêtre d'un article long     (embeddings.py, fenetres.py)
   4. ranger les morceaux dans la base           (vector_store.py)
 
 L'étape 2 est facultative : elle demande un appel de modèle de langage par
@@ -42,6 +43,7 @@ Contenu du fichier :
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID, uuid5
@@ -53,18 +55,21 @@ from app.observability.tracing import trace
 from app.rag.bm25_index import BM25Document, BM25Index
 from app.rag.chunking import decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
+from app.rag.fenetres import fenetres_article
 from app.rag.generator import (
     ReponseGeneree,
+    completude_a_verifier,
     corriger_citations,
     generer_reponse,
     verifier_citations,
+    verifier_completude,
     verifier_fidelite,
 )
 from app.rag.nli import ScoreNLI
 from app.rag.questions_articles import charger_questions
 from app.rag.retriever import HybridRetriever
 from app.rag.suivi import Echange, reformuler_question
-from app.rag.vector_store import Chunk
+from app.rag.vector_store import Chunk, MorceauStocke
 
 # Espace de noms fixe pour dériver l'identifiant d'un article de façon
 # déterministe. Conséquence : réingérer la même loi réécrit les mêmes morceaux
@@ -111,7 +116,7 @@ class _VectorStoreLecture(Protocol):
     """Partie de la base vectorielle utilisée pour reconstruire l'index BM25 :
     la lecture de tous les morceaux rangés, sans leur vecteur."""
 
-    def tous(self) -> list: ...  # list[MorceauStocke] — non importé pour rester découplé
+    def tous(self) -> list[MorceauStocke]: ...
 
 
 class _LLM(Protocol):
@@ -177,6 +182,14 @@ def preparer_morceaux(
         articles = contextualiser_chunks(articles, texte, contextualizer)
 
     vecteurs = embeddings.embed_documents([a.content for a in articles])
+    # Fenêtres des articles longs (fenetres.py), vectorisées en un seul appel
+    # puis rendues à leur article.
+    fenetres = [fenetres_article(a.content) for a in articles]
+    vecteurs_fenetres = iter(
+        embeddings.embed_documents([f for liste in fenetres for f in liste])
+        if any(fenetres)
+        else []
+    )
 
     return [
         Chunk(
@@ -190,8 +203,9 @@ def preparer_morceaux(
                 "section": article.section,
                 "titre": article.titre,
             },
+            fenetres=[next(vecteurs_fenetres) for _ in liste],
         )
-        for article, vecteur in zip(articles, vecteurs, strict=True)
+        for article, vecteur, liste in zip(articles, vecteurs, fenetres, strict=True)
     ]
 
 
@@ -224,11 +238,13 @@ def ingerer_document(
 
 
 def documents_bm25(
-    morceaux: list[Chunk], questions: dict[tuple[str, str], list[str]] | None = None
+    morceaux: Sequence[Chunk | MorceauStocke],
+    questions: dict[tuple[str, str], list[str]] | None = None,
 ) -> list[BM25Document]:
-    """Convertit des morceaux préparés en entrées pour l'index BM25, qui n'a pas
-    besoin des vecteurs. Les questions de chaque article (questions_articles.py)
-    sont indexées avec lui, sans entrer dans son texte."""
+    """Convertit des morceaux (préparés ou relus en base) en entrées pour
+    l'index BM25, qui n'a pas besoin des vecteurs. Les questions de chaque
+    article (questions_articles.py) sont indexées avec lui, sans entrer dans
+    son texte."""
     questions = charger_questions() if questions is None else questions
     return [
         BM25Document(
@@ -255,27 +271,34 @@ class _RechercheDense(Protocol):
 
 
 class _RechercheSparse(Protocol):
+    """Index BM25 : recherche par mots-clés, et article retrouvé par son
+    numéro pour suivre les renvois (cf. renvois.py)."""
+
     def search(self, query: str, k: int) -> list: ...
+
+    def article(self, famille: str, numero: str): ...
 
 
 class _Reranker(Protocol):
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]: ...
 
 
-def construire_index_bm25(vector_store: _VectorStoreLecture) -> BM25Index:
+def construire_index_bm25(
+    vector_store: _VectorStoreLecture,
+    questions: dict[tuple[str, str], list[str]] | None = None,
+) -> BM25Index:
     """Reconstruit l'index BM25 (en mémoire) à partir de ce qui est déjà rangé
     en base.
 
     Utile au démarrage de l'application : contrairement à l'ingestion, où les
     morceaux sortent de preparer_morceaux, ici on repart de la base — c'est
     elle qui fait foi sur ce qui a été ingéré.
+
+    Même conversion que l'évaluation (documents_bm25), questions des articles
+    comprises : jusqu'au 2026-10-16, l'index de production en était privé
+    alors que le gate les mesurait (q28 et q31, loi Hoguet, perdues en base).
     """
-    morceaux = vector_store.tous()
-    documents = [
-        BM25Document(id=m.id, doc_id=m.doc_id, content=m.content, metadata=m.metadata)
-        for m in morceaux
-    ]
-    return BM25Index(documents)
+    return BM25Index(documents_bm25(vector_store.tous(), questions))
 
 
 def construire_retriever(
@@ -300,6 +323,7 @@ def construire_retriever(
         k_par_source=settings.k_par_source,
         k_avant_rerank=settings.k_avant_rerank,
         seuil_rerank=settings.seuil_garde_fou_retrieval if reranker is not None else None,
+        index_articles=bm25_index,
     )
 
 
@@ -353,9 +377,49 @@ def _repondre_question(
     k: int,
     juge: _LLM | None,
 ) -> ReponseGeneree:
-    """Recherche, génération et garde-fous pour une question autonome."""
+    """Recherche, génération et garde-fous pour une question autonome.
+
+    Une réponse vérifiée que le contrôle de complétude juge trompeuse par
+    omission est rédigée une seconde fois, l'élément omis signalé au LLM, et
+    repasse les mêmes garde-fous. Une seule fois : chaque tour consomme du
+    quota gratuit.
+
+    Si la seconde rédaction échoue aux garde-fous, la première est gardée :
+    déjà vérifiée phrase par phrase, elle vaut mieux qu'un refus. Le contrôle
+    signale aussi des omissions qui n'en sont pas, et la seconde rédaction
+    transformait alors une bonne réponse en refus (q16, 2026-10-21)."""
     resultats = retriever.search(question, k=k)
-    reponse = generer_reponse(question, resultats, llm)
+    reponse = _rediger_et_verifier(question, resultats, llm, nli, settings, juge)
+    if not _completude_a_controler(reponse, resultats, settings):
+        return reponse
+    omission = verifier_completude(question, reponse, resultats, juge or llm)
+    if omission is None:
+        return reponse
+    seconde = _rediger_et_verifier(question, resultats, llm, nli, settings, juge, omission)
+    return reponse if seconde.refus else seconde
+
+
+def _completude_a_controler(reponse: ReponseGeneree, resultats: list, settings: Settings) -> bool:
+    """Le contrôle de complétude s'applique-t-il à cette réponse, selon le
+    réglage controle_completude ?"""
+    if settings.controle_completude == "non":
+        return False
+    if settings.controle_completude == "toujours":
+        return not reponse.refus
+    return completude_a_verifier(reponse, resultats)
+
+
+def _rediger_et_verifier(
+    question: str,
+    resultats: list,
+    llm: _LLM,
+    nli: _NLI,
+    settings: Settings,
+    juge: _LLM | None,
+    omission: str | None = None,
+) -> ReponseGeneree:
+    """Rédaction de la réponse puis garde-fous : citations, puis fidélité."""
+    reponse = generer_reponse(question, resultats, llm, omission)
     reponse = corriger_citations(question, resultats, llm, reponse)
     reponse = verifier_citations(reponse, resultats)
     return verifier_fidelite(

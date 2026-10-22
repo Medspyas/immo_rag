@@ -17,11 +17,13 @@ from app.rag.generator import (
     _decouper_en_affirmations,
     _extraits,
     _preselectionner,
+    completude_a_verifier,
     corriger_citations,
     generer_reponse,
     get_llm,
     get_llm_juge,
     verifier_citations,
+    verifier_completude,
     verifier_fidelite,
 )
 from app.rag.nli import ScoreNLI
@@ -527,6 +529,22 @@ def test_faute_de_frappe_au_milieu_dune_citation_est_toleree():
     assert verifier_citations(_citation_longue(passage), [_ARTICLE_LONG]).refus is False
 
 
+def test_mots_colles_par_lextraction_du_pdf_sont_toleres():
+    # Loi Hoguet, art. 1 (q28 refusée à tort le 2026-10-20) : le texte source
+    # porte « suivantsdu », espace perdue à l'extraction.
+    article = _Resultat(
+        "loi-89-462",
+        "8° La conclusion de tout contrat de jouissance d'immeuble à temps partagé régi par les\n"
+        "articles L. 121-60 et suivantsdu code de la consommation ;",
+        article="15",
+    )
+    passage = (
+        "8° La conclusion de tout contrat de jouissance d'immeuble à temps partagé régi par "
+        "les articles L. 121-60 et suivants du code de la consommation ;"
+    )
+    assert verifier_citations(_citation_longue(passage), [article]).refus is False
+
+
 def test_mot_remplace_au_milieu_dune_citation_est_refuse():
     passage = (
         "toutefois d'un mois : 1° Sur les communes mentionnées au premier "
@@ -885,6 +903,15 @@ def test_reference_legale_ne_coupe_pas_la_phrase():
     ]
 
 
+def test_ex_et_cf_ne_coupent_pas_la_phrase():
+    # q02 : l'affirmation coupée finissait par « (ex. » et le juge la refusait.
+    texte = "Le préavis est de trois mois, sauf cas prévus (ex. emploi, santé). Voir cf. article 15."
+    assert _decouper_en_affirmations(texte) == [
+        "Le préavis est de trois mois, sauf cas prévus (ex. emploi, santé).",
+        "Voir cf. article 15.",
+    ]
+
+
 def test_nombre_en_fin_de_phrase_nest_pas_un_element_de_liste():
     texte = "Le délai est fixé à l'article 3. Il court dès réception."
     assert _decouper_en_affirmations(texte) == [
@@ -1008,6 +1035,16 @@ def test_numero_detape_et_renvoi_seul_ne_sont_pas_des_affirmations():
     ]
 
 
+def test_reference_avec_identifiant_du_document_nest_pas_une_affirmation():
+    texte = "1. Le commandement doit indiquer le délai de deux mois. (loi_06_07_1989, article 24, I‑1)"
+    assert _decouper_en_affirmations(texte) == ["Le commandement doit indiquer le délai de deux mois."]
+
+
+def test_reference_a_une_plage_delements_nest_pas_une_affirmation():
+    texte = "   - pour le locataire muté. (Article 15, I, 1°‑5°)"
+    assert _decouper_en_affirmations(texte) == ["pour le locataire muté."]
+
+
 def test_le_juge_recoit_la_reponse_complete_pour_les_renvois():
     texte = "Le préavis est de trois mois.\nCe délai est réduit à un mois en meublé."
     reponse = _reponse_avec_citation(texte)
@@ -1088,3 +1125,117 @@ def test_decoupage_retire_la_mise_en_forme_markdown():
         "Règles générales notamment : Le préavis est de trois mois.",
         "Règles générales notamment : Il court dès réception de la lettre.",
     ]
+
+
+_ARTICLE_156 = _Resultat(
+    "code_impot",
+    "Le déficit foncier s'impute sur le revenu global dans la limite annuelle de 10 700 €. "
+    "La limite mentionnée au deuxième alinéa est rehaussée, sans pouvoir excéder 21 400 € par an.",
+    article="156",
+)
+
+
+def _reponse_plafond_majore() -> ReponseGeneree:
+    return ReponseGeneree(
+        refus=False,
+        reponse="Le déficit foncier s'impute sur le revenu global jusqu'à 21 400 € par an.",
+        citations=[Citation(doc_id="code_impot", article="156", passage="sans pouvoir excéder 21 400 €")],
+    )
+
+
+def test_affirmation_fondee_sur_une_derogation_part_au_juge():
+    # Vraie mot à mot, l'affirmation tirée de « est rehaussée » peut taire la
+    # règle générale : le NLI seul ne suffit pas (q58).
+    juge = _JugeLLM(fondee=False)
+    verifiee = verifier_fidelite(
+        _reponse_plafond_majore(), [_ARTICLE_156], _NLIFixe(0.99),
+        seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert juge.appele is True
+    assert verifiee.refus is True
+
+
+def _verdict_incomplet(regle: str) -> str:
+    return json.dumps({"complete": False, "regle_generale": regle, "manque": "Règle générale : 10 700 €."})
+
+
+def test_completude_renvoie_l_element_omis_et_sa_preuve():
+    llm = _LLMFake(_verdict_incomplet("dans la limite annuelle de 10 700 €"))
+    manque = verifier_completude("Jusqu'à quel montant ?", _reponse_plafond_majore(), [_ARTICLE_156], llm)
+    assert manque == "Règle générale : 10 700 €. (« dans la limite annuelle de 10 700 € »)"
+    # Le relecteur reçoit la question, la réponse et l'article cité.
+    assert "Jusqu'à quel montant ?" in llm.question_recue
+    assert "21 400 €" in llm.question_recue
+    assert "10 700 €" in llm.question_recue
+
+
+def test_completude_reponse_complete():
+    llm = _LLMFake(json.dumps({"complete": True, "manque": ""}))
+    assert verifier_completude("Q ?", _reponse_plafond_majore(), [_ARTICLE_156], llm) is None
+
+
+@pytest.mark.parametrize("brut", ["pas du json", "[]", json.dumps({"complete": False, "manque": ""})])
+def test_completude_verdict_inexploitable_vaut_complete(brut):
+    # Un échec technique ne transforme pas une réponse déjà vérifiée en refus.
+    assert verifier_completude("Q ?", _reponse_plafond_majore(), [_ARTICLE_156], _LLMFake(brut)) is None
+
+
+def test_completude_refus_sans_appel():
+    llm = _LLMFake("ne doit pas servir")
+    assert verifier_completude("Q ?", ReponseGeneree(refus=True, motif="x"), [_ARTICLE_156], llm) is None
+    assert llm.consigne_recue is None
+
+
+def test_completude_phrase_introuvable_dans_les_articles_ignoree():
+    # Omission sans appui dans le texte récupéré (article inventé) : ignorée.
+    llm = _LLMFake(_verdict_incomplet("Le locataire peut résilier le bail sans préavis."))
+    assert verifier_completude("Q ?", _reponse_plafond_majore(), [_ARTICLE_156], llm) is None
+
+
+def test_completude_regle_cherchee_dans_un_article_non_cite():
+    # La règle générale peut être dans un article récupéré que la réponse ne
+    # cite pas (q02 : seul l'article des meublés était cité).
+    article_15 = _Resultat("loi-89-462", "Le délai de préavis est de trois mois.", article="15")
+    llm = _LLMFake(_verdict_incomplet("Le délai de préavis est de trois mois."))
+    manque = verifier_completude("Q ?", _reponse_plafond_majore(), [_ARTICLE_156, article_15], llm)
+    assert manque is not None
+    assert "Article 15" in llm.question_recue
+
+
+def test_completude_signale_un_passage_cite_de_derogation():
+    # Le juge laissait passer le plafond majoré seul une fois sur trois (q58) :
+    # un passage cité qui dit « rehaussée » lui est signalé.
+    reponse = _reponse_plafond_majore()
+    reponse.citations[0].passage = "est rehaussée, sans pouvoir excéder 21 400 € par an"
+    llm = _LLMFake(json.dumps({"complete": True}))
+    verifier_completude("Q ?", reponse, [_ARTICLE_156], llm)
+    assert "énoncent une dérogation" in llm.question_recue
+    assert "« est rehaussée, sans pouvoir excéder 21 400 € par an »" in llm.question_recue
+
+
+def test_completude_sans_derogation_pas_de_signal():
+    llm = _LLMFake(json.dumps({"complete": True}))
+    verifier_completude("Q ?", _reponse_plafond_majore(), [_ARTICLE_156], llm)
+    assert "dérogation" not in llm.question_recue
+
+
+def test_completude_a_verifier_passage_de_derogation():
+    reponse = _reponse_plafond_majore()
+    reponse.citations[0].passage = "est rehaussée, sans pouvoir excéder 21 400 € par an"
+    assert completude_a_verifier(reponse, [_ARTICLE_156]) is True
+
+
+def test_completude_a_verifier_article_de_regime_particulier():
+    # q02 : seul l'article des meublés est cité, la règle générale est ailleurs.
+    meuble = _Resultat("loi-89-462", "Le délai de préavis est d'un mois.", article="25-8",
+                       section="Titre Ier bis : Des rapports entre bailleurs et locataires dans les logements meublés")
+    reponse = ReponseGeneree(
+        refus=False, reponse="Le préavis est d'un mois.",
+        citations=[Citation(doc_id="loi-89-462", article="25-8", passage="Le délai de préavis est d'un mois.")],
+    )
+    assert completude_a_verifier(reponse, [meuble]) is True
+
+
+def test_completude_a_verifier_reponse_ordinaire_ou_refus():
+    assert completude_a_verifier(_reponse_plafond_majore(), [_ARTICLE_156]) is False
+    assert completude_a_verifier(ReponseGeneree(refus=True, motif="x"), [_ARTICLE_156]) is False

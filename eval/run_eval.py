@@ -51,9 +51,11 @@ from app.rag.generator import (
     get_llm,
     get_llm_juge,
     verifier_citations,
+    verifier_completude,
     verifier_fidelite,
 )
 from app.rag.nli import get_nli_provider
+from app.rag.pipeline import _completude_a_controler
 from app.rag.reranker import get_rerank_provider
 from app.rag.retriever import HybridRetriever
 from app.rag.suivi import reformuler_question
@@ -101,7 +103,8 @@ def _trace(
 
 
 def evaluer(
-    cas_golden, retriever, llm, nli, settings: Settings, k: int = 10, juge=None
+    cas_golden, retriever, llm, nli, settings: Settings, k: int = 10, juge=None,
+    juge_completude=None,
 ) -> Iterator[dict]:
     """Fait tourner recherche + génération + garde-fou étage 2 sur chaque cas,
     et produit une trace par cas (voir `_trace`) au fur et à mesure, pour
@@ -109,7 +112,13 @@ def evaluer(
 
     `k` est le nombre d'articles récupérés, donc envoyés au LLM : moins
     d'articles consomme moins du quota Groq par réponse, au risque d'écarter
-    l'article utile."""
+    l'article utile.
+
+    Comme pipeline.repondre, une réponse fondée passe ensuite le contrôle de
+    complétude (selon settings.controle_completude) ; une omission déclenche une
+    seconde rédaction, dont la trace garde l'élément omis (`omission`).
+    `juge_completude` remplace le juge pour ce seul contrôle (Kimi en
+    analyse, cf. eval/kimi.py)."""
     for cas in cas_golden:
         # Comme pipeline.repondre : une question de suivi est d'abord rendue
         # autonome, puis suit le chemin habituel.
@@ -119,46 +128,64 @@ def evaluer(
             yield _trace(cas, resultats, None, "refus_retrieval", question=question)
             continue
 
-        historique_gen = getattr(llm, "historique", None)
-        debut_gen = len(historique_gen) if historique_gen is not None else 0
-        reponse_brute = generer_reponse(question, resultats, llm)
-        reponse_brute = corriger_citations(question, resultats, llm, reponse_brute)
-        generateurs = historique_gen[debut_gen:] if historique_gen is not None else []
-        if reponse_brute.refus:
-            yield _trace(
-                cas, resultats, reponse_brute, "refus_generation", reponse_brute,
-                generateurs=generateurs, question=question,
+        etat = _rediger(question, resultats, llm, nli, settings, juge)
+        omission = None
+        seconde_refusee = False
+        if etat["verdict_local"] == "fondee" and _completude_a_controler(
+            etat["reponse"], resultats, settings
+        ):
+            omission = verifier_completude(
+                question, etat["reponse"], resultats, juge_completude or juge or llm
             )
-            continue
+            if omission:
+                seconde = _rediger(question, resultats, llm, nli, settings, juge, omission)
+                # Comme pipeline.repondre : une seconde rédaction refusée
+                # laisse la place à la première, déjà vérifiée.
+                seconde_refusee = seconde["verdict_local"] != "fondee"
+                if not seconde_refusee:
+                    etat = seconde
+        trace = _trace(cas, resultats, question=question, **etat)
+        trace["omission"] = omission
+        trace["seconde_refusee"] = bool(omission) and seconde_refusee
+        yield trace
 
-        reponse_citations = verifier_citations(reponse_brute, resultats)
-        if reponse_citations.refus:
-            yield _trace(
-                cas, resultats, reponse_citations, "refus_citation", reponse_brute,
-                generateurs=generateurs, question=question,
-            )
-            continue
 
-        historique = getattr(juge or llm, "historique", None)
-        debut = len(historique) if historique is not None else 0
-        # reponse_citations est ce qu'on confronte à la mesure indépendante :
-        # le texte tel que rédigé, avant que notre propre garde-fou étage 2 ne
-        # le transforme éventuellement en refus.
-        reponse_apres = verifier_fidelite(
-            reponse_citations,
-            resultats,
-            nli,
-            settings.seuil_nli_haut,
-            settings.seuil_nli_contradiction,
-            juge or llm,
-        )
-        verdict = "refus_fidelite" if reponse_apres.refus else "fondee"
-        juges = historique[debut:] if historique is not None else []
-        yield _trace(
-            cas, resultats, reponse_citations, verdict, reponse_brute, juges, generateurs,
-            motif_fidelite=reponse_apres.motif if reponse_apres.refus else None,
-            question=question,
-        )
+def _rediger(question, resultats, llm, nli, settings: Settings, juge, omission=None) -> dict:
+    """Rédaction puis garde-fous (citations, fidélité) : arguments de `_trace`
+    décrivant le résultat, verdict compris."""
+    historique_gen = getattr(llm, "historique", None)
+    debut_gen = len(historique_gen) if historique_gen is not None else 0
+    reponse_brute = generer_reponse(question, resultats, llm, omission)
+    reponse_brute = corriger_citations(question, resultats, llm, reponse_brute)
+    generateurs = historique_gen[debut_gen:] if historique_gen is not None else []
+    etat = {"brute": reponse_brute, "generateurs": generateurs}
+    if reponse_brute.refus:
+        return {**etat, "reponse": reponse_brute, "verdict_local": "refus_generation"}
+
+    reponse_citations = verifier_citations(reponse_brute, resultats)
+    if reponse_citations.refus:
+        return {**etat, "reponse": reponse_citations, "verdict_local": "refus_citation"}
+
+    historique = getattr(juge or llm, "historique", None)
+    debut = len(historique) if historique is not None else 0
+    # reponse_citations est ce qu'on confronte à la mesure indépendante :
+    # le texte tel que rédigé, avant que notre propre garde-fou étage 2 ne
+    # le transforme éventuellement en refus.
+    reponse_apres = verifier_fidelite(
+        reponse_citations,
+        resultats,
+        nli,
+        settings.seuil_nli_haut,
+        settings.seuil_nli_contradiction,
+        juge or llm,
+    )
+    return {
+        **etat,
+        "reponse": reponse_citations,
+        "verdict_local": "refus_fidelite" if reponse_apres.refus else "fondee",
+        "juges": historique[debut:] if historique is not None else [],
+        "motif_fidelite": reponse_apres.motif if reponse_apres.refus else None,
+    }
 
 
 def traces_existantes(fichier: Path) -> list[dict]:
@@ -196,6 +223,10 @@ def main() -> None:
     )
     parser.add_argument("--ids", nargs="+", help="ne traiter que ces cas (ex. q22 q35)")
     parser.add_argument(
+        "--juge-completude", choices=["groq", "kimi"], default="groq",
+        help="juge du contrôle de complétude (kimi : analyse seulement, cf. eval/kimi.py)",
+    )
+    parser.add_argument(
         "--avec-hors-corpus",
         action="store_true",
         help="inclure les cas hors corpus (l'assistant doit refuser)",
@@ -209,6 +240,11 @@ def main() -> None:
     llm = get_llm(settings)
     juge = get_llm_juge(settings)
     nli = get_nli_provider(settings)
+    juge_completude = None
+    if args.juge_completude == "kimi":
+        from eval.kimi import KimiLLM, lire_cle
+
+        juge_completude = KimiLLM(lire_cle())
 
     print("Préparation du corpus en mémoire…")
     corpus = construire_corpus(embeddings)
@@ -217,6 +253,7 @@ def main() -> None:
         k_par_source=settings.k_par_source,
         k_avant_rerank=settings.k_avant_rerank,
         seuil_rerank=settings.seuil_garde_fou_retrieval,
+        index_articles=corpus.bm25,
     )
 
     cas_golden = [c for c in charger_golden() if args.avec_hors_corpus or not c.hors_corpus]
@@ -238,7 +275,8 @@ def main() -> None:
     with fichier.open("w", encoding="utf-8") as f:
         for t in traces:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge), start=1):
+        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge,
+            juge_completude=juge_completude), start=1):
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
             f.flush()
             traces.append(t)

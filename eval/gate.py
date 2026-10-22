@@ -100,6 +100,7 @@ def mesurer(settings) -> dict[str, float]:
         reranker=reranker,
         k_par_source=settings.k_par_source,
         k_avant_rerank=settings.k_avant_rerank,
+        index_articles=corpus.bm25,
     )
     scores_hors = []
     for c in hors:

@@ -98,3 +98,12 @@ def test_index_vide():
 
 def test_requete_vide_apres_tokenisation():
     assert BM25Index(DOCS).search("le la les de") == []
+
+
+def test_article_retrouve_par_son_numero_et_sa_famille():
+    doc = BM25Document(
+        id=uuid4(), doc_id="code_impot2", content="Article 150 VC", metadata={"article": "150 VC"}
+    )
+    index = BM25Index([doc])
+    assert index.article("code_impot", "150 VC") == doc
+    assert index.article("code_impot", "150 VD") is None

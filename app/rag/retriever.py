@@ -30,8 +30,9 @@ Contenu du fichier :
 - fusion_rrf : fusionne plusieurs classements d'identifiants en un seul.
 - RetrievalResult : un morceau retrouvé après fusion, avec son rang dans
   chaque recherche et, le cas échéant, son score de reclassement.
-- HybridRetriever : enchaîne les deux recherches, leur fusion, le
-  reclassement facultatif et le garde-fou de retrieval.
+- HybridRetriever : enchaîne les deux recherches, leur fusion, l'ajout des
+  articles cités par les meilleurs candidats, le reclassement facultatif et
+  le garde-fou de retrieval.
 """
 from __future__ import annotations
 
@@ -42,6 +43,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.rag.questions_articles import charger_questions
+from app.rag.renvois import articles_cites, famille_document
 from app.rag.sigles import developper_sigles
 
 
@@ -171,6 +173,22 @@ class _Reranker(Protocol):
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]: ...
 
 
+class _IndexArticles(Protocol):
+    def article(self, famille: str, numero: str) -> _ResultatRecherche | None: ...
+
+
+# Renvois suivis (renvois.py) : articles cités par les N_SOURCES_RENVOIS
+# premiers candidats de la fusion, au plus N_MAX_RENVOIS ajoutés au
+# reclasseur. Mesuré le 2026-10-19 sur le golden (50 questions, corpus
+# complet) : MRR 0,789 → 0,802, hit@10 96 % → 100 %, aucune question en
+# recul, meilleur score hors corpus inchangé. q55 (l'art. 7 de la loi de 1989
+# renvoie à l'art. 1724 du code civil) introuvable → 2e ; q23 (art. 25 de la
+# loi de 1965, cité par l'art. 24) introuvable → 6e. En moyenne 2,2 articles
+# de plus à reclasser par question. Avec 5 et 5 : q23 reste introuvable.
+N_SOURCES_RENVOIS = 10
+N_MAX_RENVOIS = 10
+
+
 class RetrievalResult(BaseModel):
     """Un morceau retrouvé par la recherche hybride.
 
@@ -212,6 +230,11 @@ class HybridRetriever:
     cross-encoder traite chaque candidat séparément ; ce plafond limite son
     coût. Sans effet lorsque reranker vaut None.
 
+    index_articles : retrouve un article par son numéro (BM25Index.article).
+    Fourni avec un reclasseur, les articles cités par les meilleurs candidats
+    sont ajoutés à ceux qu'il note (cf. N_SOURCES_RENVOIS). Sans effet sans
+    reclasseur : un article ajouté n'a pas de rang dans la fusion.
+
     seuil_rerank : garde-fou étage 1. Fourni avec un reclasseur, la recherche
     ne renvoie rien lorsque le meilleur score de reclassement tombe sous ce
     seuil ; sinon les k meilleurs candidats sont renvoyés. Sans effet lorsque
@@ -228,6 +251,7 @@ class HybridRetriever:
         k_rrf: int = 60,
         k_avant_rerank: int = 20,
         seuil_rerank: float | None = None,
+        index_articles: _IndexArticles | None = None,
     ):
         self._embeddings = embeddings
         self._dense = recherche_dense
@@ -237,6 +261,7 @@ class HybridRetriever:
         self._k_rrf = k_rrf
         self._k_avant_rerank = k_avant_rerank
         self._seuil_rerank = seuil_rerank
+        self._index_articles = index_articles
 
     def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
         """Les k morceaux les mieux placés pour la question.
@@ -289,6 +314,10 @@ class HybridRetriever:
         # Seuls les meilleurs candidats de la fusion sont soumis au reclasseur ;
         # leur ordre final est celui qu'il renvoie, pas celui de la fusion.
         candidats = ids_ordonnes[: self._k_avant_rerank]
+        for article in self._articles_cites(candidats, par_id):
+            candidats.append(article.id)
+            par_id[article.id] = article
+            scores[article.id] = 0.0
         textes = [_texte_a_reclasser(par_id[chunk_id]) for chunk_id in candidats]
         classement = self._reranker.rerank(query, textes)
 
@@ -308,3 +337,24 @@ class HybridRetriever:
             _resultat(candidats[indice], score_rerank=score)
             for indice, score in classement[:k]
         ]
+
+    def _articles_cites(
+        self, candidats: list[UUID], par_id: dict[UUID, _ResultatRecherche]
+    ) -> list[_ResultatRecherche]:
+        """Articles cités par les premiers candidats, absents des candidats,
+        dans l'ordre des renvois et dans la limite de N_MAX_RENVOIS."""
+        if self._index_articles is None:
+            return []
+        ajoutes: list[_ResultatRecherche] = []
+        deja = set(candidats)
+        for chunk_id in candidats[:N_SOURCES_RENVOIS]:
+            source = par_id[chunk_id]
+            for famille, numero in articles_cites(source.content, famille_document(source.doc_id)):
+                article = self._index_articles.article(famille, numero)
+                if article is None or article.id in deja:
+                    continue
+                if len(ajoutes) == N_MAX_RENVOIS:
+                    return ajoutes
+                ajoutes.append(article)
+                deja.add(article.id)
+        return ajoutes

@@ -29,6 +29,7 @@ from app.rag.bm25_index import BM25Index
 from app.rag.chunking import RawChunk, decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
 from app.rag.embeddings import EmbeddingProvider
+from app.rag.fenetres import fenetres_article
 from app.rag.pipeline import documents_bm25, fichiers_du_corpus, identifiant_chunk
 from app.rag.vector_store import Chunk
 
@@ -53,15 +54,30 @@ class RechercheDenseMemoire:
     """Recherche par le sens sans base : le vecteur de la question est multiplié
     à la matrice des vecteurs d'articles (tous normalisés), les meilleurs scores
     sont renvoyés. Le produit scalaire de deux vecteurs normalisés vaut leur
-    similarité cosinus."""
+    similarité cosinus.
 
-    def __init__(self, chunks: list[Chunk], matrice: np.ndarray):
+    Les vecteurs des fenêtres d'articles longs (fenetres.py) sont comparés à
+    la question eux aussi ; chaque article garde le meilleur score entre son
+    texte entier et ses fenêtres, comme dans la base (vector_store.py)."""
+
+    def __init__(
+        self,
+        chunks: list[Chunk],
+        matrice: np.ndarray,
+        fenetres: np.ndarray | None = None,
+        proprietaires: np.ndarray | None = None,
+    ):
         self._chunks = chunks
         self._matrice = matrice
+        # proprietaires[i] : rang dans chunks de l'article de la fenêtre i.
+        self._fenetres = fenetres
+        self._proprietaires = proprietaires
 
     def search(self, query_embedding: list[float], k: int) -> list[ResultatMemoire]:
         q = np.asarray(query_embedding, dtype=np.float32)
         scores = self._matrice @ q
+        if self._fenetres is not None and len(self._fenetres):
+            np.maximum.at(scores, self._proprietaires, self._fenetres @ q)
         meilleurs = np.argsort(scores)[::-1][:k]
         return [
             ResultatMemoire(
@@ -104,29 +120,27 @@ def _articles_du_corpus(
 
 
 def _matrice_embeddings(
-    articles: list[RawChunk], embeddings: EmbeddingProvider, cache_dir: Path
+    textes: list[str], embeddings: EmbeddingProvider, cache_dir: Path, nom: str = "embeddings_eval"
 ) -> np.ndarray:
-    """Renvoie la matrice des vecteurs d'articles, calculée en une passe la
-    première fois puis relue depuis le cache disque.
+    """Renvoie la matrice des vecteurs des textes (articles ou fenêtres),
+    calculée en une passe la première fois puis relue depuis le cache disque.
 
-    La clé de cache dépend du texte des articles et du modèle : changer le
-    corpus, le découpage ou le modèle d'embeddings invalide l'ancien cache.
+    La clé de cache dépend des textes et du modèle : changer le corpus, le
+    découpage ou le modèle d'embeddings invalide l'ancien cache.
     """
     cache_dir.mkdir(exist_ok=True)
     # Le modèle e5 par défaut garde l'ancienne clé : son cache reste valable.
     modele = getattr(embeddings, "_model_name", "")
     signature = "" if modele == "intfloat/multilingual-e5-base" else modele
     empreinte = hashlib.sha1(
-        (signature + "".join(a.content for a in articles)).encode("utf-8")
+        (signature + "".join(textes)).encode("utf-8")
     ).hexdigest()[:16]
-    fichier = cache_dir / f"embeddings_eval_{empreinte}.npy"
+    fichier = cache_dir / f"{nom}_{empreinte}.npy"
     if fichier.exists():
         return np.load(fichier)
 
-    print(f"Calcul des embeddings pour {len(articles)} articles (une seule fois)…")
-    vecteurs = np.asarray(
-        embeddings.embed_documents([a.content for a in articles]), dtype=np.float32
-    )
+    print(f"Calcul des embeddings pour {len(textes)} textes (une seule fois)…")
+    vecteurs = np.asarray(embeddings.embed_documents(textes), dtype=np.float32)
     np.save(fichier, vecteurs)
     return vecteurs
 
@@ -156,7 +170,18 @@ def construire_corpus(
     cache_dir = cache_dir or CACHE
 
     articles = _articles_du_corpus(fichiers, dossier, contextualizer)
-    matrice = _matrice_embeddings(articles, embeddings, cache_dir)
+    matrice = _matrice_embeddings([a.content for a in articles], embeddings, cache_dir)
+    textes_fenetres: list[str] = []
+    proprietaires: list[int] = []
+    for rang, article in enumerate(articles):
+        for fenetre in fenetres_article(article.content):
+            textes_fenetres.append(fenetre)
+            proprietaires.append(rang)
+    matrice_fenetres = (
+        _matrice_embeddings(textes_fenetres, embeddings, cache_dir, "fenetres_eval")
+        if textes_fenetres
+        else None
+    )
 
     chunks = [
         Chunk(
@@ -174,6 +199,8 @@ def construire_corpus(
     return CorpusMemoire(
         chunks=chunks,
         embeddings=embeddings,
-        dense=RechercheDenseMemoire(chunks, matrice),
+        dense=RechercheDenseMemoire(
+            chunks, matrice, matrice_fenetres, np.asarray(proprietaires, dtype=np.int64)
+        ),
         bm25=BM25Index(documents_bm25(chunks)),
     )

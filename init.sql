@@ -20,6 +20,18 @@ CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks (doc_id);
 CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx
     ON chunks USING hnsw (embedding vector_cosine_ops);
 
+-- Vecteurs des fenêtres d'un article long (app/rag/fenetres.py) : servent à
+-- retrouver l'article, jamais renvoyés. Supprimés avec leur article.
+CREATE TABLE IF NOT EXISTS fenetres (
+    chunk_id UUID NOT NULL REFERENCES chunks (id) ON DELETE CASCADE,
+    rang INT NOT NULL,
+    embedding VECTOR(768) NOT NULL,
+    PRIMARY KEY (chunk_id, rang)
+);
+
+CREATE INDEX IF NOT EXISTS fenetres_embedding_hnsw_idx
+    ON fenetres USING hnsw (embedding vector_cosine_ops);
+
 -- updated_at est rafraîchi à chaque ré-ingestion d'un chunk.
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER AS $$

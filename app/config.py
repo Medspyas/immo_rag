@@ -100,6 +100,14 @@ class Settings(BaseSettings):
     # « l'état des lieux est obligatoire » (art. 3-2 : « est établi »), le
     # 120b l'accepte, et les deux refusent les réponses fausses testées.
     llm_modele_juge: str = "openai/gpt-oss-120b"
+    # Après les garde-fous, le juge relit la réponse en partant des articles
+    # cités : une omission qui la rend trompeuse (règle générale tue derrière
+    # un plafond majoré, q58) déclenche une seconde rédaction
+    # (generator.verifier_completude). « cible » : seulement quand la réponse
+    # s'appuie sur une dérogation ou un régime particulier
+    # (generator.completude_a_verifier) ; « toujours » épuisait le quota
+    # gratuit du juge (golden arrêté à q17 le 2026-10-22).
+    controle_completude: Literal["cible", "toujours", "non"] = "cible"
 
     groq_api_key: str | None = None
     # Relais en fin de cascade quand les quotas Groq sont consommés (offre
