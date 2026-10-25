@@ -553,3 +553,4 @@ def test_repondre_seconde_redaction_refusee_garde_la_premiere():
     reponse = repondre("Quel préavis ?", _RetrieverFake([_ARTICLE_15]), llm, _NLIToujoursFonde(), _toujours())
     assert reponse.refus is False
     assert reponse.reponse == "Le délai de préavis est de trois mois."
+

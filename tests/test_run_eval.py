@@ -250,3 +250,18 @@ def test_seconde_redaction_refusee_trace_la_premiere():
     assert trace["verdict_local"] == "fondee"
     assert trace["reponse"] == "Le préavis du locataire est de trois mois."
     assert trace["seconde_refusee"] is True
+
+
+def test_erreur_du_modele_sur_un_cas_n_arrete_pas_le_golden(monkeypatch):
+    from app.rag.generator import ModeleIndisponible
+    from eval import run_eval
+
+    def _echoue(*args, **kwargs):
+        raise ModeleIndisponible("400 max completion tokens")
+
+    monkeypatch.setattr(run_eval, "_rediger", _echoue)
+    traces = list(run_eval.evaluer(
+        [_CAS_TROUVE, _CAS_TROUVE], _RetrieverFake(RESULTATS), _LLMFake(_REPONSE_OK), _NLIFake(), _settings()
+    ))
+    assert [t["verdict_local"] for t in traces] == ["erreur_modele", "erreur_modele"]
+    assert "max completion" in traces[0]["erreur"]

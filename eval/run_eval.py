@@ -25,6 +25,12 @@ Lancement :
     python -m eval.run_eval --reprendre     # compléter une trace interrompue
     python -m eval.run_eval --k 5 --sortie .cache/traces_k5.jsonl
                                             # 5 articles envoyés au LLM au lieu de 10
+    python -m eval.run_eval --relais-kimi   # Kimi relaie Groq si son quota du jour est épuisé
+
+Rédaction par le seul llm_model, sans relais (--cascade pour les rétablir) :
+quand un modèle prenait le relais d'un autre selon le quota restant, la même
+question était rédigée par 20b, 120b ou Mistral d'une passe à l'autre, et le
+golden mesurait la chance du quota plutôt que le système (2026-10-23).
 
 Chaque trace est écrite dès qu'elle est prête : une interruption (quota
 Groq, coupure) ne perd que le cas en cours. `--reprendre` saute alors les cas
@@ -45,6 +51,8 @@ if hasattr(sys.stdout, "reconfigure"):
 from app.config import Settings
 from app.rag.embeddings import get_embedding_provider
 from app.rag.generator import (
+    ModeleIndisponible,
+    QuotaJournalierEpuise,
     _contextes_cites,
     corriger_citations,
     generer_reponse,
@@ -92,8 +100,8 @@ def _trace(
         "generation": brute.model_dump() if brute else None,
         # Modèle(s) qui ont jugé la fidélité (juge en cascade seulement).
         "modeles_juge": juges or [],
-        # Modèle(s) qui ont rédigé la réponse : un relais (Mistral) n'écrit
-        # pas comme Groq, le verdict en dépend.
+        # Modèle(s) qui ont rédigé la réponse : un relais n'écrit pas comme
+        # le modèle principal, le verdict en dépend.
         "modeles_generation": generateurs or [],
         "articles": [
             {"doc_id": r.doc_id, "content": r.content, "metadata": r.metadata}
@@ -128,7 +136,19 @@ def evaluer(
             yield _trace(cas, resultats, None, "refus_retrieval", question=question)
             continue
 
-        etat = _rediger(question, resultats, llm, nli, settings, juge)
+        try:
+            etat = _rediger(question, resultats, llm, nli, settings, juge)
+        except QuotaJournalierEpuise:
+            # Plus de réponse possible aujourd'hui : arrêt, --reprendre demain.
+            raise
+        except ModeleIndisponible as exc:
+            # Sans relais (rédaction fixe), une erreur du modèle sur ce cas
+            # (réponse coupée par max_tokens, q22 le 2026-10-23) compte comme
+            # un échec du cas au lieu d'arrêter tout le golden.
+            trace = _trace(cas, resultats, None, "erreur_modele", question=question)
+            trace["erreur"] = str(exc)[:300]
+            yield trace
+            continue
         omission = None
         seconde_refusee = False
         if etat["verdict_local"] == "fondee" and _completude_a_controler(
@@ -223,8 +243,12 @@ def main() -> None:
     )
     parser.add_argument("--ids", nargs="+", help="ne traiter que ces cas (ex. q22 q35)")
     parser.add_argument(
-        "--juge-completude", choices=["groq", "kimi"], default="groq",
-        help="juge du contrôle de complétude (kimi : analyse seulement, cf. eval/kimi.py)",
+        "--relais-kimi", action="store_true",
+        help="Kimi relaie Groq (rédaction et juge) quand son quota du jour est épuisé",
+    )
+    parser.add_argument(
+        "--cascade", action="store_true",
+        help="rédaction en cascade sur les modèles de relais, comme en production",
     )
     parser.add_argument(
         "--avec-hors-corpus",
@@ -235,16 +259,21 @@ def main() -> None:
     fichier = args.sortie
 
     settings = Settings()
+    if not args.cascade:
+        settings = settings.model_copy(update={"llm_modeles_relais": []})
     embeddings = get_embedding_provider(settings)
     reranker = get_rerank_provider(settings)
     llm = get_llm(settings)
-    juge = get_llm_juge(settings)
     nli = get_nli_provider(settings)
-    juge_completude = None
-    if args.juge_completude == "kimi":
-        from eval.kimi import KimiLLM, lire_cle
+    juge = get_llm_juge(settings)
+    if args.relais_kimi:
+        from eval.kimi import KimiLLM, RelaisKimi, lire_cle
 
-        juge_completude = KimiLLM(lire_cle())
+        # Kimi (payant) rédige et juge seulement quand le quota du jour de
+        # Groq est épuisé. Un seul client : ses jetons sont comptés ensemble.
+        kimi = KimiLLM(lire_cle())
+        llm = RelaisKimi(llm, kimi)
+        juge = RelaisKimi(juge, kimi)
 
     print("Préparation du corpus en mémoire…")
     corpus = construire_corpus(embeddings)
@@ -275,8 +304,7 @@ def main() -> None:
     with fichier.open("w", encoding="utf-8") as f:
         for t in traces:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge,
-            juge_completude=juge_completude), start=1):
+        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge), start=1):
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
             f.flush()
             traces.append(t)
@@ -286,6 +314,8 @@ def main() -> None:
     for t in traces:
         comptes[t["verdict_local"]] = comptes.get(t["verdict_local"], 0) + 1
     print(f"\nTraces écrites dans {fichier}")
+    if hasattr(juge, "jetons"):
+        print(f"Jetons Kimi consommés : {juge.jetons}")
     for verdict, n in sorted(comptes.items()):
         print(f"  {verdict:<18} {n}")
     print(

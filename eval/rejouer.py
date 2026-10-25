@@ -27,7 +27,13 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 from app.config import Settings
-from app.rag.generator import ReponseGeneree, verifier_citations, verifier_fidelite
+from app.rag.generator import (
+    ReponseGeneree,
+    reparer_citations,
+    sans_exemples,
+    verifier_citations,
+    verifier_fidelite,
+)
 from app.rag.nli import get_nli_provider
 
 
@@ -53,12 +59,12 @@ def rejouer_trace(trace: dict, nli, settings: Settings) -> tuple[str, str | None
     if not trace.get("generation"):
         return trace["verdict_local"], trace.get("motif")
 
-    reponse = ReponseGeneree.model_validate(trace["generation"])
+    reponse = sans_exemples(ReponseGeneree.model_validate(trace["generation"]))
     if reponse.refus:
         return "refus_generation", reponse.motif
 
     articles = [SimpleNamespace(**a) for a in trace["articles"]]
-    apres_citations = verifier_citations(reponse, articles)
+    apres_citations = verifier_citations(reparer_citations(reponse, articles), articles)
     if apres_citations.refus:
         return "refus_citation", apres_citations.motif
 

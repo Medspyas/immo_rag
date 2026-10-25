@@ -33,6 +33,14 @@ pertinence de ce qui a été retrouvé ; le second, la fidélité du texte rédi
 ce qui a été retrouvé. Un LLM peut broder à côté même avec la bonne source sous
 les yeux.
 
+Une réponse vraie phrase par phrase peut encore tromper par omission : donner
+le plafond majoré de 21 400 € (travaux de rénovation énergétique) sans la règle
+générale de 10 700 €. Quand une réponse s'appuie sur une dérogation ou sur un
+article de régime particulier (meublé, bail mobilité), le juge LLM relit
+l'ensemble des articles récupérés ; s'il recopie mot pour mot la règle omise, la
+réponse est rédigée une seconde fois avec elle. Contrôle ciblé : appliqué à
+chaque réponse, il épuisait le quota gratuit du juge.
+
 Le découpage suit les unités légales (un morceau = un article, avec son
 intitulé de section), pas une fenêtre glissante qui couperait un article en
 deux.
@@ -56,9 +64,10 @@ Questions hors corpus : l'étage 1 (score du reclasseur) en arrête la moitié ;
 les autres, proches d'un article réel (durée de validité du DPE), sont
 refusées par l'étage 2.
 
-De bout en bout, avec de vrais appels LLM (44 premières questions) : 43
-réponses fondées sur 44, et 4 refus sur 4 hors corpus ; le seul refus restant
-porte sur une réponse fausse.
+De bout en bout, avec de vrais appels LLM (54 questions, 2026-10-20) : 48
+réponses fondées sur 54, et 4 refus sur 4 hors corpus. Parmi les réponses
+acceptées, une était trompeuse par omission (plafond majoré seul) : c'est ce
+cas que traite le contrôle ci-dessus.
 
 Renvois entre textes : un article cite souvent un autre article au lieu d'en
 recopier la règle (« l'article 1724 du code civil est applicable »). Les

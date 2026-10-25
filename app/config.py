@@ -57,9 +57,15 @@ class Settings(BaseSettings):
     # (ablation --rerank, 2026-10-03) : 30/30 au lieu de 20/20 fait remonter
     # l'article 18 de la loi de 1965 (missions du syndic, 23e en recherche par
     # le sens) — hit@5 83,9 % → 87,1 %, MRR 0,655 → 0,686, questions hors
-    # corpus inchangées (max 0,13). 40/40 n'apporte rien de plus.
-    k_par_source: int = 30
-    k_avant_rerank: int = 30
+    # corpus inchangées (max 0,13). 40/40 n'apportait rien de plus alors.
+    # Le 2026-10-23, 40/40 retenu : l'article 977 (barème de l'IFI, « tarif »,
+    # 20e par le sens, absent des mots-clés) entrait juste au-dessous des 30
+    # candidats pour « Quels sont les taux de l'impôt sur la fortune
+    # immobilière (IFI) ? » (q48, question de suivi réécrite) ; avec 40, 1er.
+    # Gate : hit@5 et hit@10 inchangés, MRR 0,802 → 0,792 (q32 passe du 1er au
+    # 2e rang, toujours parmi les articles envoyés au LLM), hors corpus inchangé.
+    k_par_source: int = 40
+    k_avant_rerank: int = 40
 
     # Nombre d'articles envoyés au LLM pour rédiger la réponse. Chaque article
     # consomme du quota Groq gratuit (8000 tokens/minute). Mesuré sur le golden
@@ -110,10 +116,6 @@ class Settings(BaseSettings):
     controle_completude: Literal["cible", "toujours", "non"] = "cible"
 
     groq_api_key: str | None = None
-    # Relais en fin de cascade quand les quotas Groq sont consommés (offre
-    # gratuite Mistral « Experiment »). Sans clé, la cascade reste 100 % Groq.
-    mistral_api_key: str | None = None
-    mistral_model: str = "ministral-14b-latest"
 
     # Origines autorisées à appeler l'API depuis un navigateur (front, phase 3).
     # Format JSON dans .env, ex. ["http://localhost:5173"] ; vide par défaut.

@@ -10,7 +10,6 @@ from app.rag.generator import (
     Citation,
     GroqLLM,
     LLMEnCascade,
-    MistralLLM,
     ModeleIndisponible,
     QuotaJournalierEpuise,
     ReponseGeneree,
@@ -22,6 +21,9 @@ from app.rag.generator import (
     generer_reponse,
     get_llm,
     get_llm_juge,
+    reparer_citations,
+    retirer_exemples,
+    sans_exemples,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
@@ -30,9 +32,7 @@ from app.rag.nli import ScoreNLI
 
 
 def _settings(**overrides) -> Settings:
-    # Sans clé Mistral par défaut : celle du .env local ne doit pas changer
-    # la cascade attendue par les tests.
-    base = {"database_url": "postgresql://x", "groq_api_key": "fake-key", "mistral_api_key": None}
+    base = {"database_url": "postgresql://x", "groq_api_key": "fake-key"}
     base.update(overrides)
     return Settings(**base)
 
@@ -100,84 +100,6 @@ def test_juge_place_son_modele_en_tete_de_cascade():
     juge = get_llm_juge(_settings(llm_model="a", llm_modeles_relais=["b"], llm_modele_juge="b"))
     assert [m._model for m in juge._modeles] == ["b", "a"]
     assert [m._model for m in juge._derniers_recours] == ["b", "a"]
-
-
-def test_cle_mistral_ajoute_mistral_en_secours_seulement():
-    llm = get_llm(_settings(llm_model="a", llm_modeles_relais=[], mistral_api_key="cle-m"))
-    assert isinstance(llm, LLMEnCascade)
-    # Hors de la cascade : une saturation d'une minute de Groq ne suffit pas.
-    assert [type(m) for m in llm._modeles] == [GroqLLM]
-    assert isinstance(llm._secours, MistralLLM)
-    assert llm._secours._max_essais == GROQ_MAX_ESSAIS
-
-
-def _mistral(gestionnaire, max_essais=0):
-    import httpx
-
-    attentes: list[float] = []
-    client = httpx.Client(transport=httpx.MockTransport(gestionnaire))
-    llm = MistralLLM("cle-m", "m", max_essais=max_essais, client=client, dormir=attentes.append)
-    return llm, attentes
-
-
-def test_mistral_renvoie_le_contenu_de_la_reponse():
-    import httpx
-
-    recues = []
-
-    def _ok(requete):
-        recues.append(requete)
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"refus": true}'}}]})
-
-    llm, _ = _mistral(_ok)
-    assert llm.generer("consigne", "question") == '{"refus": true}'
-    corps = json.loads(recues[0].content)
-    assert corps["response_format"] == {"type": "json_object"}
-    assert corps["messages"][0] == {"role": "system", "content": "consigne"}
-    assert recues[0].headers["Authorization"] == "Bearer cle-m"
-
-
-def test_mistral_impose_le_schema_selon_la_consigne():
-    import httpx
-
-    from app.rag.generator import CONSIGNE, CONSIGNE_JUGE_FIDELITE
-
-    recues = []
-
-    def _ok(requete):
-        recues.append(json.loads(requete.content))
-        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
-
-    llm, _ = _mistral(_ok)
-    llm.generer(CONSIGNE, "q")
-    llm.generer(CONSIGNE_JUGE_FIDELITE, "q")
-    reponse, juge = (r["response_format"] for r in recues)
-    assert reponse["type"] == juge["type"] == "json_schema"
-    assert reponse["json_schema"]["schema"]["properties"]["reponse"] == {"type": "string"}
-    assert juge["json_schema"]["schema"]["required"] == ["fondees"]
-
-
-def test_mistral_sature_reessaie_apres_attente():
-    import httpx
-
-    reponses = iter(
-        [
-            httpx.Response(429, text="rate limit"),
-            httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]}),
-        ]
-    )
-    llm, attentes = _mistral(lambda requete: next(reponses), max_essais=2)
-    assert llm.generer("c", "q") == "{}"
-    assert len(attentes) == 1
-
-
-def test_mistral_sature_sans_essai_passe_la_main():
-    import httpx
-
-    llm, attentes = _mistral(lambda requete: httpx.Response(429, text="rate limit"))
-    with pytest.raises(ModeleIndisponible):
-        llm.generer("c", "q")
-    assert attentes == []
 
 
 class _LLMSature:
@@ -256,25 +178,15 @@ def test_cascade_tous_epuises_pour_la_journee_leve_quota_journalier():
         cascade.generer("c", "q")
 
 
-def test_cascade_saturee_ou_epuisee_passe_au_secours():
-    secours = _LLMRepond("secours")
-    secours.nom = "m"
+def test_cascade_saturee_partout_echoue_sans_secours():
+    # Plus de relais hors Groq (Mistral retiré) : l'erreur remonte, l'API
+    # répond « service saturé » plutôt qu'une réponse dégradée.
     cascade = LLMEnCascade(
         [_LLMSature(), _LLMEpuiseDuJour()],
         derniers_recours=[_LLMSature(), _LLMRepond("r2")],
-        secours=secours,
     )
-    assert cascade.generer("c", "q") == "secours"
-    assert cascade.historique == ["m (secours)"]
-
-
-def test_cascade_n_appelle_pas_le_secours_si_groq_repond_apres_attente():
-    secours = _LLMRepond("secours")
-    cascade = LLMEnCascade(
-        [_LLMSature()], derniers_recours=[_LLMRepond("patient")], secours=secours
-    )
-    assert cascade.generer("c", "q") == "patient"
-    assert secours.appels == 0
+    with pytest.raises(ModeleIndisponible):
+        cascade.generer("c", "q")
 
 
 def test_cascade_ne_masque_pas_une_autre_erreur():
@@ -951,6 +863,34 @@ def test_formule_dattribution_en_tete_est_retiree():
     ]
 
 
+def test_reference_entre_parentheses_est_retiree():
+    # q55 (2026-10-24) : la référence faisait tomber le NLI de 1,00 à 0,00.
+    texte = "« Le prix du bail sera diminué. » (article 1724 du code civil). Le préavis est d'un mois (art. 25-8)."
+    assert _decouper_en_affirmations(texte) == [
+        "« Le prix du bail sera diminué. ».",
+        "Le préavis est d'un mois.",
+    ]
+
+
+def test_selon_larticle_en_tete_est_retire():
+    texte = "Selon l’article 3 de la loi Hoguet, les activités exigent une carte professionnelle."
+    assert _decouper_en_affirmations(texte) == [
+        "les activités exigent une carte professionnelle."
+    ]
+
+
+def test_reference_selon_entre_parentheses_est_retiree():
+    texte = "Les personnes physiques (selon l'article 3 de la loi Hoguet) justifient d'une garantie."
+    assert _decouper_en_affirmations(texte) == [
+        "Les personnes physiques justifient d'une garantie."
+    ]
+
+
+def test_parenthese_qui_nest_pas_une_reference_est_gardee():
+    texte = "Le préavis est d'un mois (régime du titre Ier bis de la loi du 6 juillet 1989)."
+    assert _decouper_en_affirmations(texte) == [texte]
+
+
 def test_article_sujet_de_la_phrase_nest_pas_retire():
     texte = "L'article 19 concerne l'hypothèque légale."
     assert _decouper_en_affirmations(texte) == [texte]
@@ -1239,3 +1179,201 @@ def test_completude_a_verifier_article_de_regime_particulier():
 def test_completude_a_verifier_reponse_ordinaire_ou_refus():
     assert completude_a_verifier(_reponse_plafond_majore(), [_ARTICLE_156]) is False
     assert completude_a_verifier(ReponseGeneree(refus=True, motif="x"), [_ARTICLE_156]) is False
+
+
+def test_decoupage_garde_le_guillemet_fermant_avec_sa_phrase():
+    # q55 : « … louée. » (article 1724 du code civil). laissait « » (article …) » seul.
+    texte = "Principe : « Le preneur doit les souffrir. » (article 1724 du code civil). Suite du texte."
+    assert _decouper_en_affirmations(texte) == [
+        "Principe : « Le preneur doit les souffrir. ».",
+        "Suite du texte.",
+    ]
+
+
+def test_decoupage_ignore_intertitres_en_gras_et_questions():
+    # q54 : intertitres gras numérotés et question rhétorique, sans contenu à vérifier.
+    texte = (
+        "**Non.** L'agent ne peut pas encaisser l'acompte.\n\n"
+        "**2. Interdiction de recevoir des fonds**\n"
+        "Les personnes habilitées ne peuvent pas recevoir de fonds.\n\n"
+        "**3. Qui peut encaisser l'acompte ?**\n"
+        "Le titulaire de la carte peut être autorisé à recevoir des fonds."
+    )
+    assert _decouper_en_affirmations(texte) == [
+        "L'agent ne peut pas encaisser l'acompte.",
+        "Les personnes habilitées ne peuvent pas recevoir de fonds.",
+        "Le titulaire de la carte peut être autorisé à recevoir des fonds.",
+    ]
+
+
+def test_decoupage_coupe_apres_le_guillemet_fermant_avant_une_nouvelle_phrase():
+    texte = "Selon l'article 1721, « Il est dû garantie. » De plus, le bailleur est tenu."
+    assert _decouper_en_affirmations(texte) == [
+        "« Il est dû garantie. »",
+        "De plus, le bailleur est tenu.",
+    ]
+
+
+def test_montant_deforme_bascule_en_refus():
+    # q48 (2026-10-23) : « 1 300 € » pour « 1 300 000 € », validé par le NLI.
+    article = _Resultat(
+        "code_impot",
+        "Supérieure à 800 000 € et inférieure ou égale à 1 300\n000 €\n0,50",
+        article="977",
+    )
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse="Le taux est de 0,5 % entre 800 001 € et 1 300 €.",
+        citations=[Citation(doc_id="code_impot", article="977", passage="Supérieure à 800 000 €")],
+    )
+    verdict = verifier_fidelite(reponse, [article], _NLIFixe(0.99), 0.5, 0.7)
+    assert verdict.refus is True
+    assert "1 300 €" in verdict.motif
+
+
+def test_montants_presents_dans_l_article_acceptes():
+    article = _Resultat(
+        "code_impot", "Supérieure à 800 000 € et inférieure ou égale à 1 300\n000 €\n0,50", article="977"
+    )
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse="Le taux est de 0,50 % entre 800 001 € et 1 300 000 €.",
+        citations=[Citation(doc_id="code_impot", article="977", passage="Supérieure à 800 000 €")],
+    )
+    assert verifier_fidelite(reponse, [article], _NLIFixe(0.99), 0.5, 0.7).refus is False
+
+
+_ARTICLE_41_12 = _Resultat(
+    "loi_1965",
+    "Par dérogation aux dispositions de l'article 17, les décisions, à l'exclusion de celles relatives\n"
+    "au vote du budget prévisionnel et à l'approbation des comptes, peuvent être prises à\n"
+    "l'unanimité des voix des copropriétaires à l'occasion d'une consultation écrite.",
+    article="41-12",
+)
+
+
+def _reponse_citant(passage: str) -> ReponseGeneree:
+    return ReponseGeneree(
+        refus=False,
+        reponse="Le budget est voté en assemblée.",
+        citations=[Citation(doc_id="loi_1965", article="41-12", passage=passage)],
+    )
+
+
+def test_citation_amputee_dune_incise_est_remplacee_par_la_phrase_entiere():
+    # q20 (2026-10-22) : « et à l'approbation des comptes » retiré au milieu.
+    passage = (
+        "Par dérogation aux dispositions de l'article 17, les décisions, **à l'exclusion de celles "
+        "relatives au vote du budget prévisionnel**, peuvent être prises à l'unanimité des voix des "
+        "copropriétaires à l'occasion d'une consultation écrite."
+    )
+    reparee = reparer_citations(_reponse_citant(passage), [_ARTICLE_41_12])
+    assert "et à l'approbation des comptes" in reparee.citations[0].passage
+    assert not verifier_citations(reparee, [_ARTICLE_41_12]).refus
+
+
+def test_citation_qui_ajoute_un_mot_nest_pas_reparee():
+    passage = (
+        "Par dérogation aux dispositions de l'article 17, les décisions, y compris celles relatives "
+        "au vote du budget prévisionnel, peuvent être prises à l'unanimité des voix."
+    )
+    reparee = reparer_citations(_reponse_citant(passage), [_ARTICLE_41_12])
+    assert reparee.citations[0].passage == passage
+
+
+def test_fragment_trop_court_nest_pas_repare():
+    passage = "les décisions peuvent être prises à l'unanimité"
+    reparee = reparer_citations(_reponse_citant(passage), [_ARTICLE_41_12])
+    assert reparee.citations[0].passage == passage
+
+
+def test_ligature_oe_citee_retrouvee_dans_larticle_ecrit_oe():
+    # q25 (2026-10-06) : « mise en œuvre » cité, « mise en oeuvre » dans l'article.
+    article = _Resultat("loi_1965", "L'opposition vaut mise en oeuvre de l'hypothèque légale.", article="20")
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse="L'opposition vaut hypothèque.",
+        citations=[Citation(doc_id="loi_1965", article="20", passage="L'opposition vaut mise en œuvre de l'hypothèque légale.")],
+    )
+    assert not verifier_citations(reponse, [article]).refus
+
+
+def test_introduction_et_element_denumeration_recolles_sont_retrouves():
+    # q17 : l'introduction et le 2° sont exacts, mais séparés dans l'article par le 1°.
+    article = _Resultat(
+        "loi_1989",
+        "Le commandement de payer contient, à peine de nullité :\n"
+        "1° La mention que le locataire dispose d'un délai de six semaines ;\n"
+        "2° Le montant mensuel du loyer et des charges ;",
+        article="24",
+    )
+    passage = "Le commandement de payer contient, à peine de nullité : 2° Le montant mensuel du loyer et des charges ;"
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse="Le commandement indique le loyer.",
+        citations=[Citation(doc_id="loi_1989", article="24", passage=passage)],
+    )
+    assert not verifier_citations(reponse, [article]).refus
+
+
+def test_element_denumeration_altere_reste_refuse():
+    article = _Resultat(
+        "loi_1989",
+        "Le commandement de payer contient, à peine de nullité :\n2° Le montant mensuel du loyer et des charges ;",
+        article="24",
+    )
+    passage = "Le commandement de payer contient, à peine de nullité : 2° Le montant annuel des dépôts versés ;"
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse="Le commandement indique les dépôts.",
+        citations=[Citation(doc_id="loi_1989", article="24", passage=passage)],
+    )
+    assert verifier_citations(reponse, [article]).refus
+
+
+def test_exemple_chiffre_et_sa_liste_sont_retires():
+    # q48 (2026-10-22) : exemple de calcul inventé, refusé pour « 1 500 000 € ».
+    texte = (
+        "Le taux est de 0,50 % entre 800 000 € et 1 300 000 €.\n\n"
+        "**Exemple de calcul** (pour un patrimoine de **1 500 000 €**) :\n"
+        "- **0 %** sur les **800 000 €** premiers.\n"
+        "- **0,50 %** sur la tranche de **500 000 €**.\n\n"
+        "Le barème s'applique à la valeur nette."
+    )
+    assert retirer_exemples(texte) == (
+        "Le taux est de 0,50 % entre 800 000 € et 1 300 000 €.\n\n"
+        "Le barème s'applique à la valeur nette."
+    )
+
+
+def test_sous_element_exemple_ne_retire_pas_lelement_suivant():
+    # q13 : « 2. » après un sous-élément « - Exemple : » est une autre règle.
+    texte = (
+        "1. **Reprise** : le bailleur justifie sa décision.\n"
+        "   - Exemple : reprise pour une mutation.\n\n"
+        "2. **Vente par lots** : le bail peut être reconduit."
+    )
+    assert retirer_exemples(texte) == (
+        "1. **Reprise** : le bailleur justifie sa décision.\n\n"
+        "2. **Vente par lots** : le bail peut être reconduit."
+    )
+
+
+def test_par_exemple_au_fil_de_la_phrase_est_garde():
+    texte = "Le préavis est réduit, par exemple en cas de mutation professionnelle."
+    assert retirer_exemples(texte) == texte
+
+
+def test_reponse_faite_seulement_dun_exemple_reste_entiere():
+    reponse = ReponseGeneree(refus=False, reponse="**Exemple** : un loyer de 1 000 €.", citations=[])
+    assert sans_exemples(reponse).reponse == reponse.reponse
+
+
+def test_introduction_avec_sujet_reste_rattachee():
+    texte = "Le locataire doit :\n- payer le loyer."
+    assert _decouper_en_affirmations(texte) == ["Le locataire doit notamment : payer le loyer."]
+
+
+def test_notamment_nest_pas_double():
+    texte = "Elle permet notamment :\n- de résilier le bail."
+    assert _decouper_en_affirmations(texte) == ["Elle permet notamment : de résilier le bail."]

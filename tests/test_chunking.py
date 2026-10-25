@@ -149,3 +149,21 @@ Un abattement de 30 % s'applique : il couvre les charges."""
     contenus = {c.article: c.content for c in chunks}
     assert contenus["31"].endswith("sous déduction des charges.")
     assert contenus["32"].endswith("il couvre les charges.")
+
+
+def test_mentions_de_version_sont_retirees_du_texte():
+    texte = (
+        "Article 4\n"
+        "VERSION EN VIGUEUR DEPUIS LE 25/11/2018\n"
+        "Modifié par LOI n°2018-1021 du 23 novembre 2018 - art. 156\n"
+        "Toute personne habilitée justifie d'une compétence professionnelle.\n"
+    )
+    (chunk,) = decouper_en_articles(texte, "loi")
+    assert chunk.content == "Article 4\nToute personne habilitée justifie d'une compétence professionnelle."
+
+
+def test_article_qui_modifie_une_autre_loi_garde_son_contenu():
+    # Loi de 1989, art. 26 : « Modifie Loi n°86-1290… » est le contenu même de l'article.
+    texte = "Article 26\nModifie Loi n°86-1290 du 23 décembre 1986 - art. 25 (M)\n"
+    (chunk,) = decouper_en_articles(texte, "loi")
+    assert "Modifie Loi n°86-1290" in chunk.content

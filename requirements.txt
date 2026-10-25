@@ -32,5 +32,5 @@ transformers
 
 # LLM du contextual retrieval et de la génération de réponse (Groq, gratuit)
 groq
-# Appels HTTP à Mistral, relais gratuit de Groq (déjà apporté par groq)
+# Appels HTTP directs (juge Kimi de eval/kimi.py ; déjà apporté par groq)
 httpx

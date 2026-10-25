@@ -23,7 +23,6 @@ Contenu du fichier :
 - ReponseGeneree : la réponse rédigée, ou un refus motivé, avec ses citations.
 - LLM : contrat commun aux fournisseurs de modèle de langage.
 - GroqLLM : implémentation Groq (gratuite, par défaut).
-- MistralLLM : implémentation Mistral (gratuite), relais quand Groq est épuisé.
 - ModeleIndisponible : erreur d'un modèle saturé ou momentanément en panne.
 - LLMEnCascade : passe au modèle suivant quand le premier est saturé.
 - get_llm : sélectionne l'implémentation selon .env.
@@ -219,76 +218,6 @@ class QuotaJournalierEpuise(ModeleIndisponible):
     n'y change rien, il ne répondra plus avant des heures."""
 
 
-# Offre gratuite Mistral : seuls les modèles « ministral » y répondent
-# (ministral-14b : 30 requêtes par minute, mesuré le 2026-10-06 ; large,
-# medium et small refusés ou à 0 requête). Une requête refusée pour débit
-# est réessayée après une demi-minute.
-MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
-MISTRAL_ATTENTE_SECONDES = 31.0
-# Plafond de réponse plus haut que pour Groq : ministral-14b rédige plus
-# long, et 1024 tokens coupaient la réponse en pleine citation (JSON
-# illisible, constaté sur q14 le 2026-10-06). Le débit Mistral le permet.
-MISTRAL_MAX_TOKENS = 2048
-
-
-class MistralLLM(LLM):
-    """Implémentation Mistral (offre gratuite) : relais de Groq dans la
-    cascade, quand les quotas Groq du jour sont consommés (constaté le
-    2026-10-06 : évaluation du golden interrompue à 8 questions sur 35).
-
-    Appel HTTP direct à l'API (même forme que Groq : messages, réponse JSON),
-    sans bibliothèque dédiée. dormir est remplaçable dans les tests."""
-
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        max_essais: int = GROQ_MAX_ESSAIS,
-        client=None,
-        dormir=None,
-    ):
-        import time
-
-        import httpx
-
-        self._client = client or httpx.Client(timeout=120.0)
-        self._cle = api_key
-        self._model = model
-        self._max_essais = max_essais
-        self._dormir = dormir or time.sleep
-        self.nom = f"mistral/{model}"
-
-    def generer(self, consigne: str, question: str) -> str:
-        import httpx
-
-        corps = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": consigne},
-                {"role": "user", "content": question},
-            ],
-            "temperature": 0.0,
-            "response_format": _format_reponse_mistral(consigne),
-            "max_tokens": MISTRAL_MAX_TOKENS,
-        }
-        for essai in range(self._max_essais + 1):
-            try:
-                reponse = self._client.post(
-                    MISTRAL_URL, json=corps, headers={"Authorization": f"Bearer {self._cle}"}
-                )
-            except httpx.HTTPError as exc:
-                raise ModeleIndisponible(f"{self.nom} : {exc}") from exc
-            # 429 : débit dépassé ; 5xx : panne passagère.
-            if reponse.status_code == 429 or reponse.status_code >= 500:
-                if essai < self._max_essais:
-                    self._dormir(MISTRAL_ATTENTE_SECONDES)
-                    continue
-                raise ModeleIndisponible(f"{self.nom} : {reponse.status_code} {reponse.text[:200]}")
-            reponse.raise_for_status()
-            return reponse.json()["choices"][0]["message"]["content"]
-        raise ModeleIndisponible(f"{self.nom} : aucun essai")
-
-
 class LLMEnCascade(LLM):
     """Répartit les appels sur plusieurs modèles pour contourner le quota.
 
@@ -303,18 +232,11 @@ class LLMEnCascade(LLM):
     2026-10-03 : quota journalier du juge gpt-oss-120b consommé).
     """
 
-    def __init__(
-        self, modeles: list[LLM], derniers_recours: list[LLM], secours: LLM | None = None
-    ):
+    def __init__(self, modeles: list[LLM], derniers_recours: list[LLM]):
         if len(modeles) != len(derniers_recours):
             raise ValueError("un dernier recours par modèle de la cascade")
         self._modeles = modeles
         self._derniers_recours = derniers_recours
-        # Secours (Mistral) : appelé seulement quand aucun modèle ne répond,
-        # même après attente. Placé dans la cascade, il prenait la main à
-        # chaque saturation d'une minute de Groq et rédigeait des réponses
-        # plus faibles (q15, q25 refusées, constaté le 2026-10-11).
-        self._secours = secours
         # Modèles qui ont effectivement répondu, dans l'ordre des appels : les
         # modèles ne jugent pas tous pareil, l'évaluation doit savoir lequel a
         # tranché (run_eval.py).
@@ -333,18 +255,9 @@ class LLMEnCascade(LLM):
                 continue
         for rang, recours in enumerate(self._derniers_recours):
             if rang not in epuises:
-                try:
-                    brut = recours.generer(consigne, question)
-                except ModeleIndisponible:
-                    if self._secours is None:
-                        raise
-                    break
+                brut = recours.generer(consigne, question)
                 self.historique.append(f"{getattr(recours, 'nom', '?')} (attente)")
                 return brut
-        if self._secours is not None:
-            brut = self._secours.generer(consigne, question)
-            self.historique.append(f"{getattr(self._secours, 'nom', '?')} (secours)")
-            return brut
         raise QuotaJournalierEpuise("quota du jour épuisé pour tous les modèles")
 
 
@@ -353,9 +266,11 @@ def get_llm(settings: Settings, premier: str | None = None) -> LLM:
 
     Avec des modèles de relais (llm_modeles_relais), les appels passent par
     une cascade : llm_model d'abord, puis les relais dans l'ordre. premier
-    place un autre modèle en tête (cf. get_llm_juge). Avec MISTRAL_API_KEY,
-    Mistral sert de secours : il ne répond que si Groq échoue même après
-    attente (quota du jour épuisé).
+    place un autre modèle en tête (cf. get_llm_juge). Quand le quota du jour
+    est épuisé partout, l'appel échoue (QuotaJournalierEpuise) : l'ancien
+    secours Mistral (ministral-14b) a été retiré le 2026-10-23, ses réponses
+    n'étaient acceptées qu'à 48 % contre 87 % pour gpt-oss-20b (traces du
+    golden) — mieux vaut pas de réponse qu'une réponse dégradée.
     """
     if settings.llm_provider == "groq":
         if not settings.groq_api_key:
@@ -365,14 +280,9 @@ def get_llm(settings: Settings, premier: str | None = None) -> LLM:
         noms = list(dict.fromkeys([tete, settings.llm_model, *settings.llm_modeles_relais]))
         modeles: list[LLM] = [GroqLLM(cle, nom, max_essais=0) for nom in noms]
         recours: list[LLM] = [GroqLLM(cle, nom) for nom in noms]
-        secours = (
-            MistralLLM(settings.mistral_api_key, settings.mistral_model)
-            if settings.mistral_api_key
-            else None
-        )
-        if len(modeles) == 1 and secours is None:
+        if len(modeles) == 1:
             return GroqLLM(cle, tete)
-        return LLMEnCascade(modeles, derniers_recours=recours, secours=secours)
+        return LLMEnCascade(modeles, derniers_recours=recours)
     raise ValueError(f"Fournisseur LLM inconnu : {settings.llm_provider}")
 
 
@@ -424,6 +334,52 @@ def _bloc_articles(
     return "\n\n".join(blocs)
 
 
+# Ligne qui ouvre un exemple rédigé par le modèle : « Exemple : », « **Exemple
+# concret** : », « ### Exemple de calcul », en tête de ligne ou de puce.
+_LIGNE_EXEMPLE = re.compile(r"^\s*(?:#{1,6}\s*|[-*•]\s+)?(?:\*\*|__)?\s*exemples?\b", re.IGNORECASE)
+
+
+def retirer_exemples(texte: str) -> str:
+    """Retire de la réponse les exemples que le rédacteur invente pour
+    illustrer (« Exemple concret : si le dépôt de 1 000 €… »), avec la liste
+    qui les détaille.
+
+    Un exemple chiffré ne vient d'aucun article : il n'a pas de source à
+    citer, et le garde-fou refusait la réponse entière à cause de lui
+    (montant absent des articles, ou juge). Mesuré le 2026-10-24 sur les
+    traces : 18 réponses sur 696 contenaient un exemple, 13 refusées (72 %).
+    Le retirer, sans rien réécrire, garde la règle sourcée et seulement elle.
+    Un « par exemple » au fil d'une phrase n'est pas touché."""
+    lignes = texte.splitlines()
+    gardees: list[str] = []
+    i = 0
+    while i < len(lignes):
+        if not _LIGNE_EXEMPLE.match(lignes[i]):
+            gardees.append(lignes[i])
+            i += 1
+            continue
+        # La ligne d'exemple, puis ses détails : les lignes plus en retrait
+        # qu'elle, et, si elle annonce une liste (« Exemple de calcul : »), les
+        # puces qui suivent. Un élément numéroté au même niveau est une autre
+        # règle et reste (q13 : « 2. En cas de vente par lots… » après un
+        # sous-élément « - Exemple : … », retiré à tort sinon).
+        retrait = len(lignes[i]) - len(lignes[i].lstrip())
+        annonce_liste = _GRAS.sub("", lignes[i]).rstrip().endswith(":")
+        i += 1
+        while i < len(lignes):
+            ligne = lignes[i]
+            if not ligne.strip():
+                suite = next((x for x in lignes[i + 1 :] if x.strip()), "")
+                if not (annonce_liste and re.match(r"\s*[-*•]\s", suite)):
+                    break
+            elif len(ligne) - len(ligne.lstrip()) <= retrait and not (
+                annonce_liste and re.match(r"\s*[-*•]\s", ligne)
+            ):
+                break
+            i += 1
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(gardees)).strip()
+
+
 def _lire_reponse(brut: str) -> ReponseGeneree:
     """Transforme la réponse JSON du modèle en ReponseGeneree.
 
@@ -433,11 +389,24 @@ def _lire_reponse(brut: str) -> ReponseGeneree:
     """
     try:
         donnees = json.loads(brut)
-        return ReponseGeneree.model_validate(donnees)
+        reponse = ReponseGeneree.model_validate(donnees)
     except (json.JSONDecodeError, ValidationError, TypeError):
         return ReponseGeneree(
             refus=True, motif="réponse du modèle illisible ou non conforme"
         )
+    return sans_exemples(reponse)
+
+
+def sans_exemples(reponse: ReponseGeneree) -> ReponseGeneree:
+    """La réponse privée de ses exemples (retirer_exemples). Une réponse qui
+    n'était qu'un exemple reste entière : vide, elle n'aurait plus aucune
+    affirmation à vérifier et passerait le garde-fou."""
+    if reponse.refus:
+        return reponse
+    texte = retirer_exemples(reponse.reponse)
+    if not re.search(r"\w", texte):
+        return reponse
+    return reponse.model_copy(update={"reponse": texte})
 
 
 def generer_reponse(
@@ -486,13 +455,21 @@ _SIMILARITE_FAUTE_DE_FRAPPE = 0.8
 _MARGE_APPROX = 20
 
 # Points de suspension par lesquels le modèle abrège une citation : « ... »,
-# « … » ou « [...] ».
-_ELLIPSE = re.compile(r"\[?(?:\.{3}|…)\]?")
+# « … » ou « [...] ». Une citation qui recolle l'introduction d'une
+# énumération et l'un de ses éléments (« … à peine de nullité : 2° Le montant
+# … »), ou plusieurs éléments sur plusieurs lignes, est coupée de même : chaque
+# morceau doit figurer dans l'article, dans l'ordre. Ces citations exactes par
+# morceaux étaient refusées (q17, q14, q22, traces de 2026-10-03 à 2026-10-06).
+_ELLIPSE = re.compile(r"\[?(?:\.{3}|…)\]?|\n+|(?<=:)\s+(?=\d+\s*°|[a-z]\)|[-–•])")
 
 
 def _normaliser(texte: str) -> str:
     """Ramène un texte à une forme comparable : sans accents, en minuscules,
     ponctuation et espaces multiples réduits à une espace simple."""
+    # La ligature « œ » ne se décompose pas : « mise en œuvre » cité contre
+    # « mise en oeuvre » dans l'article faisait refuser une citation exacte
+    # (q25, 2026-10-06).
+    texte = texte.replace("œ", "oe").replace("Œ", "OE").replace("æ", "ae").replace("Æ", "AE")
     sans_accents = "".join(
         c for c in unicodedata.normalize("NFKD", texte) if not unicodedata.combining(c)
     )
@@ -621,6 +598,62 @@ def _phrase_la_plus_proche(citation: Citation, resultats: list[_ResultatRecherch
     )
 
 
+# Une citation tronquée n'est remplacée par la phrase entière de l'article que
+# si elle en garde l'essentiel : assez de mots, et au moins cette part de la
+# phrase d'origine.
+_MOTS_MIN_TRONQUEE = 8
+_PART_MIN_TRONQUEE = 0.6
+
+
+def _sous_suite(mots: list[str], phrase: list[str]) -> bool:
+    """Les mots de la citation figurent-ils dans la phrase, dans le même ordre,
+    seuls des mots ayant été retirés ?"""
+    reste = iter(phrase)
+    return all(mot in reste for mot in mots)
+
+
+def _phrase_entiere(citation: Citation, resultats: list[_ResultatRecherche]) -> str | None:
+    """Phrase de l'article dont la citation n'est qu'une version amputée de
+    quelques mots, ou None."""
+    mots = _normaliser(citation.passage).split()
+    if len(mots) < _MOTS_MIN_TRONQUEE:
+        return None
+    for r in _articles_candidats(citation, resultats):
+        for _, phrase in _phrases_source(r.content):
+            cible = _normaliser(phrase).split()
+            if len(mots) >= _PART_MIN_TRONQUEE * len(cible) and _sous_suite(mots, cible):
+                # Numéro de page du PDF collé en tête (« 34 Par dérogation… »).
+                return re.sub(r"^\d+\s+(?=[A-ZÀ-Ý])", "", phrase)
+    return None
+
+
+def reparer_citations(
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    seuil: float = SEUIL_CITATION,
+) -> ReponseGeneree:
+    """Remplace une citation amputée de quelques mots par la phrase entière de
+    l'article, sans appel de modèle.
+
+    Le rédacteur retire parfois une incise au milieu d'une phrase citée
+    (« les décisions, à l'exclusion de celles relatives au vote du budget
+    prévisionnel [et à l'approbation des comptes], peuvent… », q20, refusée
+    entière le 2026-10-22). Afficher la phrase complète montre à l'utilisateur
+    le vrai texte de loi ; les affirmations de la réponse restent vérifiées
+    ensuite (NLI, juge) contre les articles. Une citation qui ajoute ou change
+    des mots n'est pas réparée ici."""
+    if reponse.refus:
+        return reponse
+    introuvables = citations_introuvables(reponse, resultats, seuil)
+    if not introuvables:
+        return reponse
+    citations = []
+    for c in reponse.citations:
+        entiere = _phrase_entiere(c, resultats) if c in introuvables else None
+        citations.append(c.model_copy(update={"passage": entiere}) if entiere else c)
+    return reponse.model_copy(update={"citations": citations})
+
+
 def corriger_citations(
     question: str,
     resultats: list[_ResultatRecherche],
@@ -643,6 +676,7 @@ def corriger_citations(
     """
     if reponse.refus:
         return reponse
+    reponse = reparer_citations(reponse, resultats, seuil)
     introuvables = citations_introuvables(reponse, resultats, seuil)
     if not introuvables:
         return reponse
@@ -706,7 +740,14 @@ def verifier_citations(
 # par le juge (mesuré sur q03, q14, q22, q28 le 2026-10-03). De même pour
 # « ex. » et « cf. » : « (ex. emploi, santé) » coupé laissait une affirmation
 # finissant par « (ex. », refusée par le juge (q02 juste refusée, 2026-10-22).
-_SEPARATEUR_PHRASE = re.compile(r"(?<=[.!?])(?<!\b[LRDA]\.)(?<!\bart\.)(?<!\bex\.)(?<!\bcf\.)\s+")
+# Une phrase citée entre guillemets finit avant le guillemet fermant : couper
+# là laissait « » (article 1724 du code civil). » seul, refusé par le juge
+# (q55 juste refusée, 2026-10-23) ; la coupe se fait après lui quand une
+# nouvelle phrase commence (« … louée. » De plus, … »).
+_SEPARATEUR_PHRASE = re.compile(
+    r"(?<=[.!?])(?<!\b[LRDA]\.)(?<!\bart\.)(?<!\bex\.)(?<!\bcf\.)\s+(?![»”\"])"
+    r"|(?<=[.!?]\s[»”\"])\s+(?=[«\"A-ZÀ-Ý])"
+)
 # Début d'un élément de liste : « 1. », « 2) », « a. », « b) », « - », « • », « * ».
 # Sans les lettres, « a. Le locataire … » était coupé en deux phrases et « a. »
 # devenait une affirmation refusée par le juge (q03, 2026-10-14).
@@ -722,6 +763,12 @@ _GRAS = re.compile(r"\*\*|__")
 _ITALIQUE = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
 # Un titre (« ## Règle ») n'affirme rien : la ligne est retirée entière.
 _TITRE = re.compile(r"^[ \t]*#{1,6}[ \t].*$", re.MULTILINE)
+# Intertitre écrit en gras sur sa propre ligne, numéroté ou non
+# (« **2. Interdiction de recevoir des fonds** ») : un titre aussi, retiré
+# avant le gras. Vérifié comme une affirmation, il faisait refuser une réponse
+# juste (q54, rédigée par Kimi, 2026-10-23). Un intertitre qui finit par « : »
+# introduit une liste et reste en place.
+_TITRE_GRAS = re.compile(r"^[ \t]*(?:\d+[.)][ \t]*)?\*\*[^*\n]*[^*:\s]\*\*[ \t]*$", re.MULTILINE)
 # « Oui, » / « Non. » en tête de réponse : une réaction à la question, pas une
 # affirmation que le texte source pourrait impliquer.
 _OUI_NON = re.compile(r"^(?:oui|non)\s*[,.:]\s*", re.IGNORECASE)
@@ -733,6 +780,21 @@ _ATTRIBUTION = re.compile(
     r"^(?:(?:par ailleurs|en effet|de plus|en outre|ainsi|enfin)\s*,\s*)?"
     r"l['’]article\s+[^,«»]{1,60}?\s+"
     r"(?:précise|dispose|prévoit|indique|énonce|ajoute|stipule)\s+qu(?:e\s+|['’])",
+    re.IGNORECASE,
+)
+# Même raison pour une référence entre parenthèses (« (article 1724 du code
+# civil) », « (art. 6-2) », « (selon l'article 3 de la loi Hoguet) ») ou en tête de
+# phrase (« Selon l'article 3 de la loi Hoguet, ») : mesuré le 2026-10-24, la
+# phrase exacte de l'article 1724 est impliquée à 1,00, la même suivie de
+# « (article 1724 du code civil) » à 0,00 — le NLI exige que l'extrait dise
+# aussi « code civil ». Sur le golden du 2026-10-23, ces références envoyaient
+# au juge LLM des affirmations recopiées de l'article.
+_REFERENCE_ENTRE_PARENTHESES = re.compile(
+    r"\s*\((?:[\w-]+\s*,\s*|(?:selon|cf\.|voir)\s+l?['’]?)?(?:articles?|art\.)\s+[^()]{1,80}\)",
+    re.IGNORECASE
+)
+_SELON_ARTICLE = re.compile(
+    r"^(?:selon|d['’]après|aux termes de|conformément à)\s+l['’]article\s+[^,«»]{1,80},\s*",
     re.IGNORECASE,
 )
 # Fragments qui n'affirment rien et que la découpe en phrases isole : un
@@ -830,74 +892,30 @@ ou, si elle est trompeuse :
 "manque": "<la règle générale omise, en une phrase, avec son article>"}"""
 
 
-# Schémas JSON imposés à Mistral. Le simple mode JSON ne suffit pas :
-# ministral-14b rendait « reponse » sous forme d'objet imbriqué (un cas par
-# régime) au lieu d'un texte, et la réponse, trop longue, était coupée en
-# plein JSON (constaté sur q01 le 2026-10-06). Le schéma strict fixe la
-# forme exacte attendue par _lire_reponse et _juger_fidelite.
-_SCHEMA_REPONSE = {
-    "type": "object",
-    "properties": {
-        "refus": {"type": "boolean"},
-        "motif": {"type": "string"},
-        "reponse": {"type": "string"},
-        "citations": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "doc_id": {"type": "string"},
-                    "article": {"type": "string"},
-                    "passage": {"type": "string"},
-                },
-                "required": ["doc_id", "article", "passage"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["refus", "motif", "reponse", "citations"],
-    "additionalProperties": False,
-}
-
-_SCHEMA_JUGE = {
-    "type": "object",
-    "properties": {"fondees": {"type": "array", "items": {"type": "boolean"}}},
-    "required": ["fondees"],
-    "additionalProperties": False,
-}
-
-
-_SCHEMA_COMPLETUDE = {
-    "type": "object",
-    "properties": {
-        "complete": {"type": "boolean"},
-        "regle_generale": {"type": "string"},
-        "manque": {"type": "string"},
-    },
-    "required": ["complete", "regle_generale", "manque"],
-    "additionalProperties": False,
-}
-
-
-def _format_reponse_mistral(consigne: str) -> dict:
-    """Format de réponse demandé à Mistral selon la consigne : schéma strict
-    pour les formats connus, simple mode JSON sinon."""
-    schemas = {
-        CONSIGNE: ("reponse", _SCHEMA_REPONSE),
-        CONSIGNE_JUGE_FIDELITE: ("juge", _SCHEMA_JUGE),
-        CONSIGNE_COMPLETUDE: ("completude", _SCHEMA_COMPLETUDE),
-    }
-    if consigne not in schemas:
-        return {"type": "json_object"}
-    nom, schema = schemas[consigne]
-    return {"type": "json_schema", "json_schema": {"name": nom, "schema": schema, "strict": True}}
-
-
 class _NLI(Protocol):
     """Partie d'un fournisseur NLI utilisée ici : les scores d'implication et
     de contradiction d'extraits de texte source face à une affirmation."""
 
     def evaluer(self, premisses: list[str], hypothese: str) -> list[ScoreNLI]: ...
+
+
+def _rattacher(introduction: str | None, element: str) -> str:
+    """Élément de liste précédé de l'introduction qui lui donne son sujet.
+
+    « notamment » n'est pas répété quand l'introduction le porte déjà
+    (« Elle permet notamment notamment : », vu dans les traces).
+
+    Un intitulé sans sujet (« Cas particuliers », « Précautions ») reste
+    rattaché, bien qu'il fasse chuter le NLI sur une phrase exacte (1,00 →
+    0,00) : essayé le 2026-10-24, l'élément seul a été validé par le NLI
+    sans juge alors qu'il était faux (q56 : préavis du locataire « 3 ou 6
+    mois », le délai de 6 mois est celui du bailleur) ou sans sujet (q28 :
+    « Gestion immobilière. »). Mieux vaut un appel au juge de trop."""
+    if not introduction:
+        return element
+    if re.search(r"\bnotamment$", introduction, re.IGNORECASE):
+        return f"{introduction} : {element}"
+    return f"{introduction} notamment : {element}"
 
 
 def _decouper_en_affirmations(texte: str) -> list[str]:
@@ -920,7 +938,7 @@ def _decouper_en_affirmations(texte: str) -> list[str]:
     exacts même quand l'un d'eux était faux (mesuré sur q22 le 2026-10-03 :
     implication 0,99 pour trois missions dont une prêtée à tort au syndic).
     """
-    texte = _TITRE.sub("", _ITALIQUE.sub(r"\1", _GRAS.sub("", texte)))
+    texte = _TITRE.sub("", _ITALIQUE.sub(r"\1", _GRAS.sub("", _TITRE_GRAS.sub("", texte))))
     affirmations: list[str] = []
     introduction: str | None = None
     # Introduction de la liste principale, rétablie après une sous-liste.
@@ -944,8 +962,7 @@ def _decouper_en_affirmations(texte: str) -> list[str]:
                     # et n'affirme rien seule (q16, refus à tort le 2026-10-05).
                     sous_introduction = phrase[:-1].strip()
                     continue
-                avec_introduction = introduction and rang == 0
-                affirmations.append(f"{introduction} notamment : {phrase}" if avec_introduction else phrase)
+                affirmations.append(_rattacher(introduction, phrase) if rang == 0 else phrase)
             if sous_introduction:
                 introduction = sous_introduction
             continue
@@ -958,10 +975,20 @@ def _decouper_en_affirmations(texte: str) -> list[str]:
                 continue
             introduction = introduction_principale = None
             affirmations.append(phrase)
-    affirmations = [_ATTRIBUTION.sub("", _OUI_NON.sub("", a)).strip() for a in affirmations]
+    affirmations = [
+        _REFERENCE_ENTRE_PARENTHESES.sub(
+            "", _SELON_ARTICLE.sub("", _ATTRIBUTION.sub("", _OUI_NON.sub("", a)))
+        ).strip()
+        for a in affirmations
+    ]
     # Une ligne faite seulement de ponctuation (un guillemet fermant « » »)
-    # n'affirme rien.
-    return [a for a in affirmations if re.search(r"\w", a) and not _SANS_CONTENU.match(a)]
+    # n'affirme rien, une question non plus (« Qui peut encaisser l'acompte ? »,
+    # q54, 2026-10-23).
+    return [
+        a
+        for a in affirmations
+        if re.search(r"\w", a) and not _SANS_CONTENU.match(a) and not a.endswith("?")
+    ]
 
 
 def _phrases_source(contexte: str) -> list[tuple[str | None, str]]:
@@ -1097,6 +1124,55 @@ def _juger_fidelite(
     return [f is True for f in fondees]
 
 
+# Montant de la réponse : nombre (chiffres groupés par trois avec une espace,
+# décimales après la virgule) suivi d'une unité monétaire ou de pourcentage.
+_ESPACE_CHIFFRES = r"[   ]"
+_MONTANT = re.compile(
+    rf"(?<![\d,])(\d{{1,3}}(?:{_ESPACE_CHIFFRES}\d{{3}})+|\d+)(?:,(\d+))?{_ESPACE_CHIFFRES}*"
+    r"(?:€|euros?\b|%|pour\s*cent)",
+    re.IGNORECASE,
+)
+# Nombre d'un article : les groupes de chiffres peuvent y être séparés par un
+# retour à la ligne de la mise en page PDF (« 1 300\n000 € »).
+_NOMBRE_SOURCE = re.compile(r"(?<![\d,])(\d{1,3}(?:\s\d{3})+|\d+)(?:,(\d+))?")
+
+
+def _valeur(entier: str, decimales: str | None) -> str:
+    """Forme comparable d'un nombre : chiffres sans espaces, décimales sans
+    zéros finaux (« 0,50 » et « 0,5 » se valent)."""
+    decimales = (decimales or "").rstrip("0")
+    return re.sub(r"\D", "", entier) + (f",{decimales}" if decimales else "")
+
+
+def _montant_inconnu(reponse: str, contextes: list[str]) -> str | None:
+    """Premier montant (€, %) de la réponse qu'aucun article cité ne contient.
+
+    Le NLI et le juge validaient des montants déformés : « supérieure à
+    1 300 € » pour « 1 300 000 € » dans le barème de l'IFI (q48, réponse
+    fausse acceptée le 2026-10-23). Une comparaison exacte des chiffres ne
+    laisse pas passer ce genre d'erreur. Mesuré hors ligne sur 570 réponses
+    acceptées des traces : 6 signalées, l'erreur de q48 et des montants
+    calculés par le rédacteur (« 6 % × 5 = 30 % »), qu'aucun article ne fonde.
+    Un montant égal à un nombre de l'article plus un est admis : « de
+    800 001 € à… » reformule « supérieure à 800 000 € ».
+
+    Ce contrôle tient lieu de consigne au rédacteur : la règle « recopie
+    chaque montant, n'en calcule aucun » le faisait refuser des questions
+    à taux (q42, 3 refus sur 3 avec la règle, 3 réponses sur 3 sans elle,
+    2026-10-24)."""
+    source: set[str] = set()
+    for contexte in contextes:
+        for m in _NOMBRE_SOURCE.finditer(contexte):
+            valeur = _valeur(m.group(1), m.group(2))
+            source.add(valeur)
+            if "," not in valeur:
+                source.add(str(int(valeur) + 1))
+    for m in _MONTANT.finditer(reponse):
+        if _valeur(m.group(1), m.group(2)) not in source:
+            return m.group(0).strip()
+    return None
+
+
 def verifier_fidelite(
     reponse: ReponseGeneree,
     resultats: list[_ResultatRecherche],
@@ -1143,6 +1219,11 @@ def verifier_fidelite(
         return reponse
 
     cites = _articles_cites(reponse, resultats)
+    inconnu = _montant_inconnu(reponse.reponse, [r.content for r in cites])
+    if inconnu:
+        return ReponseGeneree(
+            refus=True, motif=f"montant absent des articles cités : « {inconnu} »"
+        )
     extraits = _extraits([r.content for r in cites])
     # Extraits d'articles d'un régime particulier : une affirmation que le NLI
     # fonde sur l'un d'eux part au juge, seul à voir l'intitulé « Situé dans ».
@@ -1182,6 +1263,10 @@ def verifier_fidelite(
         fondees = _juger_fidelite(douteuses, texte_cite, llm, reponse.reponse)
     for affirmation, fondee in zip(douteuses, fondees):
         if not fondee:
+            # Pas de seconde rédaction sans l'affirmation rejetée : essayée le
+            # 2026-10-23 sur q42, q54, q56, elle a rendu deux réponses fausses
+            # acceptées (q54 : acompte permis après la vente ; q56 : délai du
+            # congé pour reprise appliqué à la vente). Un refus vaut mieux.
             return ReponseGeneree(
                 refus=True,
                 motif=f"affirmation non fondée sur les sources : « {affirmation} »",

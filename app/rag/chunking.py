@@ -123,6 +123,29 @@ def titre_document(texte: str) -> str:
     return resultat
 
 
+# Mention de version Légifrance placée sous le numéro d'article (« VERSION EN
+# VIGUEUR DEPUIS LE 27/03/2014 », « Modifié par LOI n°2014-366 du 24 mars 2014
+# - art. 24 (V) », « Création Ordonnance n°2019-1101… () JORF… ») : de
+# l'historique, pas du droit. Laissée dans le texte, elle occupe le début de
+# l'article, la partie que l'embedding (512 jetons) et le reclasseur lisent en
+# priorité, et se retrouve dans les extraits vérifiés par le NLI (300 articles
+# environ, mesuré le 2026-10-24).
+MENTION_VERSION = re.compile(
+    r"^(?:VERSION EN VIGUEUR\b.*"
+    r"|(?:Modifié par|Création|Créé par|Abrogé par|Transféré par|Rectifié par)\s+"
+    r"(?:LOI|Loi|Ordonnance|ORDONNANCE|Décret|DÉCRET|Décision|DÉCISION)\b.*)$"
+)
+
+
+def _sans_mentions_de_version(contenu: str) -> str:
+    """Retire les mentions de version qui suivent la ligne « Article … »."""
+    lignes = contenu.split("\n")
+    fin = 1
+    while fin < len(lignes) and MENTION_VERSION.match(lignes[fin].strip()):
+        fin += 1
+    return "\n".join(lignes[:1] + lignes[fin:])
+
+
 def _est_intitule_large(ligne: str) -> bool:
     """Vrai pour une ligne d'intitulé, y compris ceux des codes (INTITULE_LARGE)."""
     return bool(INTITULE.match(ligne)) or (
@@ -182,7 +205,7 @@ def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
             RawChunk(
                 doc_id=doc_id,
                 article=correspondance.group(1).strip(),
-                content=contenu_brut,
+                content=_sans_mentions_de_version(contenu_brut),
                 section=section_bloc,
                 titre=titre,
             )
