@@ -3,6 +3,5 @@
   "hit@3": {"min": 0.90},
   "hit@5": {"min": 0.94},
   "hit@10": {"min": 0.98},
-  "mrr": {"min": 0.78},
-  "hors_corpus_bloques": {"min": 0.25}
+  "mrr": {"min": 0.78}
 }

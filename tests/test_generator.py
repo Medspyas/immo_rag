@@ -5,6 +5,9 @@ import pytest
 
 from app.config import Settings
 from app.rag.generator import (
+    CONSIGNE_JUGE_EXCEPTION,
+    CONSIGNE_JUGE_FIDELITE,
+    CONSIGNE_JUGE_REPONSE_DIRECTE,
     GROQ_MAX_ESSAIS,
     LONGUEUR_MAX_CONTEXTE_CARACTERES,
     Citation,
@@ -16,6 +19,7 @@ from app.rag.generator import (
     _decouper_en_affirmations,
     _extraits,
     _preselectionner,
+    _retirer_affirmations,
     completude_a_verifier,
     corriger_citations,
     generer_reponse,
@@ -341,6 +345,14 @@ def test_la_section_de_larticle_est_transmise_au_modele():
     assert f"Situé dans : {section}" in llm.question_recue
 
 
+def test_le_titre_de_la_loi_est_transmis_au_modele():
+    llm = _LLMFake(_REPONSE_OK)
+    resultat = _Resultat("loi_06_07_1989", "Un logement meublé est un logement décent.", article="25-4")
+    resultat.metadata["titre"] = "Loi n° 89-462 du 6 juillet 1989"
+    generer_reponse("Question ?", [resultat], llm)
+    assert "Texte : Loi n° 89-462 du 6 juillet 1989" in llm.question_recue
+
+
 def test_le_bloc_darticles_sarrete_avant_de_depasser_le_budget():
     # Chaque article fait ~10 000 caractères : le 3e ferait dépasser le
     # budget de 24 000 (2 x ~10 030 = 20 060, + un 3e = 30 090) et doit donc
@@ -512,6 +524,19 @@ def test_seconde_chance_reste_dans_le_budget_de_caracteres():
     llm = _LLMFake(_REPONSE_OK)
     corriger_citations("Quel préavis ?", articles, llm, reponse)
     assert "Article 16" not in llm.question_recue
+    assert len(llm.question_recue) <= LONGUEUR_MAX_CONTEXTE_CARACTERES + 1_000
+
+
+def test_article_trop_long_reduit_aux_alineas_proches_de_la_question():
+    # t34 : l'art. 31 du CGI (51 800 caractères) dépassait seul le budget, la
+    # requête dépassait le plafond de Groq (413).
+    lignes = ["Article 31"] + [f"Alinéa sans rapport numéro {i} " + "x" * 500 for i in range(100)]
+    lignes.insert(60, "b) Les dépenses d'amélioration, à l'exclusion des travaux d'agrandissement ;")
+    long_ = _Resultat("code_impot", "\n".join(lignes), article="31")
+    llm = _LLMFake(_REPONSE_OK)
+    generer_reponse("Les travaux d'agrandissement sont-ils déductibles ?", [long_], llm)
+    assert "travaux d'agrandissement ;" in llm.question_recue
+    assert "[…]" in llm.question_recue
     assert len(llm.question_recue) <= LONGUEUR_MAX_CONTEXTE_CARACTERES + 1_000
 
 
@@ -729,15 +754,113 @@ class _NLISelonAffirmation:
         return [ScoreNLI(implication=implication, contradiction=0.0) for _ in premisses]
 
 
-def test_une_seule_affirmation_non_fondee_suffit_a_refuser():
-    reponse = _reponse_avec_citation(
-        "Le préavis est de trois mois. Le bailleur doit aussi verser une prime."
+def _verifier_sans_juge(texte: str) -> ReponseGeneree:
+    return verifier_fidelite(
+        _reponse_avec_citation(texte), [_ARTICLE_15], _NLISelonAffirmation(),
+        seuil_haut=0.7, seuil_contradiction=0.7,
     )
-    verifiee = verifier_fidelite(
-        reponse, [_ARTICLE_15], _NLISelonAffirmation(), seuil_haut=0.7, seuil_contradiction=0.7
-    )
+
+
+def test_affirmation_non_fondee_retiree_le_reste_garde():
+    verifiee = _verifier_sans_juge("Le préavis est de trois mois. Le bailleur doit aussi verser une prime.")
+    assert verifiee.refus is False
+    assert verifiee.reponse == "Le préavis est de trois mois."
+    assert verifiee.citations
+    assert "prime" in verifiee.motif
+
+
+def test_premiere_affirmation_non_fondee_fait_refuser():
+    # La première phrase porte la réponse directe : sans elle, plus de réponse.
+    verifiee = _verifier_sans_juge("Oui, le bailleur doit verser une prime. Le préavis est de trois mois.")
     assert verifiee.refus is True
     assert "prime" in verifiee.motif
+
+
+def test_toutes_les_affirmations_non_fondees_font_refuser():
+    verifiee = _verifier_sans_juge("Le bailleur doit verser une prime.")
+    assert verifiee.refus is True
+
+
+def test_element_de_liste_non_fonde_retire_avec_son_introduction_vide():
+    texte = (
+        "Le préavis est de trois mois.\n"
+        "À noter :\n"
+        "- Le bailleur doit verser une prime.\n"
+        "Le préavis de trois mois court à réception."
+    )
+    verifiee = _verifier_sans_juge(texte)
+    assert verifiee.refus is False
+    assert verifiee.reponse == "Le préavis est de trois mois.\nLe préavis de trois mois court à réception."
+
+
+def test_element_de_liste_non_fonde_retire_les_autres_gardes():
+    texte = (
+        "Le préavis est de trois mois.\n"
+        "Les règles sont :\n"
+        "- un préavis de trois mois ;\n"
+        "- une prime au bailleur."
+    )
+    verifiee = _verifier_sans_juge(texte)
+    assert verifiee.reponse == "Le préavis est de trois mois.\nLes règles sont :\n- un préavis de trois mois ;"
+
+
+def test_montant_absent_retire_avec_sa_phrase():
+    texte = "Le préavis est de trois mois. Cumulés, ces délais représentent 100 % du bail."
+    verifiee = verifier_fidelite(
+        _reponse_avec_citation(texte), [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_contradiction=0.7
+    )
+    assert verifiee.refus is False
+    assert verifiee.reponse == "Le préavis est de trois mois."
+
+
+def test_montant_absent_dans_la_premiere_phrase_fait_refuser():
+    texte = "Le préavis coûte 100 % du loyer. Le préavis est de trois mois."
+    verifiee = verifier_fidelite(
+        _reponse_avec_citation(texte), [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_contradiction=0.7
+    )
+    assert verifiee.refus is True
+    assert "100 %" in verifiee.motif
+
+
+def _verifier_guillemets(texte: str) -> ReponseGeneree:
+    return verifier_fidelite(
+        _reponse_avec_citation(texte), [_ARTICLE_15], _NLIFixe(0.95), seuil_haut=0.7, seuil_contradiction=0.7
+    )
+
+
+def test_fausse_citation_entre_guillemets_fait_refuser():
+    # Phrase réécrite qui partage presque toutes ses lettres avec l'article.
+    texte = "Selon l'article 15, « lorsque le congé émane du bailleur, le délai de préavis est de trois mois »."
+    verifiee = _verifier_guillemets(texte)
+    assert verifiee.refus is True
+    assert "citation absente" in verifiee.motif
+
+
+def test_fausse_citation_hors_premiere_phrase_retiree():
+    texte = (
+        "Le préavis est de trois mois. "
+        "La loi précise « lorsque le congé émane du bailleur, le délai de préavis est de trois mois »."
+    )
+    verifiee = _verifier_guillemets(texte)
+    assert verifiee.refus is False
+    assert verifiee.reponse == "Le préavis est de trois mois."
+
+
+def test_citation_exacte_entre_guillemets_acceptee():
+    texte = "Le préavis est de trois mois : « lorsque le congé émane du locataire, le délai de préavis est de trois mois »."
+    assert _verifier_guillemets(texte).refus is False
+
+
+def test_guillemets_tolerent_terminaison_crochets_et_terme_court():
+    texte = (
+        "Le préavis est de trois mois : « lorsque le congé émanent du locataire, le délai [légal] de "
+        "préavis est de trois mois ». C'est un « délai de préavis »."
+    )
+    assert _verifier_guillemets(texte).refus is False
+
+
+def test_retirer_affirmations_introuvable_renvoie_none():
+    assert _retirer_affirmations("Le préavis est de trois mois.", ["Une phrase absente."]) is None
 
 
 def test_verifie_contre_le_contenu_de_larticle_cite():
@@ -1083,6 +1206,128 @@ def _reponse_plafond_majore() -> ReponseGeneree:
     )
 
 
+def test_affirmation_avec_exception_part_au_juge():
+    # t05 : « sauf » d'un article greffé sur la règle d'un autre, fondé par le NLI.
+    juge = _JugeLLM(fondee=False)
+    reponse = _reponse_avec_citation("Le préavis est de trois mois, sauf si le logement est meublé.")
+    verifiee = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.99), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert juge.appele is True
+    assert verifiee.refus is True
+
+
+class _JugeExceptions:
+    """Juge groupé qui accepte tout, puis seconde lecture des exceptions
+    figée : phrase recopiée et verdict donnés."""
+
+    def __init__(self, phrase: str, fondee: bool):
+        self._verdict = {"phrase": phrase, "fondee": fondee}
+        self.consignes: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        self.consignes.append(consigne)
+        n = len(re.findall(r"^\d+\. ", question.split("Affirmations à vérifier :")[-1], re.MULTILINE))
+        if consigne == CONSIGNE_JUGE_EXCEPTION:
+            return json.dumps({"verdicts": [self._verdict] * n})
+        return json.dumps({"fondees": [True] * n})
+
+
+def _verifier_exception(juge: _JugeExceptions) -> ReponseGeneree:
+    reponse = _reponse_avec_citation("Le préavis est de trois mois, sauf si le logement est meublé.")
+    return verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.99), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+
+
+def test_exception_rattachee_a_une_autre_regle_est_rejetee_a_la_seconde_lecture():
+    # t05 : le juge groupé acceptait l'exception de l'art. 22-1 greffée sur l'art. 22-2.
+    juge = _JugeExceptions("le délai de préavis est de trois mois", fondee=False)
+    assert _verifier_exception(juge).refus is True
+    assert juge.consignes == [CONSIGNE_JUGE_FIDELITE, CONSIGNE_JUGE_EXCEPTION]
+
+
+def test_seconde_lecture_sans_phrase_retrouvee_garde_le_verdict_du_juge():
+    juge = _JugeExceptions("phrase absente des articles cités", fondee=False)
+    assert _verifier_exception(juge).refus is False
+
+
+def test_seconde_lecture_qui_confirme_garde_la_reponse():
+    juge = _JugeExceptions("le délai de préavis est de trois mois", fondee=True)
+    assert _verifier_exception(juge).refus is False
+
+
+def test_pas_de_seconde_lecture_sans_exception():
+    juge = _JugeExceptions("", fondee=False)
+    reponse = _reponse_avec_citation("Le préavis est de trois mois.")
+    verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.1), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert juge.consignes == [CONSIGNE_JUGE_FIDELITE]
+
+
+class _JugeReponseDirecte:
+    """Juge groupé qui accepte tout, puis seconde lecture de la réponse
+    directe figée : phrase recopiée et verdict donnés."""
+
+    def __init__(self, phrase: str, fondee: bool):
+        self._verdict = {"phrase": phrase, "fondee": fondee}
+        self.consignes: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        self.consignes.append(consigne)
+        n = len(re.findall(r"^\d+\. ", question.split("Affirmations à vérifier :")[-1], re.MULTILINE))
+        if consigne == CONSIGNE_JUGE_REPONSE_DIRECTE:
+            return json.dumps({"verdicts": [self._verdict] * n})
+        return json.dumps({"fondees": [True] * n})
+
+
+_REPONSE_NEGATIVE_PUIS_CONDITION = (
+    "Le locataire n'a pas de préavis à respecter. "
+    "Lorsque le congé émane du locataire, le délai de préavis est de trois mois."
+)
+
+
+def test_reponse_directe_negative_contredite_par_ses_conditions_est_refusee():
+    # n05 : « ne reste pas tenu » en tête, puis la solidarité qui dure six mois.
+    juge = _JugeReponseDirecte("le délai de préavis est de trois mois", fondee=False)
+    verifiee = verifier_fidelite(
+        _reponse_avec_citation(_REPONSE_NEGATIVE_PUIS_CONDITION), [_ARTICLE_15], _NLIFixe(0.1),
+        seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert verifiee.refus is True
+    assert juge.consignes == [CONSIGNE_JUGE_FIDELITE, CONSIGNE_JUGE_REPONSE_DIRECTE]
+
+
+def test_reponse_directe_confirmee_a_la_relecture_est_gardee():
+    juge = _JugeReponseDirecte("le délai de préavis est de trois mois", fondee=True)
+    verifiee = verifier_fidelite(
+        _reponse_avec_citation(_REPONSE_NEGATIVE_PUIS_CONDITION), [_ARTICLE_15], _NLIFixe(0.1),
+        seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert verifiee.refus is False
+
+
+def test_pas_de_relecture_de_la_reponse_directe_positive():
+    juge = _JugeReponseDirecte("", fondee=False)
+    reponse = _reponse_avec_citation(
+        "Le locataire doit un préavis. Lorsque le congé émane du locataire, le délai de préavis est de trois mois."
+    )
+    verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.1), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert juge.consignes == [CONSIGNE_JUGE_FIDELITE]
+
+
+def test_pas_de_relecture_de_la_reponse_directe_fondee_par_le_nli():
+    juge = _JugeReponseDirecte("", fondee=False)
+    verifier_fidelite(
+        _reponse_avec_citation(_REPONSE_NEGATIVE_PUIS_CONDITION), [_ARTICLE_15], _NLIFixe(0.99),
+        seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+    assert juge.consignes == []
+
+
 def test_affirmation_fondee_sur_une_derogation_part_au_juge():
     # Vraie mot à mot, l'affirmation tirée de « est rehaussée » peut taire la
     # règle générale : le NLI seul ne suffit pas (q58).
@@ -1159,6 +1404,48 @@ def test_completude_sans_derogation_pas_de_signal():
     assert "dérogation" not in llm.question_recue
 
 
+_SECTION_DEUX = "Section 2 : Dispositions particulières aux syndicats dont le nombre de voix est réparti entre deux copropriétaires"
+
+
+def _reponse_deux_coproprietaires() -> tuple[ReponseGeneree, _Resultat]:
+    article = _Resultat(
+        "loi-65-557", "Les décisions peuvent être prises par le copropriétaire détenant plus de la moitié des voix.",
+        article="41-16", section=f"Chapitre IV ter : Dispositions particulières à certaines copropriétés > {_SECTION_DEUX}",
+    )
+    reponse = ReponseGeneree(
+        refus=False, reponse="Oui, il peut décider seul.",
+        citations=[Citation(doc_id="loi-65-557", article="41-16",
+                            passage="peuvent être prises par le copropriétaire détenant plus de la moitié des voix")],
+    )
+    return reponse, article
+
+
+def test_completude_signale_l_intitule_d_un_regime_particulier_cite():
+    # t15 : l'art. 41-16 (deux copropriétaires) présenté comme règle commune.
+    reponse, article = _reponse_deux_coproprietaires()
+    llm = _LLMFake(json.dumps({"complete": True}))
+    verifier_completude("Q ?", reponse, [article], llm)
+    assert "relèvent d'un régime particulier" in llm.question_recue
+    assert f"« {_SECTION_DEUX} »" in llm.question_recue
+
+
+def test_completude_omission_sans_preuve_sur_regime_particulier():
+    # t15 : le juge voit l'omission mais recopie une règle absente des
+    # articles récupérés ; l'intitulé du régime en tient lieu.
+    reponse, article = _reponse_deux_coproprietaires()
+    llm = _LLMFake(_verdict_incomplet("Règle inventée absente des articles."))
+    manque = verifier_completude("Q ?", reponse, [article], llm)
+    assert manque == f"L'article 41-16 relève de : « {_SECTION_DEUX} »."
+
+
+def test_completude_intitule_accepte_comme_preuve():
+    # La règle générale (art. 22) n'était pas récupérée : l'intitulé qui borne
+    # le régime suffit à prouver l'omission.
+    reponse, article = _reponse_deux_coproprietaires()
+    llm = _LLMFake(_verdict_incomplet(_SECTION_DEUX))
+    assert verifier_completude("Q ?", reponse, [article], llm) is not None
+
+
 def test_completude_a_verifier_passage_de_derogation():
     reponse = _reponse_plafond_majore()
     reponse.citations[0].passage = "est rehaussée, sans pouvoir excéder 21 400 € par an"
@@ -1174,6 +1461,45 @@ def test_completude_a_verifier_article_de_regime_particulier():
         citations=[Citation(doc_id="loi-89-462", article="25-8", passage="Le délai de préavis est d'un mois.")],
     )
     assert completude_a_verifier(reponse, [meuble]) is True
+
+
+def test_completude_a_verifier_article_cite_trop_long():
+    # t34 : l'art. 31 du CGI mêle règle générale et régimes optionnels.
+    long_ = _Resultat("code_impot", "z" * (LONGUEUR_MAX_CONTEXTE_CARACTERES + 1), article="31")
+    reponse = ReponseGeneree(
+        refus=False, reponse="Oui.",
+        citations=[Citation(doc_id="code_impot", article="31", passage="zzz")],
+    )
+    assert completude_a_verifier(reponse, [long_]) is True
+
+
+_ARTICLE_1415 = _Resultat(
+    "code_impot", "La taxe foncière est établie pour l'année entière d'après les faits existants au 1er janvier.",
+    article="1415",
+)
+_ARTICLE_1403 = _Resultat(
+    "code_impot", "Tant que la mutation cadastrale n'a pas été faite, l'ancien propriétaire continue à être imposé.",
+    article="1403",
+)
+
+
+def _reponse_mutation() -> ReponseGeneree:
+    return ReponseGeneree(
+        refus=False, reponse="Le vendeur paie jusqu'à la mutation cadastrale.",
+        citations=[Citation(doc_id="code_impot", article="1403", passage="l'ancien propriétaire continue à être imposé")],
+    )
+
+
+def test_completude_a_verifier_premier_article_non_cite():
+    # t37 : l'art. 1415, classé premier, tu au profit de l'art. 1403.
+    assert completude_a_verifier(_reponse_mutation(), [_ARTICLE_1415, _ARTICLE_1403]) is True
+    assert completude_a_verifier(_reponse_mutation(), [_ARTICLE_1403, _ARTICLE_1415]) is False
+
+
+def test_completude_signale_le_premier_article_non_cite():
+    llm = _LLMFake(json.dumps({"complete": True}))
+    verifier_completude("Q ?", _reponse_mutation(), [_ARTICLE_1415, _ARTICLE_1403], llm)
+    assert "l'article 1415, classé premier" in llm.question_recue
 
 
 def test_completude_a_verifier_reponse_ordinaire_ou_refus():

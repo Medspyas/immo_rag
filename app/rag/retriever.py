@@ -42,6 +42,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from app.rag.fenetres import fenetres_article
 from app.rag.questions_articles import charger_questions
 from app.rag.renvois import articles_cites, famille_document
 from app.rag.sigles import developper_sigles
@@ -60,6 +61,22 @@ def _scores_rrf(classements: list[list[UUID]], k: int = 60) -> dict[UUID, float]
         for rang, doc_id in enumerate(classement, start=1):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rang)
     return scores
+
+
+def _titre_a_reclasser(resultat: _ResultatRecherche) -> str:
+    """Titre de la loi (et chapitre pour un code) montré au reclasseur."""
+    metadata = resultat.metadata or {}
+    titre = metadata.get("titre") or ""
+    chapitre = _chapitre_de_code(titre, metadata.get("section") or "") if titre else ""
+    return f"{titre} — {chapitre}" if chapitre else titre
+
+
+def _fenetres_a_reclasser(resultat: _ResultatRecherche) -> list[str]:
+    """Fenêtres d'un article long (fenetres.py), chacune précédée du titre de
+    sa loi : le reclasseur ne lit que les ~512 premiers tokens d'un texte, une
+    règle placée plus loin lui est invisible (rerank_fenetres)."""
+    titre = _titre_a_reclasser(resultat)
+    return [f"{titre}\n{f}" if titre else f for f in fenetres_article(resultat.content)]
 
 
 def _texte_a_reclasser(resultat: _ResultatRecherche) -> str:
@@ -85,16 +102,49 @@ def _texte_a_reclasser(resultat: _ResultatRecherche) -> str:
     au-dessus du seuil de l'étage 1 (plus de passages, plus de chances qu'un
     passage sans rapport obtienne une note élevée)."""
     metadata = resultat.metadata or {}
-    titre = metadata.get("titre")
+    titre = _titre_a_reclasser(resultat)
     if not titre:
         return resultat.content
-    chapitre = _chapitre_de_code(titre, metadata.get("section") or "")
-    if chapitre:
-        titre = f"{titre} — {chapitre}"
+    glose = _glose_renvoi(resultat)
+    if glose:
+        titre = f"{titre}\n{glose}"
     questions = charger_questions().get((resultat.doc_id, metadata.get("article")))
     if questions:
         titre = f"{titre}\n{PREFIXE_QUESTIONS}{' '.join(questions)}"
     return f"{titre}\n{resultat.content}"
+
+
+# Renvois à une définition, glosés pour le reclasseur seulement : (doc_id,
+# motif du renvoi, glose). Les articles de la loi Hoguet désignent les
+# professionnels par « les personnes visées à l'article 1er » (14 articles)
+# sans jamais écrire « agent immobilier » : le reclasseur notait 0,024
+# l'article 6 (mandat écrit) face à « Un agent immobilier peut-il vendre sur
+# simple accord oral ? » (n13), 0,169 avec la glose (2026-10-29). Les
+# dénominations reprennent l'article 14 de la loi. Gate : golden MRR
+# 0,781 → 0,797, questions neuves 0,662 → 0,685 (hit@5 82 % → 94 %), jeu
+# de test figé et scores hors corpus inchangés. Même glose pour le droit de
+# l'article 683 du CGI : écartée, 4 articles seulement (cas par cas).
+GLOSES_RENVOIS = [
+    (
+        "Loi_hoguet",
+        re.compile(r"(?:visée?s?|mentionnée?s?) (?:à|au)(?: même)? (?:l')?article 1er"),
+        (
+            "Les personnes visées à l'article 1er sont les agents immobiliers, "
+            "administrateurs de biens et syndics de copropriété."
+        ),
+    ),
+]
+
+
+def _glose_renvoi(resultat: _ResultatRecherche) -> str:
+    """Glose du renvoi à une définition que fait l'article, vide sinon."""
+    return next(
+        (
+            glose for doc_id, motif, glose in GLOSES_RENVOIS
+            if resultat.doc_id == doc_id and motif.search(resultat.content)
+        ),
+        "",
+    )
 
 
 # Annonce des questions générées (doc2query) placées entre le titre et
@@ -239,6 +289,9 @@ class HybridRetriever:
     ne renvoie rien lorsque le meilleur score de reclassement tombe sous ce
     seuil ; sinon les k meilleurs candidats sont renvoyés. Sans effet lorsque
     reranker vaut None (aucun score de reclassement à comparer).
+
+    rerank_fenetres : un article long est noté aussi sur chacune de ses
+    fenêtres et garde son meilleur score (cf. _fenetres_a_reclasser).
     """
 
     def __init__(
@@ -252,6 +305,7 @@ class HybridRetriever:
         k_avant_rerank: int = 20,
         seuil_rerank: float | None = None,
         index_articles: _IndexArticles | None = None,
+        rerank_fenetres: bool = False,
     ):
         self._embeddings = embeddings
         self._dense = recherche_dense
@@ -262,6 +316,7 @@ class HybridRetriever:
         self._k_avant_rerank = k_avant_rerank
         self._seuil_rerank = seuil_rerank
         self._index_articles = index_articles
+        self._rerank_fenetres = rerank_fenetres
 
     def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
         """Les k morceaux les mieux placés pour la question.
@@ -318,8 +373,22 @@ class HybridRetriever:
             candidats.append(article.id)
             par_id[article.id] = article
             scores[article.id] = 0.0
-        textes = [_texte_a_reclasser(par_id[chunk_id]) for chunk_id in candidats]
-        classement = self._reranker.rerank(query, textes)
+        # Chaque texte noté renvoie à son candidat (position dans candidats) :
+        # l'article entier, puis ses fenêtres si rerank_fenetres.
+        textes: list[str] = []
+        proprietaires: list[int] = []
+        for position, chunk_id in enumerate(candidats):
+            source = par_id[chunk_id]
+            a_noter = [_texte_a_reclasser(source)]
+            if self._rerank_fenetres:
+                a_noter += _fenetres_a_reclasser(source)
+            textes += a_noter
+            proprietaires += [position] * len(a_noter)
+        meilleurs: dict[int, float] = {}
+        for indice, score in self._reranker.rerank(query, textes):
+            position = proprietaires[indice]
+            meilleurs[position] = max(score, meilleurs.get(position, score))
+        classement = sorted(meilleurs.items(), key=lambda paire: paire[1], reverse=True)
 
         # Garde-fou étage 1 : si même le meilleur candidat est sous le seuil,
         # rien de pertinent n'a été trouvé, refus (résultats vides) plutôt

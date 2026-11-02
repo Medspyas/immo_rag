@@ -26,11 +26,16 @@ from uuid import UUID
 import numpy as np
 
 from app.rag.bm25_index import BM25Index
-from app.rag.chunking import RawChunk, decouper_en_articles
+from app.rag.chunking import RawChunk
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
 from app.rag.embeddings import EmbeddingProvider
 from app.rag.fenetres import fenetres_article
-from app.rag.pipeline import documents_bm25, fichiers_du_corpus, identifiant_chunk
+from app.rag.pipeline import (
+    documents_bm25,
+    fichiers_du_corpus,
+    identifiant_chunk,
+    lire_source,
+)
 from app.rag.vector_store import Chunk
 
 RACINE = Path(__file__).resolve().parent.parent
@@ -110,9 +115,7 @@ def _articles_du_corpus(
     renvoyer — un appel au modèle par fichier."""
     articles: list[RawChunk] = []
     for nom in fichiers:
-        chemin = dossier / nom
-        texte = chemin.read_text(encoding="utf-8")
-        arts = decouper_en_articles(texte, chemin.stem)
+        texte, arts = lire_source(dossier / nom)
         if contextualizer is not None:
             arts = contextualiser_chunks(arts, texte, contextualizer)
         articles.extend(arts)

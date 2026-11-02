@@ -21,6 +21,21 @@ inchangés. Écartés : vectoriser les questions pour la recherche par le sens
 écarté (hit@3 82,5 %), a été repris le 2026-10-15 avec le titre de la loi
 devant : MRR 0,725 → 0,765, hit@5 90 % → 92,5 % (cf. retriever.py).
 
+Étendu le 2026-10-29 au périmètre immobilier du code civil (propriété,
+servitudes, vente, louage, constructeurs, prescription) et du CGI (revenus
+fonciers, plus-values, IFI, taxes foncières, droits de mutation), cf.
+scripts/generer_questions_articles.py. Mesuré sur un jeu de test figé jamais
+utilisé pour régler (eval/questions_test.jsonl, 37 questions) : MRR
+0,744 → 0,858, hit@5 86 % → 97 %, hit@10 89 % → 100 % (CGI : t34 et t36
+introuvables → 1ers). Golden : MRR 0,791 → 0,781, hit@10 inchangé ; scores
+hors corpus inchangés.
+
+Le 2026-11-01, 67 articles dont une question renvoyait à « ce/cette … » sans
+objet (« ces frais », « cette règle ») ont été regénérés avec des questions
+qui nomment leur sujet (scripts/generer_questions_articles.py
+--refaire-vagues). Neuves : MRR 0,685 → 0,740 (n17, art. 1594 D du CGI : 15e
+→ 1er) ; test figé 0,858 → 0,861 ; golden 0,811 → 0,801 (q57 1re → 2e).
+
 Contenu du fichier :
 - charger_questions : lit le fichier, indexé par (loi, article).
 """

@@ -46,7 +46,12 @@ from app.config import Settings
 from app.rag.bm25_index import tokeniser_fr
 from app.rag.nli import ScoreNLI
 
-CONSIGNE = """Tu es un assistant documentaire pour des professionnels de l'immobilier \
+# Écartées le 2026-10-29 (jeu de test figé, 19 questions) : deux règles contre
+# les refus à tort (« un article qui interdit répond à « peut-on ? » », « ne
+# refuse pas pour une différence de vocabulaire »). Le rédacteur répondait
+# davantage, mais faux : t14 (procurations données et non reçues) et t15
+# (copropriétaire majoritaire « décide seul ») acceptées à tort.
+CONSIGNE ="""Tu es un assistant documentaire pour des professionnels de l'immobilier \
 (agents, gestionnaires, syndics). Tu réponds à des questions de réglementation.
 
 Règles impératives :
@@ -58,6 +63,8 @@ répondre qu'inventer, dans un domaine réglementé.
 information précise (une durée, un délai, un montant, un taux, un seuil, une \
 majorité) et qu'aucun article ne la donne, refuse, même si les articles \
 traitent du même sujet.
+- Pour nommer la loi ou le code, reprends la ligne « Texte » de l'article, \
+jamais un autre nom.
 - Un article signalé « ABROGÉ » ne doit pas être présenté comme le droit en vigueur.
 - La ligne « Situé dans » indique le régime auquel un article s'applique \
 (par exemple les logements meublés, ou le bail mobilité). Une règle propre à \
@@ -304,7 +311,9 @@ LONGUEUR_MAX_CONTEXTE_CARACTERES = 24_000
 
 
 def _bloc_articles(
-    resultats: list[_ResultatRecherche], budget: int = LONGUEUR_MAX_CONTEXTE_CARACTERES
+    resultats: list[_ResultatRecherche],
+    budget: int = LONGUEUR_MAX_CONTEXTE_CARACTERES,
+    requete: str = "",
 ) -> str:
     """Met en forme les articles récupérés pour la consigne.
 
@@ -312,8 +321,11 @@ def _bloc_articles(
     du budget de caractères, les suivants sont simplement omis plutôt que
     tronqués au milieu — une troncature casserait la vérification des
     citations, faite contre le texte complet de l'article dans `resultats`.
-    Le premier article est toujours inclus, même s'il dépasse le budget à
-    lui seul (cas limite non rencontré dans le corpus actuel).
+    Le premier article est toujours inclus. S'il dépasse le budget à lui
+    seul (art. 31 du CGI, 51 800 caractères depuis les textes PISTE : 413
+    de Groq sur t34, 2026-10-30), seuls ses alinéas les plus proches de
+    `requete` sont montrés (_raccourcir) ; la citation reste vérifiée contre
+    l'article complet.
     """
     blocs: list[str] = []
     longueur = 0
@@ -324,14 +336,47 @@ def _bloc_articles(
         # L'intitulé (« Titre Ier bis : … logements meublés … ») dit à quel
         # régime l'article s'applique, ce que son texte ne répète pas toujours.
         situation = f"\nSitué dans : {section}" if section else ""
-        bloc = (
-            f"[{i}] Document : {r.doc_id} — Article {article}{marque}{situation}\n{r.content}"
-        )
+        # Titre de la loi ou du code : sans lui, le modèle devinait le texte
+        # d'après l'identifiant et le nommait mal (« code de la construction »
+        # pour la loi de 1989, « code civil » pour son article 6).
+        titre = r.metadata.get("titre")
+        texte = f"\nTexte : {titre}" if titre else ""
+        entete = f"[{i}] Document : {r.doc_id} — Article {article}{marque}{texte}{situation}\n"
+        contenu = r.content
+        if not blocs and len(entete) + len(contenu) > budget:
+            contenu = _raccourcir(contenu, requete, budget - len(entete))
+        bloc = entete + contenu
         if blocs and longueur + len(bloc) > budget:
             break
         blocs.append(bloc)
         longueur += len(bloc)
     return "\n\n".join(blocs)
+
+
+def _raccourcir(contenu: str, requete: str, place: int) -> str:
+    """Alinéas d'un article trop long qui partagent le plus de mots avec la
+    requête, dans l'ordre du texte, jusqu'à `place` caractères ; « […] »
+    marque chaque coupure. La première ligne (« Article 31 ») est gardée."""
+    lignes = contenu.split("\n")
+    mots = {m for m in re.findall(r"\w+", requete.lower()) if len(m) > 3}
+    rangs = sorted(
+        range(1, len(lignes)),
+        key=lambda i: -len(mots & set(re.findall(r"\w+", lignes[i].lower()))),
+    )
+    gardees = {0}
+    longueur = len(lignes[0])
+    for i in rangs:
+        if longueur + len(lignes[i]) + 1 > place:
+            continue
+        gardees.add(i)
+        longueur += len(lignes[i]) + 1
+    morceaux: list[str] = []
+    for i, ligne in enumerate(lignes):
+        if i in gardees:
+            morceaux.append(ligne)
+        elif morceaux[-1] != "[…]":
+            morceaux.append("[…]")
+    return "\n".join(morceaux)
 
 
 # Ligne qui ouvre un exemple rédigé par le modèle : « Exemple : », « **Exemple
@@ -426,7 +471,7 @@ def generer_reponse(
     if not resultats:
         return ReponseGeneree(refus=True, motif="aucun passage pertinent trouvé")
 
-    message = f"Question : {question}\n\nArticles disponibles :\n\n{_bloc_articles(resultats)}"
+    message = f"Question : {question}\n\nArticles disponibles :\n\n{_bloc_articles(resultats, requete=question)}"
     if omission:
         message += (
             "\n\nUne première réponse taisait l'élément suivant, qui change la réponse "
@@ -518,6 +563,43 @@ def _fragment_approche(p: str, c: str, seuil: float) -> bool:
     debut = max(ancre.b - ancre.a - _MARGE_APPROX, 0)
     zone = c[debut : ancre.b - ancre.a + len(p) + _MARGE_APPROX]
     return _fautes_de_frappe_seulement(p.split(), zone.split())
+
+
+def _passage_mot_a_mot(passage: str, contenu: str) -> bool:
+    """Variante stricte de _passage_present : chaque fragment doit figurer dans
+    l'article mot pour mot, à une faute de frappe ou une terminaison près
+    (« justifier » pour « justifie »), sans le seuil de portion commune qui
+    laissait passer une phrase réécrite partageant 85 % de ses lettres avec
+    l'article."""
+    mots_article = _normaliser(contenu).split()
+    fragments = [f.split() for f in (_normaliser(m) for m in _ELLIPSE.split(passage)) if f]
+    if not fragments:
+        return False
+    debut = 0
+    for fragment in fragments:
+        n = len(fragment)
+        position = next(
+            (
+                i for i in range(debut, len(mots_article) - n + 1)
+                if all(_meme_mot(a, b) for a, b in zip(fragment, mots_article[i : i + n]))
+            ),
+            None,
+        )
+        if position is None:
+            return False
+        debut = position + n
+    return True
+
+
+def _meme_mot(mot: str, original: str) -> bool:
+    """Même mot, à une terminaison (« établie » / « établies ») ou une faute de
+    frappe près. Un nombre doit être identique."""
+    if mot == original:
+        return True
+    if any(ch.isdigit() for ch in mot + original) or min(len(mot), len(original)) < 4:
+        return False
+    court, long = sorted((mot, original), key=len)
+    return (long.startswith(court) and len(long) - len(court) <= 3) or _faute_de_frappe(mot, original)
 
 
 def _fautes_de_frappe_seulement(mots: list[str], zone: list[str]) -> bool:
@@ -698,7 +780,7 @@ def corriger_citations(
     # La réponse précédente et les citations fautives s'ajoutent aux articles :
     # le bloc d'articles leur cède la place, sans quoi la requête dépassait le
     # plafond de Groq (413, 8412 tokens pour 8000, q02 le 2026-10-05).
-    articles = _bloc_articles(resultats, LONGUEUR_MAX_CONTEXTE_CARACTERES - len(suite))
+    articles = _bloc_articles(resultats, LONGUEUR_MAX_CONTEXTE_CARACTERES - len(suite), question)
     message = f"Question : {question}\n\nArticles disponibles :\n\n{articles}{suite}"
     return _lire_reponse(llm.generer(CONSIGNE, message))
 
@@ -834,11 +916,26 @@ _REGIME_PARTICULIER = re.compile(r"particuli|meublé|mobilité|résidences-servi
 # de lui seul peut taire la règle générale. Le NLI fondait ainsi « jusqu'à
 # 21 400 € » sans le plafond de 10 700 € (q58, art. 156, 2026-10-20).
 _DEROGATION = re.compile(r"par dérogation|par exception|rehauss", re.IGNORECASE)
+# Exception posée par une affirmation de la réponse (« sauf si… »).
+_EXCEPTION = re.compile(r"\bsauf\b|à l'exception|excepté|hormis", re.IGNORECASE)
+# Condition, délai ou terme posés par la suite d'une réponse : la réponse
+# directe négative qui les précède est relue (CONSIGNE_JUGE_REPONSE_DIRECTE).
+# Restreint aux réponses négatives (« ne reste pas tenu », n05) : sans cette
+# restriction, 21 réponses acceptées sur ~90 auraient demandé un appel de plus.
+_CONDITION = re.compile(
+    r"\blorsqu|\bquand\b|\b(?:à|au) défaut\b|\bau plus tard\b|\bjusqu|\btant qu"
+    r"|\bsous réserve\b|\bà condition\b|\bà compter\b|\bdans un délai\b",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\bne\b|\bn'|\bn’|\bnon\b", re.IGNORECASE)
 # Nombre d'extraits soumis au NLI pour chaque affirmation, retenus parmi ceux
 # qui partagent le plus de mots avec elle : évite de passer tout l'article au
 # modèle, ce qui coûterait un passage NLI par extrait.
 _EXTRAITS_PAR_AFFIRMATION = 8
 
+# Exception d'un article greffée sur la règle d'un autre : t05 (2026-10-30),
+# « sauf étudiant ou apprenti » (art. 22-1, bailleur assuré) rattaché à
+# l'interdiction de la cosignature des parents (art. 22-2), accepté.
 CONSIGNE_JUGE_FIDELITE = """Tu vérifies si des affirmations sont fondées sur un texte source, dans le \
 cadre d'un assistant juridique qui ne doit rien avancer que le texte ne dise \
 vraiment.
@@ -850,15 +947,63 @@ ou n'a pas de rapport avec lui). En droit, le présent de l'indicatif exprime un
 obligation : « un état des lieux est établi » signifie qu'il doit l'être. Si le \
 texte réserve la règle à une condition ou à un cas particulier (« quand », \
 « lorsque », « toutefois », un régime précis) et que l'affirmation la présente \
-comme la règle générale sans cette condition, réponds false.
+comme la règle générale sans cette condition, réponds false. De même si \
+l'affirmation rattache à une règle une exception (« sauf… ») que le texte attache \
+à une autre règle : chaque exception vaut seulement pour la phrase qui la porte.
 
 La réponse complète est fournie seulement pour comprendre les renvois d'une \
 affirmation (« ce délai », « il ») : elle n'est pas une source, seul le texte \
 source fonde une affirmation.
-
 Réponds UNIQUEMENT par ce JSON, sans texte autour, une valeur par affirmation \
 dans l'ordre :
 {"fondees": [true, false, ...]}"""
+
+
+# Seconde lecture des seules affirmations à exception acceptées par le juge
+# groupé : il acceptait une fois sur trois l'exception de l'art. 22-1 greffée
+# sur la règle de l'art. 22-2 (t05, 2026-10-31). Recopier la phrase qui porte
+# l'exception l'oblige à la lire avant de trancher.
+CONSIGNE_JUGE_EXCEPTION = """Tu vérifies des affirmations d'un assistant juridique \
+qui posent une règle et une exception (« sauf… », « à l'exception de… »).
+
+Pour chaque affirmation :
+1. recopie mot pour mot, depuis le texte source, la phrase qui porte l'exception ;
+2. écris la règle que cette phrase soumet à l'exception, avec qui elle vise et ses \
+conditions (« le cautionnement ne peut être demandé par un bailleur qui a souscrit \
+une assurance ») ;
+3. réponds true seulement si la règle de l'affirmation est cette règle-là, avec les \
+mêmes personnes et les mêmes conditions ; false si l'affirmation rattache \
+l'exception à une autre règle, en omet une condition, ou si aucune phrase du texte \
+ne porte cette exception.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour, un objet par affirmation dans \
+l'ordre :
+{"verdicts": [{"phrase": "<phrase recopiée>", "regle": "<règle soumise à \
+l'exception>", "fondee": true}, ...]}"""
+
+
+# Seconde lecture de la réponse directe (1re affirmation) quand la suite de la
+# réponse pose des conditions ou un délai : n05 (2026-10-31), « ne reste pas
+# tenu de payer la part des autres » en tête, puis la solidarité qui dure
+# jusqu'au nouveau colocataire ou six mois. Le juge groupé l'acceptait 6/6,
+# même averti qu'une nuance plus loin ne rattrape pas une phrase fausse.
+CONSIGNE_JUGE_REPONSE_DIRECTE = """Tu vérifies la phrase qui donne la réponse \
+directe d'un assistant juridique (la première phrase de sa réponse).
+
+Pour chaque affirmation :
+1. recopie mot pour mot, depuis le texte source, la phrase qui fonde cette réponse ;
+2. écris la règle de cette phrase, avec ses conditions et ses délais (« la \
+solidarité prend fin lorsqu'un nouveau colocataire figure au bail, au plus tard six \
+mois après le congé ») ;
+3. réponds true si l'affirmation, lue seule, reste vraie au regard de cette règle ; \
+false si elle affirme sans réserve ce que la règle ne prévoit que sous une condition, \
+après un délai ou jusqu'à un terme, ou si elle la contredit. Les phrases suivantes \
+de la réponse ne corrigent pas une première phrase fausse.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour, un objet par affirmation dans \
+l'ordre :
+{"verdicts": [{"phrase": "<phrase recopiée>", "regle": "<règle avec ses \
+conditions>", "fondee": true}, ...]}"""
 
 
 CONSIGNE_COMPLETUDE = """Tu relis la réponse d'un assistant juridique destiné à des \
@@ -873,7 +1018,9 @@ Obtient-il un résultat faux, parce que la réponse :
 dérogation, d'un plafond majoré ou d'un régime particulier (meublé, zone, \
 travaux…), sans la règle générale qui s'applique au cas ordinaire ;
 - ou donne une règle qui, d'après l'article, ne vaut que sous une condition que \
-le cas ordinaire ne remplit pas ?
+le cas ordinaire ne remplit pas ;
+- ou tait la règle qui répond directement à la question, posée par un article \
+récupéré, au profit d'une règle voisine ou de procédure ?
 Si oui, la réponse est trompeuse.
 
 Ne sont PAS des défauts : une réponse qui donne la règle générale sans ses \
@@ -883,7 +1030,8 @@ la question porte elle-même sur l'exception (« dans quels cas… », « en meu
 la réponse est complète. En cas de doute, la réponse est complète.
 
 Si la réponse est trompeuse, recopie mot pour mot, depuis les articles récupérés, la \
-phrase qui pose la règle générale omise : sans elle, ton verdict est ignoré.
+phrase qui pose la règle générale omise ; si elle n'y figure pas, recopie l'intitulé \
+du régime particulier signalé plus haut. Sans cette preuve, ton verdict est ignoré.
 
 Réponds UNIQUEMENT par ce JSON, sans texte autour :
 {"complete": true, "regle_generale": "", "manque": ""}
@@ -916,6 +1064,14 @@ def _rattacher(introduction: str | None, element: str) -> str:
     if re.search(r"\bnotamment$", introduction, re.IGNORECASE):
         return f"{introduction} : {element}"
     return f"{introduction} notamment : {element}"
+
+
+def _forme_affirmation(phrase: str) -> str:
+    """Phrase débarrassée de ce qui n'est pas à vérifier : « Oui, » en tête,
+    formule d'attribution, référence d'article (cf. les expressions plus haut)."""
+    return _REFERENCE_ENTRE_PARENTHESES.sub(
+        "", _SELON_ARTICLE.sub("", _ATTRIBUTION.sub("", _OUI_NON.sub("", phrase)))
+    ).strip()
 
 
 def _decouper_en_affirmations(texte: str) -> list[str]:
@@ -975,12 +1131,7 @@ def _decouper_en_affirmations(texte: str) -> list[str]:
                 continue
             introduction = introduction_principale = None
             affirmations.append(phrase)
-    affirmations = [
-        _REFERENCE_ENTRE_PARENTHESES.sub(
-            "", _SELON_ARTICLE.sub("", _ATTRIBUTION.sub("", _OUI_NON.sub("", a)))
-        ).strip()
-        for a in affirmations
-    ]
+    affirmations = [_forme_affirmation(a) for a in affirmations]
     # Une ligne faite seulement de ponctuation (un guillemet fermant « » »)
     # n'affirme rien, une question non plus (« Qui peut encaisser l'acompte ? »,
     # q54, 2026-10-23).
@@ -1124,6 +1275,39 @@ def _juger_fidelite(
     return [f is True for f in fondees]
 
 
+def _juger_exceptions(
+    affirmations: list[str],
+    contextes: list[str],
+    texte_cite: str,
+    llm: LLM,
+    consigne: str = CONSIGNE_JUGE_EXCEPTION,
+) -> list[bool]:
+    """Seconde lecture des affirmations acceptées par le juge groupé :
+    affirmations à exception (CONSIGNE_JUGE_EXCEPTION) ou réponse directe
+    suivie de conditions (CONSIGNE_JUGE_REPONSE_DIRECTE).
+
+    Le verdict compte seulement si la phrase recopiée se retrouve dans un
+    article cité, comme une citation. Sans preuve, ou réponse illisible,
+    l'affirmation garde le verdict du juge groupé : ce contrôle s'ajoute à
+    lui et ne doit pas refuser sur un échec technique."""
+    liste = "\n".join(f"{i}. {a}" for i, a in enumerate(affirmations, 1))
+    message = f"Texte source :\n{texte_cite}\n\nAffirmations à vérifier :\n{liste}"
+    try:
+        verdicts = json.loads(llm.generer(consigne, message)).get("verdicts")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return [True] * len(affirmations)
+    if not isinstance(verdicts, list) or len(verdicts) != len(affirmations):
+        return [True] * len(affirmations)
+    fondees = []
+    for v in verdicts:
+        phrase = str(v.get("phrase") or "").strip() if isinstance(v, dict) else ""
+        prouve = bool(phrase) and any(
+            _passage_present(phrase, c, SEUIL_CITATION) for c in contextes
+        )
+        fondees.append(not (prouve and v.get("fondee") is False))
+    return fondees
+
+
 # Montant de la réponse : nombre (chiffres groupés par trois avec une espace,
 # décimales après la virgule) suivi d'une unité monétaire ou de pourcentage.
 _ESPACE_CHIFFRES = r"[   ]"
@@ -1171,6 +1355,99 @@ def _montant_inconnu(reponse: str, contextes: list[str]) -> str | None:
         if _valeur(m.group(1), m.group(2)) not in source:
             return m.group(0).strip()
     return None
+
+
+# Passage mis entre guillemets dans le texte de la réponse (« … », “ … ” ou
+# " … "). En dessous de MOTS_MIN_GUILLEMETS mots, c'est un terme repris
+# (« délégation de vote ») plutôt qu'une citation.
+_GUILLEMETS = re.compile(r"«\s*([^«»]+?)\s*»|“([^“”]+?)”|\"([^\"]+?)\"")
+MOTS_MIN_GUILLEMETS = 5
+
+
+def _guillemets_inconnus(reponse: str, contextes: list[str]) -> str | None:
+    """Premier passage entre guillemets du texte de la réponse qu'aucun article
+    cité ne contient.
+
+    Seules les citations de la liste `citations` étaient vérifiées : le texte
+    rédigé pouvait présenter entre guillemets une phrase réécrite comme si
+    elle venait de la loi. Sur t02 (2026-10-29), « si le bailleur manifeste sa
+    volonté … est réputé avoir renoncé » inversait l'article 17-1 (« À défaut
+    de manifester sa volonté … ») et la réponse était acceptée. Le passage est
+    comparé aux articles mot à mot (_passage_mot_a_mot) : la comparaison des
+    citations, qui tolère 15 % d'écart, acceptait l'inversion de t02.
+    Rejoué sur 130 réponses acceptées des traces : t02 seule signalée."""
+    for m in _GUILLEMETS.finditer(reponse):
+        # Un ajout entre crochets (« jusqu'à [la fin du bail] ») est une
+        # précision du rédacteur : traité comme une coupure.
+        passage = re.sub(r"\[[^\]]*\]", " … ", next(g for g in m.groups() if g))
+        if len(_normaliser(passage).split()) < MOTS_MIN_GUILLEMETS:
+            continue
+        if not any(_passage_mot_a_mot(passage, c) for c in contextes):
+            return passage
+    return None
+
+
+def _retirer_affirmations(texte: str, rejetees: list[str]) -> str | None:
+    """Texte de la réponse sans les phrases dont l'affirmation a été rejetée.
+
+    Chaque phrase du texte est ramenée à la forme vérifiée
+    (_forme_affirmation) ; un élément de liste a été vérifié précédé de son
+    introduction (_rattacher), d'où la comparaison sur la fin. Une ligne vidée
+    disparaît, de même qu'une introduction de liste (« … : ») dont tous les
+    éléments ont été retirés. Renvoie None si une affirmation rejetée n'a pas
+    été retrouvée dans le texte : la réponse est alors refusée, par prudence.
+    """
+    restantes = list(rejetees)
+    lignes: list[str] = []
+    for ligne in _PUCE_EN_LIGNE.sub("\n", texte).splitlines():
+        puce = _PUCE.match(ligne)
+        tete = puce.group(0) if puce else ""
+        corps = ligne[len(tete):].strip()
+        if not corps:
+            lignes.append(ligne)
+            continue
+        gardees: list[str] = []
+        for phrase in _SEPARATEUR_PHRASE.split(corps):
+            forme = _forme_affirmation(_ITALIQUE.sub(r"\1", _GRAS.sub("", phrase)).strip())
+            cible = next(
+                (r for r in restantes if forme and (r == forme or r.endswith(f" : {forme}"))), None
+            )
+            if cible is None:
+                gardees.append(phrase)
+            else:
+                restantes.remove(cible)
+        if gardees:
+            lignes.append(tete + " ".join(gardees))
+        elif puce is None:
+            # Une ligne de texte vidée laisse une ligne vide, pas un élément.
+            lignes.append("")
+    if restantes:
+        return None
+    # Introduction de liste restée sans élément : retirée.
+    resultat: list[str] = []
+    for i, ligne in enumerate(lignes):
+        suivante = next((s for s in lignes[i + 1 :] if s.strip()), "")
+        if ligne.rstrip().endswith(":") and not _PUCE.match(suivante):
+            continue
+        resultat.append(ligne)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(resultat)).strip()
+
+
+def _tronquer(reponse: ReponseGeneree, affirmations: list[str], rejetees: list[str]) -> ReponseGeneree:
+    """La réponse privée de ses affirmations rejetées, ou un refus.
+
+    Refus si la première affirmation est rejetée : elle porte la réponse
+    directe (« Oui, mais seulement à l'échéance du bail », q56), et la retirer
+    laisserait un « Oui, » sans objet ou une réponse sans conclusion. Refus
+    aussi s'il ne reste rien, ou si une phrase rejetée n'est pas retrouvée.
+    """
+    motif = f"affirmation non fondée sur les sources : « {rejetees[0]} »"
+    if affirmations[0] in rejetees or len(rejetees) == len(affirmations):
+        return ReponseGeneree(refus=True, motif=motif)
+    texte = _retirer_affirmations(reponse.reponse, rejetees)
+    if not texte:
+        return ReponseGeneree(refus=True, motif=motif)
+    return reponse.model_copy(update={"reponse": texte, "motif": f"réponse tronquée — {motif}"})
 
 
 def verifier_fidelite(
@@ -1221,9 +1498,27 @@ def verifier_fidelite(
     cites = _articles_cites(reponse, resultats)
     inconnu = _montant_inconnu(reponse.reponse, [r.content for r in cites])
     if inconnu:
-        return ReponseGeneree(
-            refus=True, motif=f"montant absent des articles cités : « {inconnu} »"
-        )
+        # L'affirmation qui porte le montant est retirée comme une affirmation
+        # rejetée (cf. _tronquer) : « Ces taux, cumulés, représentent 100 % »
+        # (calcul du rédacteur, q42) faisait refuser une réponse juste.
+        porteuses = [a for a in affirmations if inconnu in a] or [affirmations[0]]
+        tronquee = _tronquer(reponse, affirmations, porteuses)
+        if tronquee.refus:
+            return ReponseGeneree(
+                refus=True, motif=f"montant absent des articles cités : « {inconnu} »"
+            )
+        return verifier_fidelite(tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm)
+    fausse = _guillemets_inconnus(reponse.reponse, [r.content for r in cites])
+    if fausse:
+        # Même traitement qu'un montant inconnu : l'affirmation qui porte la
+        # fausse citation est retirée, refus si c'est la réponse directe.
+        porteuses = [a for a in affirmations if _normaliser(fausse) in _normaliser(a)]
+        tronquee = _tronquer(reponse, affirmations, porteuses or [affirmations[0]])
+        if tronquee.refus:
+            return ReponseGeneree(
+                refus=True, motif=f"citation absente des articles cités : « {fausse} »"
+            )
+        return verifier_fidelite(tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm)
     extraits = _extraits([r.content for r in cites])
     # Extraits d'articles d'un régime particulier : une affirmation que le NLI
     # fonde sur l'un d'eux part au juge, seul à voir l'intitulé « Situé dans ».
@@ -1240,7 +1535,7 @@ def verifier_fidelite(
     # d'articles, le juge passait à côté de la phrase utile (mesuré sur q02
     # le 2026-10-02 : rejet à tort, accepté une fois les passages en tête).
     passages = "\n".join(f"- Article {c.article} : « {c.passage} »" for c in reponse.citations)
-    texte_cite = f"Passages cités par la réponse :\n{passages}\n\nArticles complets :\n{_bloc_articles(cites)}"
+    texte_cite = f"Passages cités par la réponse :\n{passages}\n\nArticles complets :\n{_bloc_articles(cites, requete=reponse.reponse)}"
 
     douteuses: list[str] = []
     for affirmation in affirmations:
@@ -1252,7 +1547,11 @@ def verifier_fidelite(
             (e in particuliers or _DEROGATION.search(e)) and s.implication == implication
             for e, s in zip(selection, scores)
         )
-        if implication < seuil_haut or contradiction >= seuil_contradiction or regime:
+        # Une affirmation qui pose une exception part au juge : le NLI fondait
+        # « sauf si le logement est loué à un étudiant » (art. 22-1) rattaché
+        # à la cosignature des parents (art. 22-2), t05 le 2026-10-30.
+        exception = _EXCEPTION.search(affirmation) is not None
+        if implication < seuil_haut or contradiction >= seuil_contradiction or regime or exception:
             douteuses.append(affirmation)
 
     if not douteuses:
@@ -1261,18 +1560,46 @@ def verifier_fidelite(
         fondees = [False] * len(douteuses)
     else:
         fondees = _juger_fidelite(douteuses, texte_cite, llm, reponse.reponse)
-    for affirmation, fondee in zip(douteuses, fondees):
-        if not fondee:
-            # Pas de seconde rédaction sans l'affirmation rejetée : essayée le
-            # 2026-10-23 sur q42, q54, q56, elle a rendu deux réponses fausses
-            # acceptées (q54 : acompte permis après la vente ; q56 : délai du
-            # congé pour reprise appliqué à la vente). Un refus vaut mieux.
-            return ReponseGeneree(
-                refus=True,
-                motif=f"affirmation non fondée sur les sources : « {affirmation} »",
+        exceptions = [a for a, f in zip(douteuses, fondees) if f and _EXCEPTION.search(a)]
+        if exceptions:
+            relues = dict(
+                zip(exceptions, _juger_exceptions(exceptions, [r.content for r in cites], texte_cite, llm))
             )
-
-    return reponse
+            fondees = [f and relues.get(a, True) for a, f in zip(douteuses, fondees)]
+        # Réponse directe négative acceptée par le juge groupé alors que la
+        # suite pose des conditions : relue seule (n05). Celles qui portent une exception
+        # ont déjà eu leur seconde lecture.
+        directe = affirmations[0]
+        suite = " ".join(affirmations[1:])
+        if (
+            directe in douteuses
+            and fondees[douteuses.index(directe)]
+            and not _EXCEPTION.search(directe)
+            and _NEGATION.search(directe)
+            and _CONDITION.search(suite)
+        ):
+            relue = _juger_exceptions(
+                [directe], [r.content for r in cites], texte_cite, llm,
+                consigne=CONSIGNE_JUGE_REPONSE_DIRECTE,
+            )[0]
+            fondees[douteuses.index(directe)] = relue
+    rejetees = [a for a, fondee in zip(douteuses, fondees) if not fondee]
+    if not rejetees:
+        return reponse
+    # Les affirmations rejetées sont retirées du texte, le reste est gardé tel
+    # quel (cf. _tronquer) : jusqu'au 2026-10-28, une seule phrase rejetée
+    # faisait refuser toute la réponse. Rejoué le 2026-10-28 sur les 13
+    # réponses refusées des traces récentes (réponses figées, verdicts du juge
+    # enregistrés) : 5 récupérées et justes (q42, q46, q54, n08 ; q25 juste
+    # sur l'essentiel, avec un détail inexact que le juge acceptait déjà),
+    # aucune nouvelle réponse fausse ; q32, q58 et q56 (deux fois) restent
+    # refusées. 4 des 13 étaient acceptées au simple rejeu du juge, sans
+    # troncature : le juge ne rend pas toujours le même verdict.
+    # Pas de seconde rédaction sans l'affirmation rejetée : essayée le
+    # 2026-10-23 sur q42, q54, q56, elle a rendu deux réponses fausses
+    # acceptées (q54 : acompte permis après la vente ; q56 : délai du congé
+    # pour reprise appliqué à la vente). Retirer ne réécrit rien.
+    return _tronquer(reponse, affirmations, rejetees)
 
 
 # --- Complétude ---------------------------------------------------------------
@@ -1280,19 +1607,32 @@ def verifier_fidelite(
 
 def completude_a_verifier(reponse: ReponseGeneree, resultats: list[_ResultatRecherche]) -> bool:
     """La réponse s'appuie-t-elle sur un passage qui peut cacher une règle
-    générale : un passage cité de dérogation (« est rehaussée », q58) ou un
-    article de régime particulier (meublé, q02) ?
+    générale : un passage cité de dérogation (« est rehaussée », q58), un
+    article de régime particulier (meublé, q02), un article cité trop long
+    (t34), ou un premier article de la recherche laissé de côté (t37) ?
 
     Le contrôle de complétude appelé sur chaque réponse épuisait le quota
     gratuit du juge : le golden s'arrêtait à q17 au lieu de passer en entier
-    (2026-10-22). Les omissions trouvées jusqu'ici viennent toutes de ces deux
+    (2026-10-22). Les omissions trouvées jusqu'ici relèvent toutes de ces
     cas ; les autres réponses ne paient plus l'appel."""
     if reponse.refus:
         return False
     if any(_DEROGATION.search(c.passage) for c in reponse.citations):
         return True
+    # Premier article de la recherche non cité : la règle qui répond le plus
+    # directement peut y être. Couvre les omissions connues q02, q58 et t37
+    # (taxe foncière : art. 1415, « faits existants au 1er janvier », tu au
+    # profit de la mutation cadastrale) ; environ une réponse sur cinq
+    # (traces du 2026-10-28 et du 2026-10-30).
+    if _premier_non_cite(reponse, resultats) is not None:
+        return True
+    # Un article cité plus long que le budget mêle règle générale et régimes
+    # optionnels : t34 (2026-10-30) donnait l'amortissement de l'agrandissement
+    # « lorsque l'option est exercée » (art. 31 du CGI) pour la règle, qui
+    # l'exclut (b). Cas rare : le quota du juge n'en souffre pas.
     return any(
         _REGIME_PARTICULIER.search(r.metadata.get("section") or "")
+        or len(r.content) > LONGUEUR_MAX_CONTEXTE_CARACTERES
         for r in _articles_cites(reponse, resultats)
     )
 
@@ -1337,7 +1677,27 @@ def verifier_completude(
             "Attention : ces passages cités énoncent une dérogation ; vérifie que la "
             f"réponse donne aussi la règle qu'ils modifient.\n{liste}\n\n"
         )
-    message += f"Articles récupérés :\n{_bloc_articles(resultats)}"
+    # Même signal pour un article cité de régime particulier, avec son
+    # intitulé : t15 (2026-10-30) présentait l'art. 41-16 (syndicats à deux
+    # copropriétaires) comme la règle de toute copropriété, et la règle
+    # générale (art. 22) n'était pas parmi les articles récupérés.
+    regimes = _intitules_particuliers(reponse, resultats)
+    if regimes:
+        liste = "\n".join(f"- « {s} »" for s in regimes)
+        message += (
+            "Attention : ces articles cités relèvent d'un régime particulier. Une "
+            "réponse qui applique leur règle sans nommer ce régime (par exemple « en "
+            "meublé », « dans un syndicat de deux copropriétaires ») est trompeuse, "
+            f"sauf si la question le nomme elle-même.\n{liste}\n\n"
+        )
+    premier = _premier_non_cite(reponse, resultats)
+    if premier is not None:
+        message += (
+            f"Attention : l'article {premier.metadata.get('article', '?')}, classé premier "
+            "par la recherche, n'est pas cité par la réponse ; vérifie qu'il ne pose pas "
+            "la règle qui répond directement à la question.\n\n"
+        )
+    message += f"Articles récupérés :\n{_bloc_articles(resultats, requete=question)}"
     try:
         verdict = json.loads(llm.generer(CONSIGNE_COMPLETUDE, message))
     except json.JSONDecodeError:
@@ -1346,8 +1706,74 @@ def verifier_completude(
         return None
     regle = str(verdict.get("regle_generale") or "").strip()
     manque = str(verdict.get("manque") or "").strip()
-    if not regle or not manque:
+    # Preuve : une phrase d'un article récupéré, ou l'intitulé qui borne le
+    # régime particulier quand la règle générale n'a pas été récupérée.
+    if regle and manque and (
+        any(_passage_present(regle, r.content, SEUIL_CITATION) for r in resultats)
+        or any(_passage_present(regle, s, SEUIL_CITATION) for s in regimes)
+    ):
+        return f"{manque} (« {regle} »)"
+    # Omission signalée sans preuve retrouvée : sur un article de régime
+    # particulier, son intitulé suffit — t15 (2026-10-30), le juge voyait
+    # l'omission mais recopiait une règle générale absente des articles
+    # récupérés (art. 22 non retrouvé).
+    return precision_regimes(reponse, resultats)
+
+
+def precision_regimes(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> str | None:
+    """Phrase qui rappelle le régime particulier des articles cités (« L'article
+    41-16 relève des dispositions : « Section 2 : … deux copropriétaires ». »),
+    tirée de leur intitulé ; None si aucun article cité n'en relève."""
+    phrases = []
+    for r in _articles_cites(reponse, resultats):
+        section = r.metadata.get("section") or ""
+        if _REGIME_PARTICULIER.search(section):
+            dernier = section.split(" > ")[-1].strip()
+            phrases.append(f"L'article {r.metadata.get('article', '?')} relève de : « {dernier} ».")
+    return " ".join(dict.fromkeys(phrases)) or None
+
+
+def ajouter_precision(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> ReponseGeneree:
+    """Réponse complétée du rappel de régime particulier (precision_regimes).
+
+    Quand une omission est signalée et que la seconde rédaction échoue aux
+    garde-fous, la première est gardée : le rappel, tiré tel quel des
+    intitulés, l'empêche de passer pour la règle commune (t15)."""
+    precision = precision_regimes(reponse, resultats)
+    if reponse.refus or precision is None:
+        return reponse
+    return reponse.model_copy(update={"reponse": f"{reponse.reponse}\n\nPrécision : {precision}"})
+
+
+def _premier_non_cite(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> _ResultatRecherche | None:
+    """Premier article récupéré, s'il n'est pas cité par la réponse."""
+    if not resultats or not reponse.citations:
         return None
-    if not any(_passage_present(regle, r.content, SEUIL_CITATION) for r in resultats):
+    premier = resultats[0]
+    cites = {(c.doc_id, str(c.article)) for c in reponse.citations}
+    if (premier.doc_id, str(premier.metadata.get("article"))) in cites:
         return None
-    return f"{manque} (« {regle} »)"
+    return premier
+
+
+def _intitules_particuliers(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> list[str]:
+    """Dernier niveau d'intitulé des articles cités qui relèvent d'un régime
+    particulier (« Section 2 : Dispositions particulières aux syndicats dont
+    le nombre de voix est réparti entre deux copropriétaires »), sans doublon."""
+    intitules: list[str] = []
+    for r in _articles_cites(reponse, resultats):
+        section = r.metadata.get("section") or ""
+        if not _REGIME_PARTICULIER.search(section):
+            continue
+        dernier = section.split(" > ")[-1].strip()
+        if dernier not in intitules:
+            intitules.append(dernier)
+    return intitules

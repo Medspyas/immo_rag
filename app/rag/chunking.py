@@ -1,5 +1,8 @@
 """Découpage d'un texte de loi en morceaux ("chunks").
 
+Ce découpage ne sert plus qu'aux textes sans version structurée : ceux de
+Légifrance arrivent déjà découpés par l'API (legifrance.py).
+
 Un texte de loi nettoyé (data/clean/*.txt) est fourni en entrée ; une liste de
 morceaux est produite en sortie, à raison d'un morceau par article. La coupure
 suit les articles plutôt qu'un nombre de mots fixe, ce qui évite de séparer un
@@ -137,6 +140,24 @@ MENTION_VERSION = re.compile(
 )
 
 
+# En-tête d'article collé à sa mention de version par l'extraction du PDF
+# (« Article 14Modifié par Loi n°2001-1135… », loi de 1989) : sans séparation,
+# DEBUT_ARTICLE ne reconnaît pas la ligne et l'article est fondu dans le
+# précédent, donc introuvable sous son numéro.
+EN_TETE_COLLE = re.compile(
+    r"^(Article\s+[\w.-]+?)((?:Modifié par|Créé par|Création|Abrogé par|Transféré par)\s.*)$"
+)
+
+
+def _separer_en_tetes_colles(lignes: list[str]) -> list[str]:
+    """Remet sur deux lignes un en-tête d'article collé à sa mention de version."""
+    resultat: list[str] = []
+    for ligne in lignes:
+        colle = EN_TETE_COLLE.match(ligne.strip())
+        resultat.extend([colle.group(1), colle.group(2)] if colle else [ligne])
+    return resultat
+
+
 def _sans_mentions_de_version(contenu: str) -> str:
     """Retire les mentions de version qui suivent la ligne « Article … »."""
     lignes = contenu.split("\n")
@@ -168,7 +189,7 @@ def decouper_en_articles(texte: str, doc_id: str) -> list[RawChunk]:
     (titres, chapitres, sections) sont suivis au fil du texte et rattachés à
     chaque article qu'ils couvrent.
     """
-    lignes = texte.split("\n")
+    lignes = _separer_en_tetes_colles(texte.split("\n"))
     chunks: list[RawChunk] = []
     bloc: list[str] = []
     # Intitulés en vigueur, par niveau (indice dans NIVEAUX) ; un intitulé

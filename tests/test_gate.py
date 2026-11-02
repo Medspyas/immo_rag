@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from eval.gate import SEUILS, verifier_seuils
+from eval.gate import SEUILS, intervalle, verifier_seuils
 
 
 def test_tout_passe():
@@ -43,3 +43,21 @@ def test_fichier_de_seuils_lisible():
     assert seuils
     for borne in seuils.values():
         assert set(borne) <= {"min", "max"}
+
+
+def test_intervalle_encadre_la_mesure():
+    rangs = [1] * 28 + [2] * 6 + [None] * 3 + [4] * 3
+    mrr = sum(1 / r for r in rangs if r) / len(rangs)
+    bas, haut = intervalle(rangs, "mrr")
+    assert bas < mrr < haut
+
+
+def test_intervalle_nul_quand_toutes_les_questions_se_valent():
+    assert intervalle([1] * 20, "hit@1") == (1.0, 1.0)
+    assert intervalle([None] * 20, "hit@5") == (0.0, 0.0)
+
+
+def test_intervalle_se_resserre_avec_plus_de_questions():
+    petit = intervalle([1, None] * 20, "hit@1")
+    grand = intervalle([1, None] * 100, "hit@1")
+    assert grand[1] - grand[0] < petit[1] - petit[0]

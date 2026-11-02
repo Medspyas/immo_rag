@@ -26,6 +26,7 @@ Lancement :
     python -m eval.run_eval --k 5 --sortie .cache/traces_k5.jsonl
                                             # 5 articles envoyés au LLM au lieu de 10
     python -m eval.run_eval --relais-kimi   # Kimi relaie Groq si son quota du jour est épuisé
+    python -m eval.run_eval --fichier eval/questions_neuves.jsonl --avec-hors-corpus
 
 Rédaction par le seul llm_model, sans relais (--cascade pour les rétablir) :
 quand un modèle prenait le relais d'un autre selon le quota restant, la même
@@ -54,6 +55,7 @@ from app.rag.generator import (
     ModeleIndisponible,
     QuotaJournalierEpuise,
     _contextes_cites,
+    ajouter_precision,
     corriger_citations,
     generer_reponse,
     get_llm,
@@ -164,6 +166,8 @@ def evaluer(
                 seconde_refusee = seconde["verdict_local"] != "fondee"
                 if not seconde_refusee:
                     etat = seconde
+                else:
+                    etat = {**etat, "reponse": ajouter_precision(etat["reponse"], resultats)}
         trace = _trace(cas, resultats, question=question, **etat)
         trace["omission"] = omission
         trace["seconde_refusee"] = bool(omission) and seconde_refusee
@@ -190,7 +194,9 @@ def _rediger(question, resultats, llm, nli, settings: Settings, juge, omission=N
     debut = len(historique) if historique is not None else 0
     # reponse_citations est ce qu'on confronte à la mesure indépendante :
     # le texte tel que rédigé, avant que notre propre garde-fou étage 2 ne
-    # le transforme éventuellement en refus.
+    # le transforme éventuellement en refus. Une réponse tronquée par ce
+    # garde-fou (motif « réponse tronquée — … ») est gardée tronquée : c'est
+    # elle que l'utilisateur lit.
     reponse_apres = verifier_fidelite(
         reponse_citations,
         resultats,
@@ -201,7 +207,7 @@ def _rediger(question, resultats, llm, nli, settings: Settings, juge, omission=N
     )
     return {
         **etat,
-        "reponse": reponse_citations,
+        "reponse": reponse_citations if reponse_apres.refus else reponse_apres,
         "verdict_local": "refus_fidelite" if reponse_apres.refus else "fondee",
         "juges": historique[debut:] if historique is not None else [],
         "motif_fidelite": reponse_apres.motif if reponse_apres.refus else None,
@@ -240,6 +246,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--sortie", type=Path, default=FICHIER_TRACES, help="fichier de traces JSONL"
+    )
+    parser.add_argument(
+        "--fichier", type=Path, default=None,
+        help="autre jeu de questions, même format (défaut : le golden dataset)",
     )
     parser.add_argument("--ids", nargs="+", help="ne traiter que ces cas (ex. q22 q35)")
     parser.add_argument(
@@ -285,7 +295,7 @@ def main() -> None:
         index_articles=corpus.bm25,
     )
 
-    cas_golden = [c for c in charger_golden() if args.avec_hors_corpus or not c.hors_corpus]
+    cas_golden = [c for c in charger_golden(args.fichier) if args.avec_hors_corpus or not c.hors_corpus]
     if args.ids:
         cas_golden = [c for c in cas_golden if c.id in args.ids]
     if args.limit:

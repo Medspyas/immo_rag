@@ -47,10 +47,20 @@ class Settings(BaseSettings):
 
     # Garde-fou étage 1 (cf. CLAUDE.md) : sous ce score de reclassement, un
     # morceau est écarté des résultats plutôt que soumis au LLM générateur.
-    # Mesuré sur le golden dataset (ablation --rerank, 2026-09-10) : score du
-    # meilleur passage médiane 0,939 pour les questions du corpus, max 0,234
-    # pour les questions hors corpus. 0.3 sépare nettement les deux groupes.
-    seuil_garde_fou_retrieval: float = 0.3
+    # 0,3 jusqu'au 2026-10-27 : aucune question du golden n'y tombait, mais sur
+    # 20 questions neuves le reclasseur notait de bons articles entre 0,02 et
+    # 0,21, refusés à tort (3 refus sur 6 échecs). Aucun seuil ne sépare plus
+    # les deux groupes (une question hors corpus atteint 0,83) : l'étage 1
+    # n'arrête que le vide manifeste, l'étage 2 refuse le reste (7/7 questions
+    # hors corpus refusées). Gain mesuré : n13 juste, q33/q43 toujours refusées.
+    seuil_garde_fou_retrieval: float = 0.1
+
+    # Reclasseur noté aussi sur les fenêtres des articles longs (cf.
+    # retriever._fenetres_a_reclasser) : il ne lit que ~512 tokens par texte.
+    # Mesuré le 2026-10-27 et laissé coupé : MRR golden 0,786 → 0,804, questions
+    # neuves 0,670 → 0,691, mais reclassement 1,3 s → 5,2 s (p95 8,2 s) sur
+    # carte graphique, soit environ quatre fois plus de textes à noter.
+    rerank_fenetres: bool = False
 
     # Résultats demandés à chaque recherche (sens, mots-clés) avant fusion, et
     # candidats de la fusion soumis au reclasseur. Mesuré sur le golden dataset
@@ -116,6 +126,12 @@ class Settings(BaseSettings):
     controle_completude: Literal["cible", "toujours", "non"] = "cible"
 
     groq_api_key: str | None = None
+
+    # Identifiants de l'application PISTE (piste.gouv.fr, gratuit), lus
+    # seulement par le téléchargement des textes Légifrance
+    # (scripts/telecharger_legifrance.py) : l'application ne l'appelle pas.
+    piste_client_id: str = ""
+    piste_client_secret: str = ""
 
     # Origines autorisées à appeler l'API depuis un navigateur (front, phase 3).
     # Format JSON dans .env, ex. ["http://localhost:5173"] ; vide par défaut.

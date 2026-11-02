@@ -10,6 +10,7 @@ import json
 import uuid
 
 from app.config import Settings
+from app.rag.chunking import RawChunk
 from app.rag.fenetres import fenetres_article
 from app.rag.generator import CONSIGNE_COMPLETUDE
 from app.rag.nli import ScoreNLI
@@ -20,6 +21,7 @@ from app.rag.pipeline import (
     fichiers_du_corpus,
     identifiant_chunk,
     ingerer_document,
+    lire_source,
     preparer_morceaux,
     repondre,
 )
@@ -152,6 +154,34 @@ def test_fichiers_du_corpus_ecarte_les_textes_non_consolides(tmp_path):
     assert fichiers_du_corpus(tmp_path) == ["loi_a.txt", "loi_b.txt"]
 
 
+def test_fichiers_du_corpus_prefere_le_texte_de_l_api(tmp_path):
+    for nom in ("loi_a.txt", "loi_a.json", "loi_b.txt"):
+        (tmp_path / nom).write_text("x", encoding="utf-8")
+    assert fichiers_du_corpus(tmp_path) == ["loi_a.json", "loi_b.txt"]
+
+
+def test_lire_source_json_et_txt_donnent_les_memes_articles(tmp_path):
+    (tmp_path / "loi.txt").write_text(TEXTE, encoding="utf-8")
+    texte = {
+        "title": "Loi d'essai",
+        "sections": [],
+        "articles": [{"num": "2", "content": "<p>Le préavis est de trois mois.</p>",
+                      "intOrdre": 1, "etat": "VIGUEUR"}],
+    }
+    (tmp_path / "loi_api.json").write_text(json.dumps(texte), encoding="utf-8")
+    _, articles_txt = lire_source(tmp_path / "loi.txt")
+    texte_api, articles_api = lire_source(tmp_path / "loi_api.json")
+    assert articles_txt[0].doc_id == "loi"
+    assert [(a.doc_id, a.article) for a in articles_api] == [("loi_api", "2")]
+    assert "trois mois" in texte_api
+
+
+def test_preparer_morceaux_utilise_les_articles_fournis():
+    articles = [RawChunk(doc_id="loi", article="7", content="Article 7\nTexte.")]
+    morceaux = preparer_morceaux("", "loi", embeddings=_EmbeddingsFake(), articles=articles)
+    assert [m.metadata["article"] for m in morceaux] == ["7"]
+
+
 def test_documents_bm25_reprend_id_contenu_et_metadonnees():
     morceaux = preparer_morceaux(TEXTE, "loi-essai", embeddings=_EmbeddingsFake())
     docs = documents_bm25(morceaux)
@@ -166,6 +196,15 @@ def test_documents_bm25_indexe_les_questions_sans_toucher_au_contenu():
     assert docs[0].complement == "Combien de temps dure le préavis ?"
     assert "Combien de temps" not in docs[0].content
     assert all(d.complement == "" for d in docs[1:])
+
+
+def test_documents_bm25_indexe_le_chemin_de_sections():
+    articles = [RawChunk(doc_id="cgi", article="32", content="Article 32\nAbattement de 30 %.",
+                         section="Section II : Revenus imposables > I : Revenus fonciers")]
+    morceaux = preparer_morceaux("", "cgi", embeddings=_EmbeddingsFake(), articles=articles)
+    docs = documents_bm25(morceaux, {("cgi", "32"): ["Micro-foncier ?"]})
+    assert docs[0].complement == "Section II : Revenus imposables > I : Revenus fonciers\nMicro-foncier ?"
+    assert "Revenus fonciers" not in docs[0].content
 
 
 # --- construire_index_bm25 ---------------------------------------------------
@@ -553,4 +592,24 @@ def test_repondre_seconde_redaction_refusee_garde_la_premiere():
     reponse = repondre("Quel préavis ?", _RetrieverFake([_ARTICLE_15]), llm, _NLIToujoursFonde(), _toujours())
     assert reponse.refus is False
     assert reponse.reponse == "Le délai de préavis est de trois mois."
+
+
+def test_repondre_seconde_refusee_rappelle_le_regime_particulier():
+    # t15 : la première rédaction, gardée, ne doit pas passer pour la règle
+    # commune quand l'article cité relève d'un régime particulier.
+    article = _ResultatFake("loi-89-462", "Le délai de préavis est de trois mois.", article="15")
+    article.metadata["section"] = "Titre > Dispositions particulières aux logements meublés"
+    inventee = json.dumps(
+        {
+            "refus": False,
+            "reponse": "Le préavis est de six mois.",
+            "citations": [{"doc_id": "loi-89-462", "article": "15", "passage": "passage absent de l'article"}],
+        }
+    )
+    # Article de régime particulier : l'affirmation passe aussi par le juge.
+    juge_ok = json.dumps({"fondees": [True]})
+    llm = _LLMSelonConsigne([_REPONSE_OK, juge_ok, inventee, inventee], _INCOMPLETE)
+    reponse = repondre("Quel préavis ?", _RetrieverFake([article]), llm, _NLIToujoursFonde(), _settings())
+    assert reponse.reponse.startswith("Le délai de préavis est de trois mois.")
+    assert "Précision : L'article 15 relève de : « Dispositions particulières aux logements meublés »." in reponse.reponse
 

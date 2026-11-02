@@ -117,9 +117,13 @@ class OnnxReranker(RerankProvider):
     versionné. Classe utilisée si RERANK_PROVIDER=onnx.
     """
 
-    def __init__(self, model_dir: str, max_length: int = 512):
+    def __init__(self, model_dir: str, max_length: int = 512, taille_lot: int = 32):
         self._model_dir = model_dir
         self._max_length = max_length
+        # Textes notés par passage : un seul lot pour tous les candidats
+        # dépasse la mémoire de la carte graphique quand les fenêtres des
+        # articles longs s'y ajoutent (rerank_fenetres).
+        self._taille_lot = taille_lot
         self._session = None
         self._tokenizer = None
 
@@ -139,21 +143,24 @@ class OnnxReranker(RerankProvider):
         if not documents:
             return []
         session, tokenizer = self._charger()
-        entrees = tokenizer(
-            [query] * len(documents),
-            documents,
-            padding=True,
-            truncation=True,
-            max_length=self._max_length,
-            return_tensors="np",
-        )
-        logits = session.run(
-            ["logits"],
-            {"input_ids": entrees["input_ids"], "attention_mask": entrees["attention_mask"]},
-        )[0]
-        scores = logits[:, 0]
+        scores: list[float] = []
+        for debut in range(0, len(documents), self._taille_lot):
+            lot = documents[debut : debut + self._taille_lot]
+            entrees = tokenizer(
+                [query] * len(lot),
+                lot,
+                padding=True,
+                truncation=True,
+                max_length=self._max_length,
+                return_tensors="np",
+            )
+            logits = session.run(
+                ["logits"],
+                {"input_ids": entrees["input_ids"], "attention_mask": entrees["attention_mask"]},
+            )[0]
+            scores += [float(x) for x in logits[:, 0]]
         ordre = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
-        return [(i, _sigmoide(float(scores[i]))) for i in ordre]
+        return [(i, _sigmoide(scores[i])) for i in ordre]
 
 
 def _fournisseurs_onnx(disponibles: list[str]) -> list[str]:

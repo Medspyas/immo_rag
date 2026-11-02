@@ -29,6 +29,8 @@ Contenu du fichier :
   combien d'abrogés).
 - TEXTES_NON_CONSOLIDES, fichiers_du_corpus : textes de data/clean/ indexés,
   liste commune à l'ingestion réelle et à l'évaluation.
+- lire_source : texte et articles d'un fichier du corpus, réponse de l'API
+  Légifrance (.json, legifrance.py) ou texte extrait d'un PDF (.txt).
 - identifiant_chunk : identifiant stable d'un article — même loi et même numéro
   donnent toujours le même identifiant, d'une ingestion à l'autre.
 - preparer_morceaux : étapes 1 à 3, sans toucher à la base.
@@ -43,6 +45,7 @@ Contenu du fichier :
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
@@ -53,11 +56,12 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.observability.tracing import trace
 from app.rag.bm25_index import BM25Document, BM25Index
-from app.rag.chunking import decouper_en_articles
+from app.rag.chunking import RawChunk, decouper_en_articles
 from app.rag.contextualizer import ContextGenerator, contextualiser_chunks
 from app.rag.fenetres import fenetres_article
 from app.rag.generator import (
     ReponseGeneree,
+    ajouter_precision,
     completude_a_verifier,
     corriger_citations,
     generer_reponse,
@@ -65,6 +69,7 @@ from app.rag.generator import (
     verifier_completude,
     verifier_fidelite,
 )
+from app.rag.legifrance import articles_legifrance
 from app.rag.nli import ScoreNLI
 from app.rag.questions_articles import charger_questions
 from app.rag.retriever import HybridRetriever
@@ -90,10 +95,26 @@ TEXTES_NON_CONSOLIDES = {"loi_ALUR.txt"}
 def fichiers_du_corpus(dossier: Path) -> list[str]:
     """Noms des textes de dossier indexés en production : tous les .txt sauf
     TEXTES_NON_CONSOLIDES. L'évaluation lit la même liste, pour mesurer le
-    système réellement interrogé et non un sous-ensemble plus facile."""
-    return sorted(
-        p.name for p in dossier.glob("*.txt") if p.name not in TEXTES_NON_CONSOLIDES
-    )
+    système réellement interrogé et non un sous-ensemble plus facile.
+
+    Un texte téléchargé depuis l'API Légifrance (<doc_id>.json) remplace le
+    texte extrait du PDF de même nom (<doc_id>.txt)."""
+    textes = {p.stem: p.name for p in dossier.glob("*.txt") if p.name not in TEXTES_NON_CONSOLIDES}
+    textes.update({p.stem: p.name for p in dossier.glob("*.json")})
+    return sorted(textes.values())
+
+
+def lire_source(chemin: Path) -> tuple[str, list[RawChunk]]:
+    """Texte entier et articles d'un fichier du corpus, doc_id = nom du
+    fichier sans extension. Le texte entier ne sert qu'à la contextualisation
+    (contextualizer.py) : pour une réponse de l'API, il est recomposé à partir
+    des articles."""
+    doc_id = chemin.stem
+    if chemin.suffix == ".json":
+        articles = articles_legifrance(json.loads(chemin.read_text(encoding="utf-8")), doc_id)
+        return "\n\n".join(a.content for a in articles), articles
+    texte = chemin.read_text(encoding="utf-8")
+    return texte, decouper_en_articles(texte, doc_id)
 
 
 class _Embeddings(Protocol):
@@ -160,6 +181,7 @@ def preparer_morceaux(
     *,
     embeddings: _Embeddings,
     contextualizer: ContextGenerator | None = None,
+    articles: list[RawChunk] | None = None,
 ) -> list[Chunk]:
     """Découpe, situe (facultatif) puis vectorise un texte de loi.
 
@@ -170,9 +192,13 @@ def preparer_morceaux(
     doc_id nomme la loi (en général le nom du fichier sans extension) ; il relie
     entre eux tous les morceaux d'un même texte.
 
+    articles, s'il est fourni (texte déjà structuré, cf. lire_source), remplace
+    le découpage du texte.
+
     Lève une erreur si le texte ne contient aucun article exploitable.
     """
-    articles = decouper_en_articles(texte, doc_id)
+    if articles is None:
+        articles = decouper_en_articles(texte, doc_id)
     if not articles:
         raise ValueError(
             f"Aucun article trouvé dans le texte de « {doc_id} » : rien à indexer."
@@ -181,6 +207,9 @@ def preparer_morceaux(
     if contextualizer is not None:
         articles = contextualiser_chunks(articles, texte, contextualizer)
 
+    # Le texte seul est vectorisé. Le chemin de sections ajouté après lui,
+    # mesuré le 2026-10-28 (textes de l'API) : golden MRR 0,794 → 0,801 (q32),
+    # mais questions neuves 0,659 → 0,646, hit@5 88 % → 76 %. Écarté.
     vecteurs = embeddings.embed_documents([a.content for a in articles])
     # Fenêtres des articles longs (fenetres.py), vectorisées en un seul appel
     # puis rendues à leur article.
@@ -216,6 +245,7 @@ def ingerer_document(
     embeddings: _Embeddings,
     vector_store: _VectorStore,
     contextualizer: ContextGenerator | None = None,
+    articles: list[RawChunk] | None = None,
 ) -> RapportIngestion:
     """Enchaîne les quatre étapes, rangement en base compris.
 
@@ -223,7 +253,8 @@ def ingerer_document(
     sans cela, un article supprimé d'une version à jour resterait en base.
     """
     morceaux = preparer_morceaux(
-        texte, doc_id, embeddings=embeddings, contextualizer=contextualizer
+        texte, doc_id, embeddings=embeddings, contextualizer=contextualizer,
+        articles=articles,
     )
 
     vector_store.delete_by_doc(doc_id)
@@ -242,9 +273,16 @@ def documents_bm25(
     questions: dict[tuple[str, str], list[str]] | None = None,
 ) -> list[BM25Document]:
     """Convertit des morceaux (préparés ou relus en base) en entrées pour
-    l'index BM25, qui n'a pas besoin des vecteurs. Les questions de chaque
-    article (questions_articles.py) sont indexées avec lui, sans entrer dans
-    son texte."""
+    l'index BM25, qui n'a pas besoin des vecteurs. Le chemin de sections de
+    chaque article et ses questions (questions_articles.py) sont indexés avec
+    lui, sans entrer dans son texte.
+
+    Le chemin de sections remplace un signal que le PDF donnait par accident :
+    294 articles du code des impôts y traînaient en fin de texte les intitulés
+    de leur hiérarchie (« Impôt sur le revenu », « Revenus imposables »). Sans
+    eux (textes de l'API Légifrance, 2026-10-28), l'article 32 (micro-foncier,
+    q40) sortait des candidats. Avec le chemin : golden MRR 0,774 → 0,794, q40
+    1re ; questions neuves 0,662 → 0,659 (une question perd un rang)."""
     questions = charger_questions() if questions is None else questions
     return [
         BM25Document(
@@ -252,7 +290,10 @@ def documents_bm25(
             doc_id=m.doc_id,
             content=m.content,
             metadata=m.metadata,
-            complement="\n".join(questions.get((m.doc_id, m.metadata.get("article")), [])),
+            complement="\n".join(
+                ([m.metadata["section"]] if m.metadata.get("section") else [])
+                + questions.get((m.doc_id, m.metadata.get("article")), [])
+            ),
         )
         for m in morceaux
     ]
@@ -387,7 +428,9 @@ def _repondre_question(
     Si la seconde rédaction échoue aux garde-fous, la première est gardée :
     déjà vérifiée phrase par phrase, elle vaut mieux qu'un refus. Le contrôle
     signale aussi des omissions qui n'en sont pas, et la seconde rédaction
-    transformait alors une bonne réponse en refus (q16, 2026-10-21)."""
+    transformait alors une bonne réponse en refus (q16, 2026-10-21). Si un
+    article cité relève d'un régime particulier, la première est gardée avec
+    ce régime rappelé (ajouter_precision, t15)."""
     resultats = retriever.search(question, k=k)
     reponse = _rediger_et_verifier(question, resultats, llm, nli, settings, juge)
     if not _completude_a_controler(reponse, resultats, settings):
@@ -396,7 +439,7 @@ def _repondre_question(
     if omission is None:
         return reponse
     seconde = _rediger_et_verifier(question, resultats, llm, nli, settings, juge, omission)
-    return reponse if seconde.refus else seconde
+    return ajouter_precision(reponse, resultats) if seconde.refus else seconde
 
 
 def _completude_a_controler(reponse: ReponseGeneree, resultats: list, settings: Settings) -> bool:

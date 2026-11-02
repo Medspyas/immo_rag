@@ -281,6 +281,30 @@ def test_le_reclasseur_recoit_les_questions_generees_entre_titre_et_article(monk
     assert resultats[0].content == "Article 7\nSont nulles…"
 
 
+def test_le_renvoi_aux_personnes_de_larticle_1er_hoguet_est_glose():
+    dense = SearchResult(
+        id=uuid4(), doc_id="Loi_hoguet",
+        content="Article 6\nLes conventions conclues avec les personnes visées à l'article 1er…",
+        metadata={"titre": "Loi Hoguet", "article": "6"}, score=0.9,
+    )
+    reclasseur = _RerankerFake()
+    resultats = _retriever([dense], [], reranker=reclasseur).search("q")
+    assert reclasseur.textes_recus[0].startswith(
+        "Loi Hoguet\nLes personnes visées à l'article 1er sont les agents immobiliers"
+    )
+    assert resultats[0].content.startswith("Article 6\nLes conventions")
+
+
+def test_sans_renvoi_pas_de_glose():
+    dense = SearchResult(
+        id=uuid4(), doc_id="Loi_hoguet", content="Article 7\nSont nulles…",
+        metadata={"titre": "Loi Hoguet", "article": "7"}, score=0.9,
+    )
+    reclasseur = _RerankerFake()
+    _retriever([dense], [], reranker=reclasseur).search("q")
+    assert "agents immobiliers" not in reclasseur.textes_recus[0]
+
+
 def test_pour_une_loi_le_chapitre_nest_pas_ajoute():
     dense = SearchResult(
         id=uuid4(), doc_id="loi_06_07_1989", content="Article 15\nLe congé…",

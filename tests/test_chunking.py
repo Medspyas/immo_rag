@@ -162,6 +162,18 @@ def test_mentions_de_version_sont_retirees_du_texte():
     assert chunk.content == "Article 4\nToute personne habilitée justifie d'une compétence professionnelle."
 
 
+def test_en_tete_colle_a_la_mention_de_version_est_reconnu():
+    # Loi de 1989 : « Article 14Modifié par… » fondait l'article 14 dans le 13.
+    texte = (
+        "Article 13\nLes dispositions peuvent être invoquées.\n"
+        "Article 14Modifié par Loi n°2001-1135 du 3 décembre 2001 - art. 14\n"
+        "Lors du décès du locataire, le contrat de location est transféré.\n"
+    )
+    chunks = decouper_en_articles(texte, "loi")
+    assert [c.article for c in chunks] == ["13", "14"]
+    assert chunks[1].content == "Article 14\nLors du décès du locataire, le contrat de location est transféré."
+
+
 def test_article_qui_modifie_une_autre_loi_garde_son_contenu():
     # Loi de 1989, art. 26 : « Modifie Loi n°86-1290… » est le contenu même de l'article.
     texte = "Article 26\nModifie Loi n°86-1290 du 23 décembre 1986 - art. 25 (M)\n"

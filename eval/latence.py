@@ -205,6 +205,7 @@ def main() -> None:
         # recherche seule est mesurée sans refus, comme dans l'ablation.
         seuil_rerank=settings.seuil_garde_fou_retrieval if args.complet else None,
         index_articles=corpus.bm25,
+        rerank_fenetres=settings.rerank_fenetres,
     )
 
     if args.complet:
