@@ -60,6 +60,7 @@ from app.rag.generator import (
     generer_reponse,
     get_llm,
     get_llm_juge,
+    rappeler_champ,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
@@ -168,6 +169,8 @@ def evaluer(
                     etat = seconde
                 else:
                     etat = {**etat, "reponse": ajouter_precision(etat["reponse"], resultats)}
+        if etat["verdict_local"] == "fondee":
+            etat = {**etat, "reponse": rappeler_champ(etat["reponse"], resultats)}
         trace = _trace(cas, resultats, question=question, **etat)
         trace["omission"] = omission
         trace["seconde_refusee"] = bool(omission) and seconde_refusee
@@ -204,6 +207,7 @@ def _rediger(question, resultats, llm, nli, settings: Settings, juge, omission=N
         settings.seuil_nli_haut,
         settings.seuil_nli_contradiction,
         juge or llm,
+        question,
     )
     return {
         **etat,

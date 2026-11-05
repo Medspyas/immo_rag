@@ -16,15 +16,18 @@ from app.rag.generator import (
     ModeleIndisponible,
     QuotaJournalierEpuise,
     ReponseGeneree,
+    _bloc_articles,
     _decouper_en_affirmations,
     _extraits,
     _preselectionner,
     _retirer_affirmations,
+    champ_application,
     completude_a_verifier,
     corriger_citations,
     generer_reponse,
     get_llm,
     get_llm_juge,
+    rappeler_champ,
     reparer_citations,
     retirer_exemples,
     sans_exemples,
@@ -1118,6 +1121,42 @@ def test_le_juge_recoit_la_reponse_complete_pour_les_renvois():
     assert recu.index(texte) < recu.index("Affirmations à vérifier :")
 
 
+def test_acteur_absent_des_articles_cites_part_au_juge():
+    # vh05 : « la commune » alors que l'article ne nomme que l'administration.
+    reponse = _reponse_avec_citation("La commune dispose d'un délai de préavis de trois mois.")
+    juge = _JugeLLM(fondee=False)
+    resultat = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.99), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge
+    )
+    assert juge.appele
+    assert resultat.refus
+
+
+def test_acteur_present_dans_l_article_ne_derange_pas_le_juge():
+    reponse = _reponse_avec_citation("Le locataire donne un préavis de trois mois.")
+    juge = _JugeLLM(fondee=False)
+    resultat = verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.99), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge
+    )
+    assert not juge.appele
+    assert not resultat.refus
+
+
+def test_le_juge_recoit_la_question_comme_situation():
+    # v089 / v102 : les faits de la situation (« si ma commune a voté ») ne
+    # figurent pas dans l'article ; sans la question, le juge rejetait.
+    reponse = _reponse_avec_citation("Le préavis est plutôt court.")
+    juge = _JugeLLM(fondee=True)
+    question = "Je loue en meublé depuis 2025, quel préavis ?"
+    verifier_fidelite(
+        reponse, [_ARTICLE_15], _NLIFixe(0.5), seuil_haut=0.7, seuil_contradiction=0.7,
+        llm=juge, question=question,
+    )
+    recu = juge.question_recue
+    assert question in recu
+    assert recu.index(question) < recu.index("Texte source :")
+
+
 def test_le_juge_recoit_les_passages_cites_en_tete():
     reponse = _reponse_avec_citation("Le préavis est plutôt court.")
     juge = _JugeLLM(fondee=True)
@@ -1452,6 +1491,34 @@ def test_completude_a_verifier_passage_de_derogation():
     assert completude_a_verifier(reponse, [_ARTICLE_156]) is True
 
 
+def _reponse_parking() -> tuple[ReponseGeneree, _Resultat]:
+    # v065 : « Dans ce cas » renvoie à la clause de priorité du règlement.
+    article = _Resultat(
+        "loi-65-557",
+        "Le règlement de copropriété peut prévoir une clause attribuant un droit de priorité. "
+        "Dans ce cas, le vendeur doit faire connaître au syndic son intention de vendre.",
+        article="8-1",
+    )
+    reponse = ReponseGeneree(
+        refus=False, reponse="Oui, le vendeur doit prévenir le syndic.",
+        citations=[Citation(doc_id="loi-65-557", article="8-1",
+                            passage="Dans ce cas, le vendeur doit faire connaître au syndic son intention de vendre.")],
+    )
+    return reponse, article
+
+
+def test_completude_a_verifier_passage_qui_renvoie_au_cas_precedent():
+    reponse, article = _reponse_parking()
+    assert completude_a_verifier(reponse, [article]) is True
+
+
+def test_completude_signale_un_passage_conditionnel():
+    reponse, article = _reponse_parking()
+    llm = _LLMFake(json.dumps({"complete": True}))
+    verifier_completude("Q ?", reponse, [article], llm)
+    assert "cas posé juste avant" in llm.question_recue
+
+
 def test_completude_a_verifier_article_de_regime_particulier():
     # q02 : seul l'article des meublés est cité, la règle générale est ailleurs.
     meuble = _Resultat("loi-89-462", "Le délai de préavis est d'un mois.", article="25-8",
@@ -1567,6 +1634,24 @@ def test_montants_presents_dans_l_article_acceptes():
         citations=[Citation(doc_id="code_impot", article="977", passage="Supérieure à 800 000 €")],
     )
     assert verifier_fidelite(reponse, [article], _NLIFixe(0.99), 0.5, 0.7).refus is False
+
+
+def test_montant_repris_de_la_question_accepte():
+    # v008 (2026-11-02) : « 15 % » vient de la question, pas de l'article.
+    article = _Resultat(
+        "loi_1989", "Toutefois, si la hausse est supérieure à 10 %, elle s'applique par tiers annuel.",
+        article="25-9",
+    )
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse="Non, la hausse de 15 % s'applique par tiers annuel.",
+        citations=[Citation(doc_id="loi_1989", article="25-9", passage="elle s'applique par tiers annuel")],
+    )
+    question = "Mon loyer augmente de 15 % : dois-je tout payer immédiatement ?"
+    assert verifier_fidelite(reponse, [article], _NLIFixe(0.99), 0.5, 0.7).refus is True
+    assert verifier_fidelite(
+        reponse, [article], _NLIFixe(0.99), 0.5, 0.7, question=question
+    ).refus is False
 
 
 _ARTICLE_41_12 = _Resultat(
@@ -1703,3 +1788,44 @@ def test_introduction_avec_sujet_reste_rattachee():
 def test_notamment_nest_pas_double():
     texte = "Elle permet notamment :\n- de résilier le bail."
     assert _decouper_en_affirmations(texte) == ["Elle permet notamment : de résilier le bail."]
+
+
+_ARTICLE_2_TERDECIES_G = _Resultat(
+    "code_impot3",
+    "Article 2 terdecies G\nPour l'application du o du 1° du I de l'article 31 du code général des "
+    "impôts :\n1° Le délai de préavis est de trois mois.",
+    article="2 terdecies G",
+)
+
+
+def test_champ_application_lu_en_tete_d_article():
+    assert champ_application(_ARTICLE_2_TERDECIES_G.content) == (
+        "Pour l'application du o du 1° du I de l'article 31 du code général des impôts"
+    )
+    assert champ_application(_ARTICLE_15.content) is None
+
+
+def test_champ_application_montre_au_modele():
+    assert "Champ d'application : Pour l'application du o" in _bloc_articles([_ARTICLE_2_TERDECIES_G])
+
+
+def test_article_a_champ_d_application_part_au_juge():
+    # vh13 : plafonds d'une déduction fiscale présentés comme ceux du logement social.
+    reponse = _reponse_avec_citation("Le délai de préavis est de trois mois.", article="2 terdecies G")
+    reponse.citations[0].doc_id = "code_impot3"
+    juge = _JugeLLM(fondee=False)
+    resultat = verifier_fidelite(
+        reponse, [_ARTICLE_2_TERDECIES_G], _NLIFixe(0.99), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge
+    )
+    assert juge.appele
+    assert resultat.refus
+    assert completude_a_verifier(reponse, [_ARTICLE_2_TERDECIES_G])
+
+
+def test_rappel_du_champ_quand_la_reponse_ne_le_nomme_pas():
+    reponse = _reponse_avec_citation("Le délai de préavis est de trois mois.", article="2 terdecies G")
+    reponse.citations[0].doc_id = "code_impot3"
+    complete = rappeler_champ(reponse, [_ARTICLE_2_TERDECIES_G])
+    assert "Précision : L'article 2 terdecies G vaut seulement « Pour l'application du o" in complete.reponse
+    nomme = reponse.model_copy(update={"reponse": "Pour la déduction de l'article 31, le délai est de trois mois."})
+    assert rappeler_champ(nomme, [_ARTICLE_2_TERDECIES_G]).reponse == nomme.reponse

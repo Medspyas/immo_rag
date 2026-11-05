@@ -65,6 +65,7 @@ from app.rag.generator import (
     completude_a_verifier,
     corriger_citations,
     generer_reponse,
+    rappeler_champ,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
@@ -434,12 +435,12 @@ def _repondre_question(
     resultats = retriever.search(question, k=k)
     reponse = _rediger_et_verifier(question, resultats, llm, nli, settings, juge)
     if not _completude_a_controler(reponse, resultats, settings):
-        return reponse
+        return rappeler_champ(reponse, resultats)
     omission = verifier_completude(question, reponse, resultats, juge or llm)
     if omission is None:
-        return reponse
+        return rappeler_champ(reponse, resultats)
     seconde = _rediger_et_verifier(question, resultats, llm, nli, settings, juge, omission)
-    return ajouter_precision(reponse, resultats) if seconde.refus else seconde
+    return rappeler_champ(ajouter_precision(reponse, resultats) if seconde.refus else seconde, resultats)
 
 
 def _completude_a_controler(reponse: ReponseGeneree, resultats: list, settings: Settings) -> bool:
@@ -472,4 +473,5 @@ def _rediger_et_verifier(
         settings.seuil_nli_haut,
         settings.seuil_nli_contradiction,
         llm=juge or llm,
+        question=question,
     )

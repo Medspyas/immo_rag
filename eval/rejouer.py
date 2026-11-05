@@ -76,6 +76,7 @@ def rejouer_trace(trace: dict, nli, settings: Settings) -> tuple[str, str | None
         settings.seuil_nli_haut,
         settings.seuil_nli_contradiction,
         juge,
+        trace.get("question", ""),
     )
     if apres_fidelite.refus:
         return "refus_fidelite", apres_fidelite.motif

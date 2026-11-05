@@ -71,6 +71,9 @@ jamais un autre nom.
 un régime particulier ne doit jamais être présentée comme la règle générale : \
 précise toujours le régime concerné, et donne d'abord la règle générale \
 lorsqu'un article la fournit.
+- La ligne « Champ d'application » borne un article à l'application d'un autre \
+texte (par exemple une déduction fiscale) : ne présente pas sa règle comme celle \
+d'un autre sujet, et nomme ce cadre dans la réponse.
 - N'affirme pas qu'une règle ou une exception est la seule (« uniquement », \
 « seulement ») si l'article ne le dit pas : d'autres textes peuvent en prévoir.
 - Ne transforme pas une règle de calcul en égalité (« est égale à ») : \
@@ -341,7 +344,13 @@ def _bloc_articles(
         # pour la loi de 1989, « code civil » pour son article 6).
         titre = r.metadata.get("titre")
         texte = f"\nTexte : {titre}" if titre else ""
-        entete = f"[{i}] Document : {r.doc_id} — Article {article}{marque}{texte}{situation}\n"
+        # Article qui ne vaut que pour l'application d'un autre article
+        # (« Pour l'application du o du 1° du I de l'article 31 du CGI : »).
+        champ = champ_application(r.content)
+        portee = f"\nChamp d'application : {champ}" if champ else ""
+        entete = (
+            f"[{i}] Document : {r.doc_id} — Article {article}{marque}{texte}{situation}{portee}\n"
+        )
         contenu = r.content
         if not blocs and len(entete) + len(contenu) > budget:
             contenu = _raccourcir(contenu, requete, budget - len(entete))
@@ -916,6 +925,48 @@ _REGIME_PARTICULIER = re.compile(r"particuli|meublé|mobilité|résidences-servi
 # de lui seul peut taire la règle générale. Le NLI fondait ainsi « jusqu'à
 # 21 400 € » sans le plafond de 10 700 € (q58, art. 156, 2026-10-20).
 _DEROGATION = re.compile(r"par dérogation|par exception|rehauss", re.IGNORECASE)
+# Passage cité qui ne vaut que dans le cas posé juste avant dans l'article
+# (« Dans ce cas, le vendeur doit… ») : recopié seul, il fait d'une règle
+# conditionnelle une obligation générale (v065, art. 8-1 de la loi de 1965 :
+# notification au syndic seulement si le règlement prévoit un droit de
+# priorité, 2026-11-03).
+_CAS_PRECEDENT = re.compile(
+    r"^\W*(?:dans ce cas|en ce cas|dans cette hypothèse|dans ces cas|en pareil cas)\b",
+    re.IGNORECASE,
+)
+# Article dont la première phrase borne la portée à l'application d'un autre
+# texte : l'art. 2 terdecies G de l'annexe III du CGI fixe des plafonds de
+# ressources « pour l'application du o du 1° du I de l'article 31 » (déduction
+# fiscale du bailleur) ; le juge l'acceptait comme les plafonds pour obtenir un
+# logement social (vh13, hors corpus, 2026-11-05).
+_CHAMP = re.compile(r"\A[^\n]*\n\s*(Pour l['’]application d[^:\n]{1,300}?)\s*:")
+
+
+def champ_application(contenu: str) -> str | None:
+    """Phrase qui borne la portée d'un article (« Pour l'application du … de
+    l'article 31 du code général des impôts »), ou None."""
+    m = _CHAMP.search(contenu)
+    return m.group(1).strip() if m else None
+
+
+# Acteurs juridiques (qui détient le droit, qui supporte l'obligation). Une
+# affirmation qui nomme un acteur absent des articles cités part au juge : le
+# NLI fondait « la commune dispose de six mois » sur l'art. 1904 du CGI, où ce
+# délai est celui de l'administration fiscale (vh05, 2026-11-04). Un synonyme
+# (« preneur » pour « locataire ») ne coûte qu'un appel au juge, pas un refus.
+_ACTEURS = re.compile(
+    r"\b(commune|maire|préfet|bailleur|locataire|preneur|syndic|syndicat|copropriétaire"
+    r"|vendeur|acquéreur|acheteur|notaire|administration|trésor|indivisaire"
+    r"|usufruitier|nu-propriétaire|mandataire|caution|organisme)s?\b",
+    re.IGNORECASE,
+)
+
+
+def _acteurs(texte: str) -> set[str]:
+    """Acteurs juridiques nommés dans un texte, au singulier et en minuscules."""
+    return {m.group(1).lower() for m in _ACTEURS.finditer(texte)}
+
+
 # Exception posée par une affirmation de la réponse (« sauf si… »).
 _EXCEPTION = re.compile(r"\bsauf\b|à l'exception|excepté|hormis", re.IGNORECASE)
 # Condition, délai ou terme posés par la suite d'une réponse : la réponse
@@ -949,11 +1000,21 @@ texte réserve la règle à une condition ou à un cas particulier (« quand »,
 « lorsque », « toutefois », un régime précis) et que l'affirmation la présente \
 comme la règle générale sans cette condition, réponds false. De même si \
 l'affirmation rattache à une règle une exception (« sauf… ») que le texte attache \
-à une autre règle : chaque exception vaut seulement pour la phrase qui la porte.
+à une autre règle : chaque exception vaut seulement pour la phrase qui la porte. Un article doté \
+d'une ligne « Champ d'application » ne vaut que dans ce cadre : une affirmation \
+qui applique sa règle à un autre sujet (celui de la question, par exemple) est \
+false.
 
 La réponse complète est fournie seulement pour comprendre les renvois d'une \
 affirmation (« ce délai », « il ») : elle n'est pas une source, seul le texte \
 source fonde une affirmation.
+La question de l'utilisateur, si elle est fournie, décrit sa situation (dates, \
+type de bien, décision déjà prise par sa commune…). Une affirmation qui applique \
+la règle du texte aux faits de cette situation est fondée si la règle l'est : ces \
+faits n'ont pas à figurer dans le texte source. La question ne fonde en revanche \
+jamais une règle de droit, une durée, un montant, une condition légale, ni qui \
+détient un droit ou supporte une obligation : si le texte donne un délai à \
+l'administration, il ne le donne pas à la commune.
 Réponds UNIQUEMENT par ce JSON, sans texte autour, une valeur par affirmation \
 dans l'ordre :
 {"fondees": [true, false, ...]}"""
@@ -1247,7 +1308,11 @@ def _contextes_cites(
 
 
 def _juger_fidelite(
-    affirmations: list[str], contexte: str, llm: LLM, reponse_complete: str = ""
+    affirmations: list[str],
+    contexte: str,
+    llm: LLM,
+    reponse_complete: str = "",
+    question: str = "",
 ) -> list[bool]:
     """Repli pour les affirmations que le NLI n'a pas validées : demande à un
     LLM si le texte source fonde chacune d'elles.
@@ -1259,9 +1324,17 @@ def _juger_fidelite(
 
     La réponse complète accompagne les affirmations : une phrase découpée
     (« Ce délai est réduit à un mois… ») ne dit pas seule de quoi elle parle,
-    et le juge la rejetait à tort (mesuré sur q02 le 2026-10-03)."""
+    et le juge la rejetait à tort (mesuré sur q02 le 2026-10-03).
+
+    La question accompagne aussi les affirmations : une réponse qui reprend la
+    situation de l'utilisateur (« logements de plus de 40 ans », v089 ; « si
+    ma commune a voté », v102) était rejetée, ces faits ne figurant pas dans
+    le texte source (2026-11-04)."""
     liste = "\n".join(f"{i}. {a}" for i, a in enumerate(affirmations, 1))
-    message = f"Texte source :\n{contexte}\n\n"
+    message = ""
+    if question:
+        message += f"Question de l'utilisateur (sa situation) :\n{question}\n\n"
+    message += f"Texte source :\n{contexte}\n\n"
     if reponse_complete:
         message += f"Réponse complète (pour comprendre les renvois) :\n{reponse_complete}\n\n"
     message += f"Affirmations à vérifier :\n{liste}"
@@ -1457,9 +1530,14 @@ def verifier_fidelite(
     seuil_haut: float,
     seuil_contradiction: float,
     llm: LLM | None = None,
+    question: str = "",
 ) -> ReponseGeneree:
     """Garde-fou étage 2 (suite) : la réponse rédigée colle-t-elle aux articles
     qu'elle cite ?
+
+    `question` sert au contrôle des montants (un montant repris de la question,
+    « une hausse de 15 % », v008, n'est pas tiré des sources) et est montrée
+    au juge comme situation de l'utilisateur (v089, v102).
 
     Une bonne citation (vérifiée par verifier_citations) ne garantit pas que le
     texte rédigé autour reste fidèle à ce qu'elle dit : le LLM peut broder à
@@ -1496,7 +1574,7 @@ def verifier_fidelite(
         return reponse
 
     cites = _articles_cites(reponse, resultats)
-    inconnu = _montant_inconnu(reponse.reponse, [r.content for r in cites])
+    inconnu = _montant_inconnu(reponse.reponse, [r.content for r in cites] + [question])
     if inconnu:
         # L'affirmation qui porte le montant est retirée comme une affirmation
         # rejetée (cf. _tronquer) : « Ces taux, cumulés, représentent 100 % »
@@ -1507,7 +1585,9 @@ def verifier_fidelite(
             return ReponseGeneree(
                 refus=True, motif=f"montant absent des articles cités : « {inconnu} »"
             )
-        return verifier_fidelite(tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm)
+        return verifier_fidelite(
+            tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm, question
+        )
     fausse = _guillemets_inconnus(reponse.reponse, [r.content for r in cites])
     if fausse:
         # Même traitement qu'un montant inconnu : l'affirmation qui porte la
@@ -1518,13 +1598,20 @@ def verifier_fidelite(
             return ReponseGeneree(
                 refus=True, motif=f"citation absente des articles cités : « {fausse} »"
             )
-        return verifier_fidelite(tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm)
+        return verifier_fidelite(
+            tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm, question
+        )
     extraits = _extraits([r.content for r in cites])
     # Extraits d'articles d'un régime particulier : une affirmation que le NLI
     # fonde sur l'un d'eux part au juge, seul à voir l'intitulé « Situé dans ».
     particuliers = set(
         _extraits(
-            [r.content for r in cites if _REGIME_PARTICULIER.search(r.metadata.get("section") or "")]
+            [
+                r.content
+                for r in cites
+                if _REGIME_PARTICULIER.search(r.metadata.get("section") or "")
+                or champ_application(r.content)
+            ]
         )
     )
     # Le juge reçoit tous les articles cités ensemble, avec leur intitulé :
@@ -1537,6 +1624,7 @@ def verifier_fidelite(
     passages = "\n".join(f"- Article {c.article} : « {c.passage} »" for c in reponse.citations)
     texte_cite = f"Passages cités par la réponse :\n{passages}\n\nArticles complets :\n{_bloc_articles(cites, requete=reponse.reponse)}"
 
+    acteurs_cites = _acteurs(" ".join(r.content for r in cites))
     douteuses: list[str] = []
     for affirmation in affirmations:
         selection = _preselectionner(extraits, affirmation)
@@ -1551,7 +1639,14 @@ def verifier_fidelite(
         # « sauf si le logement est loué à un étudiant » (art. 22-1) rattaché
         # à la cosignature des parents (art. 22-2), t05 le 2026-10-30.
         exception = _EXCEPTION.search(affirmation) is not None
-        if implication < seuil_haut or contradiction >= seuil_contradiction or regime or exception:
+        acteur = not _acteurs(affirmation) <= acteurs_cites
+        if (
+            implication < seuil_haut
+            or contradiction >= seuil_contradiction
+            or regime
+            or exception
+            or acteur
+        ):
             douteuses.append(affirmation)
 
     if not douteuses:
@@ -1559,7 +1654,7 @@ def verifier_fidelite(
     if llm is None:
         fondees = [False] * len(douteuses)
     else:
-        fondees = _juger_fidelite(douteuses, texte_cite, llm, reponse.reponse)
+        fondees = _juger_fidelite(douteuses, texte_cite, llm, reponse.reponse, question)
         exceptions = [a for a, f in zip(douteuses, fondees) if f and _EXCEPTION.search(a)]
         if exceptions:
             relues = dict(
@@ -1617,7 +1712,7 @@ def completude_a_verifier(reponse: ReponseGeneree, resultats: list[_ResultatRech
     cas ; les autres réponses ne paient plus l'appel."""
     if reponse.refus:
         return False
-    if any(_DEROGATION.search(c.passage) for c in reponse.citations):
+    if any(_DEROGATION.search(c.passage) or _CAS_PRECEDENT.search(c.passage) for c in reponse.citations):
         return True
     # Premier article de la recherche non cité : la règle qui répond le plus
     # directement peut y être. Couvre les omissions connues q02, q58 et t37
@@ -1632,6 +1727,7 @@ def completude_a_verifier(reponse: ReponseGeneree, resultats: list[_ResultatRech
     # l'exclut (b). Cas rare : le quota du juge n'en souffre pas.
     return any(
         _REGIME_PARTICULIER.search(r.metadata.get("section") or "")
+        or champ_application(r.content)
         or len(r.content) > LONGUEUR_MAX_CONTEXTE_CARACTERES
         for r in _articles_cites(reponse, resultats)
     )
@@ -1676,6 +1772,14 @@ def verifier_completude(
         message += (
             "Attention : ces passages cités énoncent une dérogation ; vérifie que la "
             f"réponse donne aussi la règle qu'ils modifient.\n{liste}\n\n"
+        )
+    conditionnels = [c.passage for c in reponse.citations if _CAS_PRECEDENT.search(c.passage)]
+    if conditionnels:
+        liste = "\n".join(f"- « {p} »" for p in conditionnels)
+        message += (
+            "Attention : ces passages cités ne s'appliquent que dans le cas posé juste "
+            "avant eux dans l'article ; vérifie que la réponse donne cette condition.\n"
+            f"{liste}\n\n"
         )
     # Même signal pour un article cité de régime particulier, avec son
     # intitulé : t15 (2026-10-30) présentait l'art. 41-16 (syndicats à deux
@@ -1732,6 +1836,9 @@ def precision_regimes(
         if _REGIME_PARTICULIER.search(section):
             dernier = section.split(" > ")[-1].strip()
             phrases.append(f"L'article {r.metadata.get('article', '?')} relève de : « {dernier} ».")
+        champ = champ_application(r.content)
+        if champ:
+            phrases.append(f"L'article {r.metadata.get('article', '?')} vaut « {champ} ».")
     return " ".join(dict.fromkeys(phrases)) or None
 
 
@@ -1746,6 +1853,37 @@ def ajouter_precision(
     precision = precision_regimes(reponse, resultats)
     if reponse.refus or precision is None:
         return reponse
+    return reponse.model_copy(update={"reponse": f"{reponse.reponse}\n\nPrécision : {precision}"})
+
+
+# Article qui borne le champ (« … de l'article 31 du code … » → « 31 »).
+_ARTICLE_VISE = re.compile(r"\barticle\s+(\d[\w-]*)")
+
+
+def rappeler_champ(
+    reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> ReponseGeneree:
+    """Réponse complétée du champ d'application d'un article cité, quand elle
+    ne nomme pas l'article qui borne ce champ.
+
+    vh13 (2026-11-05) : les plafonds de l'art. 2 terdecies G (annexe III du
+    CGI), qui ne valent que pour la déduction de l'article 31, étaient donnés
+    comme ceux du logement social ; le juge acceptait, malgré la ligne
+    « Champ d'application » et sa consigne. Le rappel est tiré tel quel de
+    l'article : il ne coûte aucun appel et ne peut rien inventer."""
+    if reponse.refus:
+        return reponse
+    texte = _normaliser(reponse.reponse)
+    phrases = []
+    for r in _articles_cites(reponse, resultats):
+        champ = champ_application(r.content)
+        vise = _ARTICLE_VISE.search(champ or "")
+        if champ is None or (vise and _normaliser(f"article {vise.group(1)}") in texte):
+            continue
+        phrases.append(f"L'article {r.metadata.get('article', '?')} vaut seulement « {champ} ».")
+    if not phrases:
+        return reponse
+    precision = " ".join(dict.fromkeys(phrases))
     return reponse.model_copy(update={"reponse": f"{reponse.reponse}\n\nPrécision : {precision}"})
 
 
