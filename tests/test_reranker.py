@@ -7,6 +7,7 @@ from app.rag.reranker import (
     OnnxReranker,
     _fournisseurs_onnx,
     _sigmoide,
+    _taille_lot_pour,
     get_rerank_provider,
 )
 
@@ -133,6 +134,9 @@ class _TokenizerFake:
             "token_type_ids": np.zeros((n, 4), dtype=np.int64),
         }
 
+    def pad(self, entrees, **options):
+        return {cle: np.array(valeurs) for cle, valeurs in entrees.items()}
+
 
 class _SessionFake:
     """Remplace la session ONNX Runtime : renvoie les logits fournis, au format
@@ -150,7 +154,8 @@ class _SessionFake:
 
 
 def _onnx_fake(scores: list[float]) -> tuple[OnnxReranker, _SessionFake, _TokenizerFake]:
-    reranker = OnnxReranker("dossier-test")
+    # Un seul lot : la session factice renvoie tous les logits d'un coup.
+    reranker = OnnxReranker("dossier-test", taille_lot=32)
     session, tokenizer = _SessionFake(scores), _TokenizerFake()
     reranker._session, reranker._tokenizer = session, tokenizer
     return reranker, session, tokenizer
@@ -222,6 +227,62 @@ def test_onnx_liste_vide_renvoie_liste_vide_sans_charger():
     reranker = OnnxReranker("dossier-inexistant")
     assert reranker.rerank("q", []) == []
     assert reranker._session is None
+
+
+class _TokenizerLongueurs:
+    """Tokenizer factice dont chaque texte a une longueur différente (un token
+    par caractère) et dont le 1er token porte le numéro du texte."""
+
+    def __call__(self, questions, textes, **options):
+        ids = [[numero] * len(texte) for numero, texte in enumerate(textes)]
+        return {"input_ids": ids, "attention_mask": [[1] * len(x) for x in ids]}
+
+    def pad(self, entrees, **options):
+        # Complète chaque lot par des zéros jusqu'à son texte le plus long.
+        longueur = max(len(x) for x in entrees["input_ids"])
+        return {
+            cle: np.array([x + [0] * (longueur - len(x)) for x in valeurs])
+            for cle, valeurs in entrees.items()
+        }
+
+
+class _SessionNumero:
+    """Session factice : le logit d'une paire est le numéro de son texte, lu
+    dans le 1er token. Garde la taille de chaque lot reçu."""
+
+    def __init__(self):
+        self.lots: list[list[int]] = []
+
+    def run(self, sorties, entrees):
+        ids = entrees["input_ids"]
+        self.lots.append([int(m.sum()) for m in entrees["attention_mask"]])
+        return [np.array([[float(ligne[0])] for ligne in ids], dtype=np.float32)]
+
+
+def test_onnx_remet_chaque_score_sur_son_texte_apres_tri_par_longueur():
+    # Les lots sont formés par longueur croissante : chaque score doit
+    # revenir au texte d'origine, sinon le classement serait faux.
+    reranker = OnnxReranker("dossier-test", taille_lot=2)
+    session = _SessionNumero()
+    reranker._session, reranker._tokenizer = session, _TokenizerLongueurs()
+    # Textes 1 à 4 (le texte 0 aurait un 1er token nul, confondu avec le
+    # remplissage) de longueurs dans le désordre.
+    textes = ["x", "aaaaa", "bb", "cccc", "d"]
+    ordre = reranker.rerank("q", textes)
+    scores = dict(ordre)
+    assert [i for i, _ in ordre] == [4, 3, 2, 1, 0]
+    for numero in range(1, 5):
+        assert scores[numero] == pytest.approx(1 / (1 + np.exp(-numero)))
+    # Lots par longueur croissante : (1, 1), (2, 4), (5).
+    assert session.lots == [[1, 1], [2, 4], [5]]
+
+
+def test_onnx_note_un_texte_a_la_fois_sur_le_processeur():
+    assert _taille_lot_pour("CPUExecutionProvider") == 1
+
+
+def test_onnx_note_par_lots_de_huit_sur_la_carte_graphique():
+    assert _taille_lot_pour("DmlExecutionProvider") == 8
 
 
 # --- _fournisseurs_onnx -----------------------------------------------------

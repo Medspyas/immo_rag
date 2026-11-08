@@ -161,3 +161,47 @@ def test_query_refuse_un_historique_trop_long():
     historique = [{"question": "q", "reponse": ""}] * (ECHANGES_MAX + 1)
     response = client.post("/query", json={"question": "Et alors ?", "historique": historique})
     assert response.status_code == 422
+
+
+class _RetrieverEspion:
+    def __init__(self):
+        self.questions: list[str] = []
+
+    def search(self, query, k=10):
+        self.questions.append(query)
+        return []
+
+
+class _NLIEspion:
+    def __init__(self):
+        self.appels = 0
+
+    def evaluer(self, premisses, hypothese):
+        self.appels += 1
+        return []
+
+
+def test_prechauffer_charge_la_recherche_et_le_nli(monkeypatch):
+    from app import main
+
+    retriever, nli = _RetrieverEspion(), _NLIEspion()
+    monkeypatch.setattr(main, "_retriever", lambda: retriever)
+    monkeypatch.setattr(main, "_nli", lambda: nli)
+    main._prechauffage_fini.clear()
+    main.prechauffer()
+    assert len(retriever.questions) == 1
+    assert nli.appels == 1
+    assert main._prechauffage_fini.is_set()
+
+
+def test_prechauffer_echoue_sans_bloquer_les_questions(monkeypatch):
+    from app import main
+
+    # Base injoignable au démarrage : /query ne doit pas attendre indéfiniment.
+    def _injoignable():
+        raise ValueError("base injoignable")
+
+    monkeypatch.setattr(main, "_retriever", _injoignable)
+    main._prechauffage_fini.clear()
+    main.prechauffer()
+    assert main._prechauffage_fini.is_set()

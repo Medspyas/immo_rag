@@ -136,3 +136,8 @@ class Settings(BaseSettings):
     # Origines autorisées à appeler l'API depuis un navigateur (front, phase 3).
     # Format JSON dans .env, ex. ["http://localhost:5173"] ; vide par défaut.
     cors_origins: list[str] = []
+
+    # Charger les modèles locaux dès le démarrage de l'API, en arrière-plan
+    # (main.prechauffer). Désactivé par défaut : les tests et les scripts
+    # n'ont pas à charger plusieurs Go de modèles.
+    prechauffer: bool = False

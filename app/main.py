@@ -17,10 +17,16 @@ qu'un plantage du serveur.
 FastAPI exécute les routes synchrones dans plusieurs threads : un verrou
 garantit que deux premières requêtes simultanées ne chargent pas chacune les
 modèles (plusieurs Go de mémoire en double).
+
+Avec PRECHAUFFER=true, ces composants sont construits dès le démarrage, en
+arrière-plan (cf. prechauffer) : sans cela, la première question attend le
+chargement des modèles (jusqu'à 165 s mesurées dans Docker le 2026-11-05).
 """
 from __future__ import annotations
 
+import logging
 import threading
+from contextlib import asynccontextmanager
 
 import psycopg
 from fastapi import FastAPI, HTTPException
@@ -48,8 +54,20 @@ from app.rag.pipeline import (
 from app.rag.reranker import get_rerank_provider
 from app.rag.vector_store import DocumentIndexe, VectorStore
 
-app = FastAPI(title="immo-rag")
 settings = Settings()
+# Journal d'uvicorn : le seul affiché par défaut dans `docker compose logs`.
+journal = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def _cycle_de_vie(_app: FastAPI):
+    if settings.prechauffer:
+        _prechauffage_fini.clear()
+        threading.Thread(target=prechauffer, daemon=True).start()
+    yield
+
+
+app = FastAPI(title="immo-rag", lifespan=_cycle_de_vie)
 
 # Le front (phase 3) est servi depuis une autre origine que l'API : le
 # navigateur bloque ses appels sauf origine autorisée ici. Liste vide par
@@ -120,6 +138,32 @@ def _contextualizer() -> ContextGenerator:
     return get_context_generator(settings)
 
 
+# Ouvert tant qu'aucun préchauffage n'est en cours : /query n'attend alors rien.
+_prechauffage_fini = threading.Event()
+_prechauffage_fini.set()
+
+
+def prechauffer() -> None:
+    """Charge les modèles locaux avant la première question.
+
+    Une recherche factice charge les embeddings, l'index BM25 et le
+    reclasseur ; une évaluation factice charge le NLI. Les questions reçues
+    pendant ce temps attendent la fin du préchauffage (cf. query) au lieu de
+    charger les mêmes modèles une seconde fois.
+
+    Un échec ne bloque rien : il est journalisé, et la première question
+    retente la construction et répond 503 si le composant manque toujours.
+    """
+    try:
+        _retriever().search("préchauffage", k=1)
+        _nli().evaluer(["Préchauffage."], "Préchauffage.")
+        journal.info("préchauffage terminé")
+    except Exception:  # noqa: BLE001 — journalisé, la question suivante retente
+        journal.exception("préchauffage échoué")
+    finally:
+        _prechauffage_fini.set()
+
+
 # Erreurs attendues lorsqu'un composant est indisponible : base injoignable,
 # réglage invalide (ex. clé API manquante). Toute autre erreur remonte telle
 # quelle, comme une erreur 500 non anticipée.
@@ -176,6 +220,7 @@ def supprimer_document(doc_id: str) -> None:
 
 @app.post("/query", response_model=ReponseGeneree)
 def query(payload: QueryRequest) -> ReponseGeneree:
+    _prechauffage_fini.wait()
     try:
         retriever = _retriever()
         llm = _llm()

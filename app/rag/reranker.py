@@ -117,12 +117,11 @@ class OnnxReranker(RerankProvider):
     versionné. Classe utilisée si RERANK_PROVIDER=onnx.
     """
 
-    def __init__(self, model_dir: str, max_length: int = 512, taille_lot: int = 32):
+    def __init__(self, model_dir: str, max_length: int = 512, taille_lot: int | None = None):
         self._model_dir = model_dir
         self._max_length = max_length
-        # Textes notés par passage : un seul lot pour tous les candidats
-        # dépasse la mémoire de la carte graphique quand les fenêtres des
-        # articles longs s'y ajoutent (rerank_fenetres).
+        # Nombre de textes notés par passage ; None : choisi selon le moteur
+        # au chargement (cf. _taille_lot_pour).
         self._taille_lot = taille_lot
         self._session = None
         self._tokenizer = None
@@ -137,30 +136,57 @@ class OnnxReranker(RerankProvider):
                 f"{self._model_dir}/model.onnx",
                 providers=_fournisseurs_onnx(ort.get_available_providers()),
             )
+            if self._taille_lot is None:
+                self._taille_lot = _taille_lot_pour(self._session.get_providers()[0])
         return self._session, self._tokenizer
 
     def rerank(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
         if not documents:
             return []
         session, tokenizer = self._charger()
-        scores: list[float] = []
+        paires = tokenizer(
+            [query] * len(documents), documents, truncation=True, max_length=self._max_length
+        )
+        # Lots formés par longueur croissante : un lot est complété (padding)
+        # jusqu'à son texte le plus long, et presque chaque lot de candidats
+        # pris dans l'ordre contenait un texte de 512 tokens pour une moyenne
+        # de 384 (mesuré le 2026-11-05). Les scores ne changent pas : le
+        # remplissage est masqué, seul le calcul inutile disparaît.
+        ordre_longueur = sorted(range(len(documents)), key=lambda i: len(paires["input_ids"][i]))
+        scores = [0.0] * len(documents)
         for debut in range(0, len(documents), self._taille_lot):
-            lot = documents[debut : debut + self._taille_lot]
-            entrees = tokenizer(
-                [query] * len(lot),
-                lot,
-                padding=True,
-                truncation=True,
-                max_length=self._max_length,
+            indices = ordre_longueur[debut : debut + self._taille_lot]
+            entrees = tokenizer.pad(
+                {
+                    "input_ids": [paires["input_ids"][i] for i in indices],
+                    "attention_mask": [paires["attention_mask"][i] for i in indices],
+                },
                 return_tensors="np",
             )
             logits = session.run(
                 ["logits"],
                 {"input_ids": entrees["input_ids"], "attention_mask": entrees["attention_mask"]},
             )[0]
-            scores += [float(x) for x in logits[:, 0]]
+            for i, x in zip(indices, logits[:, 0]):
+                scores[i] = float(x)
         ordre = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
         return [(i, _sigmoide(scores[i])) for i in ordre]
+
+
+def _taille_lot_pour(moteur: str) -> int:
+    """Nombre de textes notés par passage, selon le moteur réellement retenu.
+
+    Mesuré le 2026-11-07 sur 40 passages réels, scores identiques dans tous
+    les cas (seul le remplissage change) :
+      - processeur : un texte à la fois, 14,1 s contre 17,5 s par lots de 8.
+        Un lot est complété jusqu'à son texte le plus long ; sans lot, aucun
+        calcul n'est perdu en remplissage.
+      - carte graphique (DirectML) : lots de 8, 1,2 s contre 9,1 s un par un.
+        Elle calcule en parallèle et paie surtout chaque appel. Un lot unique
+        pour tous les candidats dépasse sa mémoire quand les fenêtres des
+        articles longs s'y ajoutent (rerank_fenetres).
+    """
+    return 1 if moteur == "CPUExecutionProvider" else 8
 
 
 def _fournisseurs_onnx(disponibles: list[str]) -> list[str]:

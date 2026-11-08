@@ -1,5 +1,5 @@
 import { AlertCircle, Check, Copy, Loader2, RotateCcw, ShieldCheck, ShieldOff } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import { Badge } from '@/components/ui/badge'
@@ -108,13 +108,28 @@ export function Refus({ motif }: { motif: string | null }) {
   )
 }
 
+// Sans carte graphique, le reclassement des passages prend l'essentiel du
+// temps (~25 s mesurées le 2026-11-05) : la durée attendue et le temps écoulé
+// sont affichés pour que l'attente ne passe pas pour une panne.
 export function Attente() {
+  const [secondes, setSecondes] = useState(0)
+  useEffect(() => {
+    const minuteur = setInterval(() => setSecondes((s) => s + 1), 1000)
+    return () => clearInterval(minuteur)
+  }, [])
+
   return (
     <div className="rounded-xl border bg-card p-5" aria-live="polite">
-      <div className="mb-4 flex items-center gap-2 text-sm text-muted-foreground">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin" aria-hidden />
         Recherche dans les textes, rédaction puis vérification des citations…
       </div>
+      <p className="mt-1 mb-4 pl-6 text-xs text-muted-foreground">
+        Comptez environ 30 secondes : chaque passage est relu avant la réponse.{' '}
+        <span className="tabular-nums" aria-hidden>
+          ({secondes} s)
+        </span>
+      </p>
       <div className="space-y-2">
         <Skeleton className="h-4 w-11/12" />
         <Skeleton className="h-4 w-4/5" />
