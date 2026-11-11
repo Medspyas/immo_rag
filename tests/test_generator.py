@@ -8,6 +8,11 @@ from app.rag.generator import (
     CONSIGNE_JUGE_EXCEPTION,
     CONSIGNE_JUGE_FIDELITE,
     CONSIGNE_JUGE_REPONSE_DIRECTE,
+    CONSIGNE_OUI_NON,
+    CONSIGNE_ROLES,
+    CONSIGNE_ROLES_ARTICLE,
+    CONSIGNE_ROLES_QUESTION,
+    CONSIGNE_SITUATION_EXCEPTION,
     GROQ_MAX_ESSAIS,
     LONGUEUR_MAX_CONTEXTE_CARACTERES,
     Citation,
@@ -18,6 +23,7 @@ from app.rag.generator import (
     ReponseGeneree,
     _bloc_articles,
     _decouper_en_affirmations,
+    _exonerations_derogeant,
     _extraits,
     _preselectionner,
     _retirer_affirmations,
@@ -27,13 +33,17 @@ from app.rag.generator import (
     generer_reponse,
     get_llm,
     get_llm_juge,
+    get_llm_roles,
+    oui_non_a_relire,
     rappeler_champ,
     reparer_citations,
     retirer_exemples,
+    roles_a_verifier,
     sans_exemples,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
+    verifier_roles,
 )
 from app.rag.nli import ScoreNLI
 
@@ -107,6 +117,12 @@ def test_juge_place_son_modele_en_tete_de_cascade():
     juge = get_llm_juge(_settings(llm_model="a", llm_modeles_relais=["b"], llm_modele_juge="b"))
     assert [m._model for m in juge._modeles] == ["b", "a"]
     assert [m._model for m in juge._derniers_recours] == ["b", "a"]
+
+
+def test_redacteur_des_roles_en_tete_de_cascade_ou_absent():
+    llm = get_llm_roles(_settings(llm_model="a", llm_modeles_relais=["b"], llm_modele_roles="q"))
+    assert [m._model for m in llm._modeles] == ["q", "a", "b"]
+    assert get_llm_roles(_settings(llm_modele_roles="")) is None
 
 
 class _LLMSature:
@@ -194,6 +210,15 @@ def test_cascade_saturee_partout_echoue_sans_secours():
     )
     with pytest.raises(ModeleIndisponible):
         cascade.generer("c", "q")
+
+
+def test_cascade_dernier_recours_en_echec_passe_au_suivant():
+    # x024 (2026-11-11) : qwen, dernier recours, renvoie un JSON invalide ;
+    # le recours suivant doit répondre au lieu d'arrêter l'appel.
+    suivant = _LLMRepond("20b")
+    cascade = LLMEnCascade([_LLMSature(), _LLMSature()], derniers_recours=[_LLMSature(), suivant])
+    assert cascade.generer("c", "q") == "20b"
+    assert suivant.appels == 1
 
 
 def test_cascade_ne_masque_pas_une_autre_erreur():
@@ -1829,3 +1854,322 @@ def test_rappel_du_champ_quand_la_reponse_ne_le_nomme_pas():
     assert "Précision : L'article 2 terdecies G vaut seulement « Pour l'application du o" in complete.reponse
     nomme = reponse.model_copy(update={"reponse": "Pour la déduction de l'article 31, le délai est de trois mois."})
     assert rappeler_champ(nomme, [_ARTICLE_2_TERDECIES_G]).reponse == nomme.reponse
+
+
+class _JugeOuiNon:
+    """Juge qui ne répond qu'à la relecture du « Oui » / « Non » de tête, avec
+    un verdict figé, et retient les consignes reçues."""
+
+    def __init__(self, coherent: bool):
+        self._coherent = coherent
+        self.consignes: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        self.consignes.append(consigne)
+        return json.dumps({"coherent": self._coherent})
+
+
+_QUESTION_DISPENSE = "Le locataire doit-il respecter un préavis ?"
+_OUI_SUIVI_DUNE_DISPENSE = "Oui, le locataire peut partir sans préavis de trois mois."
+
+
+def _verifier_oui_non(texte: str, juge, question: str = _QUESTION_DISPENSE) -> ReponseGeneree:
+    # NLI à 0,99 : les affirmations sont fondées sans juge, seule la relecture
+    # du « Oui » / « Non » peut l'appeler.
+    return verifier_fidelite(
+        _reponse_avec_citation(texte), [_ARTICLE_15], _NLIFixe(0.99),
+        seuil_haut=0.7, seuil_contradiction=0.7, llm=juge, question=question,
+    )
+
+
+def test_oui_contraire_a_la_question_est_retire():
+    # v178 : « doit-il suivre la procédure ? » → « Oui, […] sans suivre la procédure ».
+    juge = _JugeOuiNon(coherent=False)
+    verifiee = _verifier_oui_non(_OUI_SUIVI_DUNE_DISPENSE, juge)
+    assert verifiee.refus is False
+    assert verifiee.reponse == "Le locataire peut partir sans préavis de trois mois."
+    assert juge.consignes == [CONSIGNE_OUI_NON]
+
+
+def test_oui_juge_coherent_est_garde():
+    verifiee = _verifier_oui_non(_OUI_SUIVI_DUNE_DISPENSE, _JugeOuiNon(coherent=True))
+    assert verifiee.reponse == _OUI_SUIVI_DUNE_DISPENSE
+
+
+def test_reponse_illisible_du_juge_garde_le_oui():
+    class _JugeCasse:
+        def generer(self, consigne, question):
+            return "pas du JSON"
+
+    verifiee = _verifier_oui_non(_OUI_SUIVI_DUNE_DISPENSE, _JugeCasse())
+    assert verifiee.reponse == _OUI_SUIVI_DUNE_DISPENSE
+
+
+@pytest.mark.parametrize(
+    "reponse, question",
+    [
+        # « Oui » suivi d'une phrase affirmative : rien à relire.
+        ("Oui, le préavis est de trois mois.", _QUESTION_DISPENSE),
+        # « ne … que » restreint sans nier (q26).
+        ("Oui, le préavis ne court qu'à compter de la réception.", _QUESTION_DISPENSE),
+        # « Non » suivi d'une négation : cohérent.
+        ("Non, le préavis ne peut pas être réduit, car la loi prévoit que trois mois.", _QUESTION_DISPENSE),
+        # Question négative : le sens attendu s'inverse, pas de relecture.
+        (_OUI_SUIVI_DUNE_DISPENSE, "Le locataire n'est-il pas tenu à un préavis ?"),
+        # Sans « Oui » / « Non » en tête.
+        ("Le locataire peut partir sans préavis de trois mois.", _QUESTION_DISPENSE),
+    ],
+)
+def test_pas_de_relecture_du_oui_non_sans_contradiction_apparente(reponse, question):
+    juge = _JugeOuiNon(coherent=False)
+    assert oui_non_a_relire(reponse, question) is False
+    _verifier_oui_non(reponse, juge, question)
+    assert juge.consignes == []
+
+
+def test_pas_de_relecture_du_oui_non_sans_question():
+    juge = _JugeOuiNon(coherent=False)
+    _verifier_oui_non(_OUI_SUIVI_DUNE_DISPENSE, juge, question="")
+    assert juge.consignes == []
+
+
+# --- Sens des relations entre personnes (v150) -------------------------------
+
+_ARTICLE_8_2 = _Resultat(
+    "loi-89-462",
+    "Le fait pour le locataire auteur des violences de ne pas acquitter son loyer est un "
+    "motif légitime et sérieux. Le bailleur peut donner congé à son locataire.",
+    article="8-2",
+)
+
+
+class _JugeRoles:
+    """Extraction des rôles figée : phrase recopiée, qui agit, envers qui."""
+
+    def __init__(self, phrase: str, agit: str, envers: str):
+        self._action = {"phrase": phrase, "agit": agit, "envers": envers}
+        self.consignes: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        self.consignes.append(consigne)
+        if consigne == CONSIGNE_ROLES:
+            n = len(re.findall(r"^\d+\. ", question.split("Actions :")[-1], re.MULTILINE))
+            return json.dumps({"actions": [self._action] * n})
+        n = len(re.findall(r"^\d+\. ", question.split("Affirmations à vérifier :")[-1], re.MULTILINE))
+        return json.dumps({"fondees": [True] * n})
+
+
+def _verifier_roles(texte: str, juge: _JugeRoles) -> ReponseGeneree:
+    reponse = ReponseGeneree(
+        refus=False,
+        reponse=texte,
+        citations=[Citation(doc_id="loi-89-462", article="8-2", passage="est un motif légitime et sérieux")],
+    )
+    return verifier_fidelite(
+        reponse, [_ARTICLE_8_2], _NLIFixe(0.99), seuil_haut=0.7, seuil_contradiction=0.7, llm=juge,
+    )
+
+
+def test_relation_inversee_est_rejetee():
+    # v150 : c'est le bailleur qui donne congé, pas le locataire « au bailleur ».
+    juge = _JugeRoles("Le bailleur peut donner congé à son locataire.", "bailleur", "locataire")
+    verifiee = _verifier_roles("C'est un motif légitime et sérieux pour donner congé au bailleur.", juge)
+    assert verifiee.refus is True
+    assert juge.consignes == [CONSIGNE_ROLES]
+
+
+def test_relation_inversee_retiree_le_reste_garde():
+    juge = _JugeRoles("Le bailleur peut donner congé à son locataire.", "bailleur", "locataire")
+    verifiee = _verifier_roles(
+        "Le défaut de paiement est un motif légitime et sérieux. Il permet de donner congé au bailleur.",
+        juge,
+    )
+    assert verifiee.refus is False
+    assert "au bailleur" not in verifiee.reponse
+
+
+def test_relation_dans_le_bon_sens_est_gardee():
+    juge = _JugeRoles("Le bailleur peut donner congé à son locataire.", "locataire", "bailleur")
+    assert _verifier_roles("Le locataire peut donner congé au bailleur.", juge).refus is False
+
+
+def test_relation_sans_phrase_retrouvee_est_gardee():
+    juge = _JugeRoles("Phrase absente des articles cités.", "bailleur", "locataire")
+    assert _verifier_roles("C'est un motif pour donner congé au bailleur.", juge).refus is False
+
+
+def test_pas_d_extraction_sans_verbe_d_action():
+    # n08 : « impose au bailleur » ne fait agir personne envers personne.
+    juge = _JugeRoles("", "", "")
+    _verifier_roles("Ce motif légitime et sérieux impose au bailleur une démarche.", juge)
+    assert CONSIGNE_ROLES not in juge.consignes
+
+
+# --- Situation de la question et cas de l'article cité (v108) -----------------
+
+_ART_555 = _Resultat(
+    "code_civil",
+    "Lorsque les constructions ont été faites par un tiers avec des matériaux appartenant à ce dernier, "
+    "le propriétaire du fonds a le droit d'obliger le tiers à les enlever.",
+    article="555",
+)
+_ART_553 = _Resultat("code_civil", "Toutes constructions sont présumées faites par le propriétaire.", article="553")
+_PHRASE_555 = "Lorsque les constructions ont été faites par un tiers avec des matériaux appartenant à ce dernier"
+
+
+def _reponse_555() -> ReponseGeneree:
+    return ReponseGeneree(
+        refus=False,
+        reponse="Le propriétaire du fonds peut obliger le tiers à enlever les constructions.",
+        citations=[Citation(doc_id="code_civil", article="555", passage="obliger le tiers à les enlever")],
+    )
+
+
+class _LLMRolesFige:
+    def __init__(self, personnes_article: list[str], phrase: str = _PHRASE_555):
+        self._article = {"phrase": phrase, "roles": [{"role": "x", "personne": p} for p in personnes_article]}
+
+    def generer(self, consigne: str, question: str) -> str:
+        if consigne == CONSIGNE_ROLES_QUESTION:
+            return json.dumps({"roles": [
+                {"role": "propriétaire du terrain", "personne": "le voisin"},
+                {"role": "auteur de la construction", "personne": "Le voisin"},
+            ]})
+        assert consigne == CONSIGNE_ROLES_ARTICLE
+        return json.dumps(self._article)
+
+
+_Q108 = "Mon voisin a construit sur son terrain avec mes matériaux, puis-je les reprendre ?"
+
+
+def test_roles_ecart_signale_au_redacteur():
+    ecart = verifier_roles(_Q108, _reponse_555(), [_ART_555], _LLMRolesFige(["le propriétaire du fonds", "un tiers"]))
+    assert ecart is not None
+    assert "personnes différentes" in ecart and "article 555" in ecart
+
+
+def test_roles_meme_schema_pas_d_ecart():
+    llm = _LLMRolesFige(["le propriétaire du fonds", "Le propriétaire du fonds"])
+    assert verifier_roles(_Q108, _reponse_555(), [_ART_555], llm) is None
+
+
+def test_roles_sans_phrase_retrouvee_pas_d_ecart():
+    llm = _LLMRolesFige(["le propriétaire du fonds", "un tiers"], phrase="Phrase inventée par le modèle.")
+    assert verifier_roles(_Q108, _reponse_555(), [_ART_555], llm) is None
+
+
+def test_roles_designation_collective_ignoree():
+    # v023 : « les parties » ne dit pas si deux rôles vont à la même personne.
+    llm = _LLMRolesFige(["les parties", "un tiers"])
+    assert verifier_roles(_Q108, _reponse_555(), [_ART_555], llm) is None
+
+
+def test_roles_a_verifier_situation_personnelle_et_article_cite_hors_tete():
+    assert roles_a_verifier(_Q108, _reponse_555(), [_ART_553, _ART_555]) is True
+    assert roles_a_verifier(_Q108, _reponse_555(), [_ART_555, _ART_553]) is False
+    question = "Un tiers construit sur le terrain d'autrui : que prévoit la loi ?"
+    assert roles_a_verifier(question, _reponse_555(), [_ART_553, _ART_555]) is False
+
+
+def test_liste_json_reunit_une_liste_d_objets_par_role():
+    # v108 (2026-11-10) : un objet {"phrase", "roles"} par rôle au lieu d'un seul.
+    from app.rag.generator import _liste_json
+
+    brut = json.dumps([
+        {"phrase": "p", "roles": [{"role": "a", "personne": "x"}]},
+        {"phrase": "p", "roles": [{"role": "b", "personne": "y"}]},
+    ])
+    objet, roles = _liste_json(brut, "roles")
+    assert objet["phrase"] == "p"
+    assert [r["role"] for r in roles] == ["a", "b"]
+
+
+# --- complétude : exonération appliquée à la situation (v090) ----------------
+
+_SECTION_TF = "Section II : Taxes foncières > I : Taxe foncière sur les propriétés bâties"
+_ART_1381 = _Resultat(
+    "code_impot",
+    "Article 1381\nSont également soumis à la taxe foncière sur les propriétés bâties : "
+    "1° Les installations destinées à abriter des personnes ou des biens ou à stocker des produits ;",
+    article="1381",
+    section=f"{_SECTION_TF} > A : Propriétés imposables",
+)
+_ART_1382 = _Resultat(
+    "code_impot",
+    "Article 1382\nSont exonérés de la taxe foncière sur les propriétés bâties : "
+    "6° a. Les bâtiments qui servent aux exploitations rurales tels que granges, écuries ;",
+    article="1382",
+    section=f"{_SECTION_TF} > B : Exonérations permanentes",
+)
+
+
+def _reponse_exoneree() -> ReponseGeneree:
+    return ReponseGeneree(
+        refus=False,
+        reponse="Les écuries et les granges sont exonérées de la taxe foncière.",
+        citations=[
+            Citation(
+                doc_id="code_impot",
+                article="1382",
+                passage="Les bâtiments qui servent aux exploitations rurales tels que granges, écuries",
+            )
+        ],
+    )
+
+
+class _LLMSuite:
+    """Renvoie les sorties dans l'ordre et retient les consignes reçues."""
+
+    def __init__(self, *sorties: str):
+        self._sorties = list(sorties)
+        self.consignes: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        self.consignes.append(consigne)
+        return self._sorties.pop(0)
+
+
+_OMISSION_1381 = json.dumps({
+    "complete": False,
+    "regle_generale": "Sont également soumis à la taxe foncière sur les propriétés bâties",
+    "manque": "Les constructions sont soumises (art. 1381), sauf exonération de l'art. 1382.",
+})
+
+
+def test_completude_regle_generale_d_une_exoneration_remplie_ignoree():
+    # v090 : la réponse applique l'exonération (1382) qui déroge à la règle
+    # générale (1381) ; la situation la remplit → pas d'omission.
+    llm = _LLMSuite(_OMISSION_1381, json.dumps({
+        "phrase": "Les bâtiments qui servent aux exploitations rurales tels que granges, écuries",
+        "remplie": True,
+    }))
+    assert verifier_completude("Ma grange agricole ?", _reponse_exoneree(), [_ART_1381, _ART_1382], llm) is None
+    assert llm.consignes[1] == CONSIGNE_SITUATION_EXCEPTION
+
+
+@pytest.mark.parametrize("verdict", [
+    {"phrase": "Les bâtiments qui servent aux exploitations rurales", "remplie": False},
+    {"phrase": "phrase absente des passages cités", "remplie": True},
+    "pas du json",
+])
+def test_completude_exoneration_non_remplie_ou_sans_preuve_garde_l_omission(verdict):
+    brut = verdict if isinstance(verdict, str) else json.dumps(verdict)
+    llm = _LLMSuite(_OMISSION_1381, brut)
+    manque = verifier_completude("Ma grange devenue gîte ?", _reponse_exoneree(), [_ART_1381, _ART_1382], llm)
+    assert manque is not None and "1381" in manque
+
+
+def test_completude_derogation_dans_le_meme_article_sans_controle_de_situation():
+    # q58 : la règle générale omise est dans l'article cité lui-même → pas
+    # d'exonération « d'ailleurs » : l'omission est gardée sans appel de plus.
+    llm = _LLMSuite(_verdict_incomplet("dans la limite annuelle de 10 700 €"))
+    assert verifier_completude("Q ?", _reponse_plafond_majore(), [_ARTICLE_156], llm) is not None
+    assert len(llm.consignes) == 1
+
+
+def test_exonerations_derogeant_exige_la_meme_section():
+    autre = _Resultat("code_impot", _ART_1381.content, article="1381", section="Autre > A : Imposables")
+    assert _exonerations_derogeant(_reponse_exoneree(), [autre, _ART_1382], [autre]) == []
+    assert _exonerations_derogeant(_reponse_exoneree(), [_ART_1381, _ART_1382], [_ART_1381]) == [
+        "Les bâtiments qui servent aux exploitations rurales tels que granges, écuries"
+    ]

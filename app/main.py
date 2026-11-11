@@ -42,6 +42,7 @@ from app.rag.generator import (
     ReponseGeneree,
     get_llm,
     get_llm_juge,
+    get_llm_roles,
 )
 from app.rag.nli import NLIProvider, get_nli_provider
 from app.rag.pipeline import (
@@ -128,6 +129,10 @@ def _llm() -> LLM:
 
 def _juge() -> LLM:
     return _get("juge", lambda: get_llm_juge(settings))
+
+
+def _redacteur_roles() -> LLM | None:
+    return _get("redacteur_roles", lambda: get_llm_roles(settings))
 
 
 def _nli() -> NLIProvider:
@@ -225,13 +230,14 @@ def query(payload: QueryRequest) -> ReponseGeneree:
         retriever = _retriever()
         llm = _llm()
         juge = _juge()
+        redacteur_roles = _redacteur_roles()
         nli = _nli()
     except _ERREURS_COMPOSANT_INDISPONIBLE as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
         return repondre(
             payload.question, retriever, llm, nli, settings, juge=juge,
-            historique=payload.historique,
+            historique=payload.historique, redacteur_roles=redacteur_roles,
         )
     except ModeleIndisponible as exc:
         # Tous les modèles saturés, même après attente : service momentanément

@@ -12,7 +12,11 @@ import uuid
 from app.config import Settings
 from app.rag.chunking import RawChunk
 from app.rag.fenetres import fenetres_article
-from app.rag.generator import CONSIGNE_COMPLETUDE
+from app.rag.generator import (
+    CONSIGNE_COMPLETUDE,
+    CONSIGNE_ROLES_ARTICLE,
+    CONSIGNE_ROLES_QUESTION,
+)
 from app.rag.nli import ScoreNLI
 from app.rag.pipeline import (
     construire_index_bm25,
@@ -613,3 +617,138 @@ def test_repondre_seconde_refusee_rappelle_le_regime_particulier():
     assert reponse.reponse.startswith("Le délai de préavis est de trois mois.")
     assert "Précision : L'article 15 relève de : « Dispositions particulières aux logements meublés »." in reponse.reponse
 
+
+
+# --- Situation de la question et cas de l'article cité (v108) -----------------
+
+_ART_553 = _ResultatFake("code_civil", "Toutes constructions sur un terrain sont présumées faites par le propriétaire.", article="553")
+_ART_554 = _ResultatFake(
+    "code_civil",
+    "Le propriétaire du sol qui a fait des constructions avec des matériaux qui ne lui appartenaient pas doit en payer la valeur.",
+    article="554",
+)
+_ART_555 = _ResultatFake(
+    "code_civil",
+    "Lorsque les constructions ont été faites par un tiers avec des matériaux appartenant à ce dernier, "
+    "le propriétaire du fonds a le droit d'obliger le tiers à les enlever.",
+    article="555",
+)
+
+
+def _redaction(article: str, passage: str, texte: str) -> str:
+    return json.dumps(
+        {"refus": False, "reponse": texte, "citations": [{"doc_id": "code_civil", "article": article, "passage": passage}]}
+    )
+
+
+class _LLMRoles:
+    """Rédactions successives ; rôles de la question et de l'article figés."""
+
+    def __init__(self, redactions: list[str], roles_article: list[str]):
+        self._redactions = list(redactions)
+        self._roles_article = roles_article
+        self.messages_redaction: list[str] = []
+
+    def generer(self, consigne: str, question: str) -> str:
+        if consigne == CONSIGNE_ROLES_QUESTION:
+            return json.dumps({"roles": [
+                {"role": "propriétaire du terrain", "personne": "le voisin"},
+                {"role": "auteur de la construction", "personne": "le voisin"},
+                {"role": "propriétaire des matériaux", "personne": "l'utilisateur"},
+            ]})
+        if consigne == CONSIGNE_ROLES_ARTICLE:
+            return json.dumps({
+                "phrase": "Lorsque les constructions ont été faites par un tiers avec des matériaux appartenant à ce dernier",
+                "roles": [{"role": "x", "personne": p} for p in self._roles_article],
+            })
+        self.messages_redaction.append(question)
+        return self._redactions.pop(0)
+
+
+_QUESTION_V108 = "Mon voisin a construit sur son terrain avec mes matériaux : puis-je les reprendre ?"
+_FAUSSE = _redaction("555", "le propriétaire du fonds a le droit d'obliger le tiers à les enlever", "Le propriétaire du fonds a le droit d'obliger le tiers à les enlever.")
+_JUSTE = _redaction("554", "doit en payer la valeur", "Le propriétaire du sol doit en payer la valeur.")
+
+
+def test_repondre_cas_de_l_article_different_redige_de_nouveau():
+    llm = _LLMRoles([_FAUSSE, _JUSTE], ["le propriétaire du fonds", "un tiers", "un tiers"])
+    reponse = repondre(
+        _QUESTION_V108, _RetrieverFake([_ART_553, _ART_555, _ART_554]), llm, _NLIToujoursFonde(),
+        _settings(controle_completude="non"),
+    )
+    assert reponse.citations[0].article == "554"
+    assert len(llm.messages_redaction) == 2
+    assert "Contrôle des rôles" in llm.messages_redaction[1]
+    assert "auteur de la construction" in llm.messages_redaction[1]
+
+
+def test_repondre_meme_article_apres_ecart_signale_refuse():
+    llm = _LLMRoles([_FAUSSE, _FAUSSE], ["le propriétaire du fonds", "un tiers", "un tiers"])
+    reponse = repondre(
+        _QUESTION_V108, _RetrieverFake([_ART_553, _ART_555, _ART_554]), llm, _NLIToujoursFonde(),
+        _settings(controle_completude="non"),
+    )
+    assert reponse.refus
+    assert "555" in reponse.motif
+    assert len(llm.messages_redaction) == 2
+
+
+def test_repondre_redaction_apres_ecart_confiee_au_redacteur_des_roles():
+    # v108 (2026-11-11) : les gpt-oss recitaient l'art. 555 même avec l'écart
+    # signalé ; la rédaction refaite passe par le rédacteur dédié (qwen).
+    llm = _LLMRoles([_FAUSSE], ["le propriétaire du fonds", "un tiers", "un tiers"])
+    redacteur = _LLMRoles([_JUSTE], [])
+    reponse = repondre(
+        _QUESTION_V108, _RetrieverFake([_ART_553, _ART_555, _ART_554]), llm, _NLIToujoursFonde(),
+        _settings(controle_completude="non"), redacteur_roles=redacteur,
+    )
+    assert reponse.citations[0].article == "554"
+    assert len(llm.messages_redaction) == 1
+    assert len(redacteur.messages_redaction) == 1
+    assert "Contrôle des rôles" in redacteur.messages_redaction[0]
+
+
+class _LLMRolesCompletude(_LLMRoles):
+    """Comme _LLMRoles, avec une omission signalée par le contrôle de complétude."""
+
+    def generer(self, consigne: str, question: str) -> str:
+        if consigne == CONSIGNE_COMPLETUDE:
+            return json.dumps({
+                "complete": False,
+                "regle_generale": "Toutes constructions sur un terrain sont présumées faites par le propriétaire.",
+                "manque": "La présomption de l'article 553.",
+            })
+        return super().generer(consigne, question)
+
+
+def test_repondre_completude_garde_l_ecart_des_roles_et_le_controle():
+    # v108 en réel (2026-11-10) : la rédaction de complétude revenait à
+    # l'art. 555 écarté par le contrôle des rôles.
+    llm = _LLMRolesCompletude([_FAUSSE, _JUSTE, _FAUSSE], ["le propriétaire du fonds", "un tiers", "un tiers"])
+    reponse = repondre(
+        _QUESTION_V108, _RetrieverFake([_ART_553, _ART_555, _ART_554]), llm, _NLIToujoursFonde(),
+        _toujours(),
+    )
+    assert len(llm.messages_redaction) == 3
+    assert "Contrôle des rôles" in llm.messages_redaction[2]
+    assert reponse.citations[0].article == "554"
+
+
+def test_repondre_cas_de_l_article_conforme_garde_la_reponse():
+    llm = _LLMRoles([_FAUSSE], ["le propriétaire du sol", "le propriétaire du sol", "autrui"])
+    reponse = repondre(
+        _QUESTION_V108, _RetrieverFake([_ART_553, _ART_555, _ART_554]), llm, _NLIToujoursFonde(),
+        _settings(controle_completude="non"),
+    )
+    assert reponse.citations[0].article == "555"
+    assert len(llm.messages_redaction) == 1
+
+
+def test_repondre_sans_situation_personnelle_pas_de_controle_des_roles():
+    llm = _LLMRoles([_FAUSSE], ["le propriétaire du fonds", "un tiers", "un tiers"])
+    repondre(
+        "Un voisin construit avec les matériaux d'autrui : que prévoit la loi ?",
+        _RetrieverFake([_ART_553, _ART_555, _ART_554]), llm, _NLIToujoursFonde(),
+        _settings(controle_completude="non"),
+    )
+    assert len(llm.messages_redaction) == 1

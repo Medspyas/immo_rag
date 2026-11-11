@@ -263,11 +263,24 @@ class LLMEnCascade(LLM):
                 epuises.add(rang)
             except ModeleIndisponible:
                 continue
+        # Un dernier recours qui échoue encore (JSON invalide, 2026-11-11 :
+        # qwen sur x024) passe la main au suivant au lieu d'arrêter l'appel.
+        derniere_erreur: ModeleIndisponible | None = None
         for rang, recours in enumerate(self._derniers_recours):
-            if rang not in epuises:
+            if rang in epuises:
+                continue
+            try:
                 brut = recours.generer(consigne, question)
-                self.historique.append(f"{getattr(recours, 'nom', '?')} (attente)")
-                return brut
+            except QuotaJournalierEpuise:
+                epuises.add(rang)
+                continue
+            except ModeleIndisponible as exc:
+                derniere_erreur = exc
+                continue
+            self.historique.append(f"{getattr(recours, 'nom', '?')} (attente)")
+            return brut
+        if derniere_erreur is not None:
+            raise derniere_erreur
         raise QuotaJournalierEpuise("quota du jour épuisé pour tous les modèles")
 
 
@@ -300,6 +313,15 @@ def get_llm_juge(settings: Settings) -> LLM:
     """LLM du juge de repli de verifier_fidelite : llm_modele_juge en tête,
     les modèles de génération en relais."""
     return get_llm(settings, premier=settings.llm_modele_juge)
+
+
+def get_llm_roles(settings: Settings) -> LLM | None:
+    """Rédacteur de la rédaction refaite après un écart de rôles :
+    llm_modele_roles en tête, les modèles de génération en relais ; None si
+    non réglé (la rédaction reste confiée au rédacteur habituel)."""
+    if not settings.llm_modele_roles:
+        return None
+    return get_llm(settings, premier=settings.llm_modele_roles)
 
 
 # Budget de caractères pour le bloc d'articles envoyé au LLM. Le forfait
@@ -468,6 +490,7 @@ def generer_reponse(
     resultats: list[_ResultatRecherche],
     llm: LLM,
     omission: str | None = None,
+    ecart_roles: str | None = None,
 ) -> ReponseGeneree:
     """Rédige une réponse à la question à partir des articles récupérés.
 
@@ -476,6 +499,8 @@ def generer_reponse(
 
     omission : élément qu'une première réponse taisait (verifier_completude),
     signalé au LLM pour qu'il l'intègre en rédigeant de nouveau.
+    ecart_roles : écart entre la situation de la question et le cas de
+    l'article cité par une première réponse (verifier_roles).
     """
     if not resultats:
         return ReponseGeneree(refus=True, motif="aucun passage pertinent trouvé")
@@ -486,6 +511,8 @@ def generer_reponse(
             "\n\nUne première réponse taisait l'élément suivant, qui change la réponse "
             f"à la question : {omission}\nIntègre-le, avec sa citation."
         )
+    if ecart_roles:
+        message += f"\n\n{ecart_roles}"
     brut = llm.generer(CONSIGNE, message)
     return _lire_reponse(brut)
 
@@ -1532,6 +1559,26 @@ def verifier_fidelite(
     llm: LLM | None = None,
     question: str = "",
 ) -> ReponseGeneree:
+    """Garde-fou étage 2 (suite) : fidélité aux articles cités
+    (_verifier_fidelite), puis « Oui » / « Non » de tête confronté à la
+    question (_corriger_oui_non)."""
+    reponse = _verifier_fidelite(
+        reponse, resultats, nli, seuil_haut, seuil_contradiction, llm, question
+    )
+    if reponse.refus or llm is None or not question:
+        return reponse
+    return _corriger_oui_non(reponse, question, llm)
+
+
+def _verifier_fidelite(
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    nli: _NLI,
+    seuil_haut: float,
+    seuil_contradiction: float,
+    llm: LLM | None = None,
+    question: str = "",
+) -> ReponseGeneree:
     """Garde-fou étage 2 (suite) : la réponse rédigée colle-t-elle aux articles
     qu'elle cite ?
 
@@ -1585,7 +1632,7 @@ def verifier_fidelite(
             return ReponseGeneree(
                 refus=True, motif=f"montant absent des articles cités : « {inconnu} »"
             )
-        return verifier_fidelite(
+        return _verifier_fidelite(
             tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm, question
         )
     fausse = _guillemets_inconnus(reponse.reponse, [r.content for r in cites])
@@ -1598,7 +1645,7 @@ def verifier_fidelite(
             return ReponseGeneree(
                 refus=True, motif=f"citation absente des articles cités : « {fausse} »"
             )
-        return verifier_fidelite(
+        return _verifier_fidelite(
             tronquee, resultats, nli, seuil_haut, seuil_contradiction, llm, question
         )
     extraits = _extraits([r.content for r in cites])
@@ -1650,7 +1697,8 @@ def verifier_fidelite(
             douteuses.append(affirmation)
 
     if not douteuses:
-        return reponse
+        inversees = _relations_inversees(affirmations, cites, question, llm)
+        return _tronquer(reponse, affirmations, inversees) if inversees else reponse
     if llm is None:
         fondees = [False] * len(douteuses)
     else:
@@ -1679,6 +1727,10 @@ def verifier_fidelite(
             )[0]
             fondees[douteuses.index(directe)] = relue
     rejetees = [a for a, fondee in zip(douteuses, fondees) if not fondee]
+    rejetees += [
+        a for a in _relations_inversees(affirmations, cites, question, llm)
+        if a not in rejetees
+    ]
     if not rejetees:
         return reponse
     # Les affirmations rejetées sont retirées du texte, le reste est gardé tel
@@ -1695,6 +1747,369 @@ def verifier_fidelite(
     # acceptées (q54 : acompte permis après la vente ; q56 : délai du congé
     # pour reprise appliqué à la vente). Retirer ne réécrit rien.
     return _tronquer(reponse, affirmations, rejetees)
+
+
+# --- Sens des relations entre personnes ------------------------------------
+
+# Action d'une personne envers une autre (« donner congé au bailleur ») : un
+# verbe parmi les quatre mots qui précèdent « au / aux / à la » + acteur.
+_RELATION = re.compile(
+    r"((?:\S+\s+){1,4})(?:au|aux|à la|à l['’])\s*" + _ACTEURS.pattern[2:],
+    re.IGNORECASE,
+)
+_VERBE_RELATION = re.compile(
+    r"\b(?:donn|délivr|notifi|adress|vers|pai|pay|rembours|restitu|remet|remis"
+    r"|envoi|envoy|signifi|demand|réclam|transmet|transmis|communiqu|fourni|vend"
+    r"|lou|céd|propos|régl)\w*",
+    re.IGNORECASE,
+)
+
+CONSIGNE_ROLES = """Tu lis un texte juridique. Pour chaque action demandée, \
+indique d'après le texte source qui fait cette action et envers qui, dans la \
+situation de l'utilisateur.
+Recopie mot pour mot la phrase du texte source qui le montre. Désigne chaque \
+personne par un seul mot du texte (bailleur, locataire, syndic, commune, \
+acquéreur...), ou "inconnu" si le texte ne le dit pas.
+Réponds UNIQUEMENT par ce JSON, un objet par action dans l'ordre :
+{"actions": [{"phrase": "<phrase recopiée>", "agit": "<mot>", "envers": "<mot>"}]}"""
+
+
+def _relations_inversees(
+    affirmations: list[str],
+    cites: list[_ResultatRecherche],
+    question: str,
+    llm: LLM | None,
+) -> list[str]:
+    """Affirmations qui inversent qui agit et envers qui.
+
+    v150 (2026-11-08) : « un motif légitime et sérieux pour donner congé au
+    bailleur », alors que c'est le bailleur qui donne congé au locataire
+    (art. 8-2 et 15). Le NLI fondait la phrase (mêmes mots que l'article) et
+    le juge, à qui l'on demandait un verdict, l'acceptait aussi (2 passes sur
+    2, même avec une consigne dédiée aux rôles).
+
+    Le LLM ne juge donc pas : il extrait seulement de l'article qui fait
+    l'action et envers qui, et la comparaison est faite ici. La relation est
+    inversée quand le destinataire nommé par la réponse est, selon l'article,
+    celui qui agit. L'extraction compte seulement si la phrase recopiée se
+    retrouve dans un article cité, comme une citation.
+
+    Visées : les relations « verbe d'action … au <acteur> » que les articles
+    cités ne contiennent pas telles quelles. Mesuré le 2026-11-09 sur les
+    réponses acceptées des traces : 3 réponses visées (q16, v112, v150), v150
+    rejetée 3 fois sur 3, q16 et v112 (justes) gardées à chaque passe. Le
+    filtre sur le verbe écarte « impose au bailleur » (n08) ou « applicables
+    aux locataires » (vh13), où personne n'agit envers personne."""
+    if llm is None or not cites:
+        return []
+    source = _normaliser(" ".join(r.content for r in cites))
+    relations: list[tuple[str, str, str]] = []
+    for affirmation in affirmations:
+        for m in _RELATION.finditer(affirmation):
+            destinataire = m.group(0)[len(m.group(1)):]
+            if _VERBE_RELATION.search(m.group(1)) and _normaliser(destinataire) not in source:
+                relations.append((affirmation, m.group(0).strip(), m.group(2).lower()))
+    if not relations:
+        return []
+    liste = "\n".join(f"{i}. {r[1]}" for i, r in enumerate(relations, 1))
+    message = (
+        f"Situation de l'utilisateur (sa question) : {question}\n\n"
+        f"Texte source :\n{_bloc_articles(cites, requete=' '.join(affirmations))}\n\n"
+        f"Actions :\n{liste}"
+    )
+    try:
+        actions = json.loads(llm.generer(CONSIGNE_ROLES, message)).get("actions")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return []
+    if not isinstance(actions, list) or len(actions) != len(relations):
+        return []
+    inversees: list[str] = []
+    for (affirmation, _, destinataire), action in zip(relations, actions):
+        if not isinstance(action, dict):
+            continue
+        phrase = str(action.get("phrase") or "").strip()
+        agit = str(action.get("agit") or "").lower()
+        envers = str(action.get("envers") or "").lower()
+        prouve = bool(phrase) and any(
+            _passage_present(phrase, r.content, SEUIL_CITATION) for r in cites
+        )
+        # Comparaison sur le radical (« bailleur » / « bailleurs »).
+        if (
+            prouve
+            and agit[:6] == destinataire[:6]
+            and envers[:6] != destinataire[:6]
+            and affirmation not in inversees
+        ):
+            inversees.append(affirmation)
+    return inversees
+
+
+# --- Situation de la question et cas visé par l'article cité ----------------
+
+# Question qui décrit la situation de l'utilisateur (« mon voisin a construit
+# […] avec des matériaux qui m'appartenaient »).
+_SITUATION_PERSONNELLE = re.compile(
+    r"\b(?:mon|ma|mes|je|j['’]|m['’]|moi|notre|nos)(?=\s|\b)", re.IGNORECASE
+)
+# Désignations collectives d'un article (« les parties ») : elles ne disent pas
+# si deux rôles sont tenus par la même personne.
+_DESIGNATION_COLLECTIVE = re.compile(
+    r"^(?:parties?|chacune? des parties|inconnu|personnes?)$"
+)
+_DETERMINANT = re.compile(r"^(?:le|la|les|l|un|une|des|du|de|son|sa|ses|votre|vos|mon|ma|mes)\s+")
+
+CONSIGNE_ROLES_QUESTION = """Tu lis la question d'un utilisateur à un \
+assistant juridique. Tu ne réponds pas à la question : tu décris seulement la situation.
+Liste, en français, les rôles juridiques que la question attribue à des \
+personnes : à qui appartient chaque bien (terrain, logement, matériaux, lot...), \
+qui loue à qui, qui vend à qui. Liste toujours à part, comme un rôle distinct, \
+l'auteur de chaque action décrite (« auteur de la construction », « auteur du \
+congé », « auteur du paiement »...), même s'il tient aussi un autre rôle. Pour \
+chaque rôle, écris qui le tient, avec les mots de la question (« l'utilisateur », \
+« le voisin », « mon locataire »...). Une même personne est toujours désignée par \
+les mêmes mots. N'invente rien : si la question ne dit pas qui tient un rôle, ne \
+liste pas ce rôle. Un possessif ne prouve pas la propriété : « mon immeuble », \
+« mon logement » désignent souvent le lieu où vit l'utilisateur ; attribue la \
+propriété d'un bien seulement si la question la dit (« je suis propriétaire », \
+« qui m'appartenaient », « son terrain »).
+Réponds UNIQUEMENT par ce JSON :
+{"roles": [{"role": "<rôle>", "personne": "<qui>"}]}"""
+
+CONSIGNE_ROLES_ARTICLE = """Tu lis un article de loi. Pour chaque rôle de la \
+liste, écris qui le tient dans le cas que vise l'article, avec les mots de \
+l'article (« le propriétaire du fonds », « un tiers », « le bailleur »...). Une \
+même personne est toujours désignée par les mêmes mots.
+Le schéma donné indique quels rôles sont tenus par une même personne. Si \
+l'article vise plusieurs cas, décris celui qui suit ce schéma, s'il en existe un ; \
+sinon décris le cas que vise l'article, tel qu'il est écrit, sans l'adapter au schéma.
+Si l'article ne dit pas qui tient un rôle, écris "inconnu". Recopie aussi mot \
+pour mot la phrase de l'article qui décrit ce cas.
+Réponds UNIQUEMENT par ce JSON, un seul objet, avec dans « roles » un élément \
+par rôle dans l'ordre de la liste :
+{"phrase": "<phrase recopiée>", "roles": [{"role": "<rôle>", "personne": "<qui>"}]}"""
+
+
+def _personne(texte: object) -> str:
+    """Désignation comparable d'une personne : minuscules, sans accents ni
+    ponctuation, sans déterminant (« Le voisin » et « voisin » se valent)."""
+    t = unicodedata.normalize("NFKD", str(texte or "").lower()).encode("ascii", "ignore").decode()
+    t = re.sub(r"\s+", " ", re.sub(r"[^a-z ]", " ", t)).strip()
+    return _DETERMINANT.sub("", t)
+
+
+def _liste_json(brut: str, cle: str) -> tuple[dict, list[dict]]:
+    """Objet JSON et sa liste `cle` (le modèle renvoie parfois la liste seule)."""
+    objet = json.loads(brut)
+    # Liste d'objets portant chacun leur propre `cle` (v108, 2026-11-10 :
+    # un objet {"phrase", "roles"} par rôle) : réunis en un seul objet.
+    if isinstance(objet, list) and objet and all(
+        isinstance(x, dict) and isinstance(x.get(cle), list) for x in objet
+    ):
+        objet = {**objet[0], cle: [r for x in objet for r in x[cle]]}
+    if not isinstance(objet, dict):
+        objet = {cle: objet}
+    liste = objet.get(cle) if isinstance(objet.get(cle), list) else []
+    return objet, [x if isinstance(x, dict) else {} for x in liste]
+
+
+def roles_a_verifier(
+    question: str, reponse: ReponseGeneree, resultats: list[_ResultatRecherche]
+) -> bool:
+    """La réponse peut-elle appliquer un article dont le cas ne correspond pas
+    à la situation décrite ? Question à la première personne, et réponse qui
+    s'appuie d'abord sur un autre article que le premier de la recherche.
+
+    Mesuré le 2026-11-09 sur les traces : 17 réponses acceptées sur 503,
+    dont toutes celles de v108 (art. 553 en tête de la recherche, 555 cité)."""
+    if reponse.refus or not reponse.citations or not resultats:
+        return False
+    if not _SITUATION_PERSONNELLE.search(question):
+        return False
+    premiere = reponse.citations[0]
+    tete = resultats[0]
+    return (premiere.doc_id, str(premiere.article)) != (
+        tete.doc_id,
+        str(tete.metadata.get("article")),
+    )
+
+
+def verifier_roles(
+    question: str,
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    llm: LLM,
+) -> str | None:
+    """Écart entre la situation de l'utilisateur et le cas que vise l'article
+    cité en premier, ou None.
+
+    v108 (2026-11-03) : « mon voisin a construit une extension sur son terrain
+    avec des matériaux qui m'appartenaient » ; la réponse applique l'art. 555
+    (un tiers construit avec ses matériaux sur le terrain d'autrui) au lieu du
+    554 (le propriétaire du sol construit avec les matériaux d'autrui). Le
+    NLI et le juge l'acceptaient : la phrase recopiée de l'article est exacte,
+    seuls les rôles sont inversés. Cinq consignes au rédacteur (cas visé,
+    lexique « fonds = terrain », situation écrite d'abord, glose dans
+    l'article, 120b) n'y changeaient rien.
+
+    Le LLM ne juge pas : il décrit, en deux appels séparés, la situation de
+    la question (sans l'article, qui lui faisait prendre l'utilisateur pour
+    le « propriétaire du fonds ») puis le cas de l'article pour les mêmes
+    rôles. La comparaison est faite ici : deux rôles tenus par une même
+    personne d'un côté et par deux personnes de l'autre sont un écart. Le
+    schéma anonyme de la situation (« personne A : … ») est donné pour
+    l'article : sans lui, l'art. 15 était lu comme le congé du bailleur pour
+    un locataire qui part (v003).
+
+    Mesuré hors ligne (2026-11-09, juge réel, 17 réponses déclenchées, deux
+    passes) : v108 signalée 6 fois sur 8, v003 (juste) parfois signalée. Un
+    écart ne refuse donc pas : il est signalé au rédacteur pour une seconde
+    rédaction (pipeline), qui a donné 3 réponses justes sur 3 pour v003 et,
+    pour v108, l'art. 554 une fois et deux refus, aucune réponse fausse."""
+    cites = _articles_cites(reponse, resultats)
+    article = next(
+        (r for r in cites if str(r.metadata.get("article")) == str(reponse.citations[0].article)),
+        cites[0] if cites else None,
+    )
+    if article is None:
+        return None
+    try:
+        _, situation = _liste_json(
+            llm.generer(CONSIGNE_ROLES_QUESTION, f"Question : {question}"), "roles"
+        )
+        if len(situation) < 2:
+            return None
+        groupes: dict[str, list[str]] = {}
+        for r in situation:
+            groupes.setdefault(_personne(r.get("personne")), []).append(str(r.get("role")))
+        schema = "\n".join(
+            f"- Personne {chr(65 + i)} : {', '.join(roles)}"
+            for i, roles in enumerate(groupes.values())
+        )
+        liste = "\n".join(f"- {r.get('role')}" for r in situation)
+        objet, cas = _liste_json(
+            llm.generer(
+                CONSIGNE_ROLES_ARTICLE,
+                f"Article :\n{_bloc_articles([article], requete=question)}\n\n"
+                f"Rôles :\n{liste}\n\nSchéma :\n{schema}",
+            ),
+            "roles",
+        )
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    if len(cas) != len(situation):
+        return None
+    phrase = str(objet.get("phrase") or "").strip()
+    if not (phrase and _passage_present(phrase, article.content, SEUIL_CITATION)):
+        return None
+    paires = [
+        (str(s.get("role")), str(s.get("personne")), str(c.get("personne")))
+        for s, c in zip(situation, cas)
+        if not _DESIGNATION_COLLECTIVE.match(_personne(c.get("personne")))
+    ]
+    numero = article.metadata.get("article")
+    for i, (role_a, qui_a, art_a) in enumerate(paires):
+        for role_b, qui_b, art_b in paires[i + 1 :]:
+            meme_situation = _personne(qui_a) == _personne(qui_b)
+            meme_article = _personne(art_a) == _personne(art_b)
+            if meme_situation == meme_article:
+                continue
+            if meme_situation:
+                ecart = (
+                    f"la même personne ({qui_a}) est {role_a} et {role_b} ; dans le cas que "
+                    f"vise l'article {numero}, ces deux rôles sont tenus par des personnes "
+                    f"différentes ({art_a} ; {art_b})"
+                )
+            else:
+                ecart = (
+                    f"des personnes différentes ({qui_a} ; {qui_b}) sont {role_a} et {role_b} ; "
+                    f"dans le cas que vise l'article {numero}, une même personne ({art_a}) "
+                    f"tient ces deux rôles"
+                )
+            return (
+                "Contrôle des rôles sur une première réponse : dans la situation de "
+                f"l'utilisateur, {ecart}. Vérifie, d'après le texte des articles, lequel "
+                "vise exactement la situation de l'utilisateur, et réponds d'après lui. "
+                f"Si l'article {numero} la vise bien, tu peux le citer. Si aucun article "
+                "ne la vise, refuse."
+            )
+    return None
+
+
+# --- « Oui » / « Non » de tête ----------------------------------------------
+
+# « Oui, » / « Non, » est retiré avant la vérification (_OUI_NON) : il ne se
+# confronte à aucun texte, seulement à la question. v178 (2026-11-04) : « doit-il
+# suivre la procédure d'agrément ? » → « Oui, il peut être reconnu […] sans
+# suivre la procédure » ; phrase vraie, mais le « Oui » dit le contraire.
+_OUI_NON_TETE = re.compile(r"^(\**)(oui|non)(\**)\s*[,.:]\s*", re.IGNORECASE)
+# « ne … que » restreint sans nier (« ne peut être exercé que par … », q26) :
+# retiré avant de chercher une négation. Ne franchit ni « pas » ni « jamais » :
+# « ne peut pas être conclu […], car la loi prévoit que » est une négation (q31).
+_RESTRICTION = re.compile(
+    r"\b(?:ne|n['’])(?:(?!\b(?:pas|plus|jamais|point)\b)[^.;]){0,80}?\bqu(?:e\b|['’])",
+    re.IGNORECASE,
+)
+_NEGATIF = re.compile(
+    r"\bne\b|\bn['’]|\bnon\b|\bsans\b|\baucune?\b|\bpas\b|\bjamais\b|\bnullement\b"
+    r"|\bdispens|\bexon[ée]r|\bexempt",
+    re.IGNORECASE,
+)
+
+CONSIGNE_OUI_NON = """Tu relis la première phrase de la réponse d'un assistant \
+juridique à une question fermée. Le contenu de cette phrase a déjà été vérifié \
+contre les textes de loi ; seul le « Oui » ou le « Non » placé en tête est à contrôler.
+
+Lis la question exactement comme elle est posée, puis la suite de la phrase. Le mot \
+de tête est-il la bonne réponse à cette question ? Exemple : « Le locataire doit-il \
+payer ces frais ? » → « Oui, il en est dispensé » : le mot de tête devrait être \
+« Non », la phrase est incohérente.
+
+Si le mot de tête répond correctement à la question posée, ou en cas de doute, la \
+phrase est cohérente.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour :
+{"coherent": true}"""
+
+
+def _negative(texte: str) -> bool:
+    """Le texte nie-t-il ou dispense-t-il (hors simple restriction « ne … que ») ?"""
+    return bool(_NEGATIF.search(_RESTRICTION.sub(" ", texte)))
+
+
+def oui_non_a_relire(reponse: str, question: str) -> bool:
+    """Le « Oui » / « Non » de tête semble-t-il contredire la suite de la phrase ?
+
+    « Oui » suivi d'une négation ou d'une dispense, « Non » suivi d'une phrase
+    affirmative : seulement pour une question sans négation (« ne doit-il
+    pas… ? » inverse le sens attendu). Mesuré le 2026-11-08 sur les traces :
+    7 réponses acceptées sur 550, dont v178."""
+    tete = _OUI_NON_TETE.match(reponse)
+    if tete is None or _negative(question):
+        return False
+    suite = re.split(r"(?<=[.!?])\s", reponse[tete.end():], maxsplit=1)[0]
+    return (tete.group(2).lower() == "oui") == _negative(suite)
+
+
+def _corriger_oui_non(reponse: ReponseGeneree, question: str, llm: LLM) -> ReponseGeneree:
+    """Réponse dont le « Oui » / « Non » de tête, jugé contraire à la question,
+    est retiré.
+
+    Le mot n'est pas remplacé par son contraire : la phrase qui suit est déjà
+    vérifiée et suffit, alors qu'un mot inversé sur un verdict erroné du juge
+    rendrait la réponse fausse. Réponse illisible du juge : rien ne change."""
+    if not oui_non_a_relire(reponse.reponse, question):
+        return reponse
+    phrase = re.split(r"(?<=[.!?])\s", reponse.reponse, maxsplit=1)[0]
+    try:
+        verdict = json.loads(
+            llm.generer(CONSIGNE_OUI_NON, f"Question : {question}\n\nPhrase : {phrase}")
+        ).get("coherent")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return reponse
+    if verdict is not False:
+        return reponse
+    reste = _OUI_NON_TETE.sub("", reponse.reponse, count=1)
+    return reponse.model_copy(update={"reponse": reste[:1].upper() + reste[1:]})
 
 
 # --- Complétude ---------------------------------------------------------------
@@ -1812,16 +2227,104 @@ def verifier_completude(
     manque = str(verdict.get("manque") or "").strip()
     # Preuve : une phrase d'un article récupéré, ou l'intitulé qui borne le
     # régime particulier quand la règle générale n'a pas été récupérée.
-    if regle and manque and (
-        any(_passage_present(regle, r.content, SEUIL_CITATION) for r in resultats)
-        or any(_passage_present(regle, s, SEUIL_CITATION) for s in regimes)
-    ):
+    sources = [r for r in resultats if _passage_present(regle, r.content, SEUIL_CITATION)] if regle else []
+    if regle and manque and (sources or any(_passage_present(regle, s, SEUIL_CITATION) for s in regimes)):
+        exonerations = _exonerations_derogeant(reponse, resultats, sources)
+        if exonerations and _situation_dans_exception(question, exonerations, llm):
+            return None
         return f"{manque} (« {regle} »)"
     # Omission signalée sans preuve retrouvée : sur un article de régime
     # particulier, son intitulé suffit — t15 (2026-10-30), le juge voyait
     # l'omission mais recopiait une règle générale absente des articles
     # récupérés (art. 22 non retrouvé).
     return precision_regimes(reponse, resultats)
+
+
+# Article d'exonération ou d'exclusion, reconnu à son intitulé (« B :
+# Exonérations permanentes ») ou à sa première phrase (« Sont exonérés… »).
+_EXONERATION = re.compile(
+    r"exonér|exclu|ne sont pas (?:soumis|imposables|assujettis)|à l['’]exception", re.IGNORECASE
+)
+
+
+def _parent(section: str) -> str:
+    """Intitulés de la section sans son dernier niveau (« … > I : Taxe foncière
+    sur les propriétés bâties » pour « … > I : … > B : Exonérations »)."""
+    return section.rsplit(" > ", 1)[0] if " > " in section else ""
+
+
+def _exonerations_derogeant(
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    sources: list[_ResultatRecherche],
+) -> list[str]:
+    """Passages cités, tirés d'un article d'exonération, quand la règle signalée
+    comme omise est la règle générale à laquelle cet article déroge : elle vient
+    d'un autre article, non cité, de la même section (art. 1381 « Propriétés
+    imposables » face à l'art. 1382 « Exonérations permanentes »).
+
+    v090 (2026-11-10) : « l'écurie et la grange sont exonérées » (art. 1382,
+    6°) était juste ; le juge réclamait la règle « sont soumis » de l'art.
+    1381 (2/3 au rejeu), et la seconde rédaction donnait « soumises, sauf
+    exonération », moins bonne. Une règle générale ne manque pas à une réponse
+    qui applique l'exception qui y déroge — si la situation la remplit.
+    Liste vide hors de ce cas : q58 (dérogation dans le même article), q02 et
+    t15 (régimes particuliers, sans exonération) ne sont pas concernés."""
+    cites = {(c.doc_id, str(c.article)) for c in reponse.citations}
+    sources_non_citees = [
+        r for r in sources if (r.doc_id, str(r.metadata.get("article"))) not in cites
+    ]
+    if not sources or len(sources_non_citees) != len(sources):
+        return []
+    parents = {_parent(r.metadata.get("section") or "") for r in sources_non_citees} - {""}
+    passages = []
+    for r in _articles_cites(reponse, resultats):
+        section = r.metadata.get("section") or ""
+        lignes = r.content.strip().split("\n")
+        tete = lignes[1] if len(lignes) > 1 and lignes[0].startswith("Article") else lignes[0]
+        if _parent(section) not in parents:
+            continue
+        if not (_EXONERATION.search(section.split(" > ")[-1]) or _EXONERATION.search(tete)):
+            continue
+        passages += [
+            c.passage
+            for c in reponse.citations
+            if (c.doc_id, str(c.article)) == (r.doc_id, str(r.metadata.get("article")))
+        ]
+    return passages
+
+
+CONSIGNE_SITUATION_EXCEPTION = """Tu vérifies une réponse d'un assistant juridique \
+qui applique une exonération (ou une exclusion) à la situation décrite par \
+l'utilisateur.
+
+1. Recopie mot pour mot, depuis les passages de l'exonération, la phrase qui vise \
+cette situation.
+2. Réponds true seulement si la situation décrite dans la question remplit toutes \
+les conditions de cette phrase (nature du bien, usage, personne, durée…) ; false \
+si une condition n'est pas remplie, si la question ne permet pas de le savoir, \
+ou si aucune phrase ne vise cette situation.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour :
+{"phrase": "<phrase recopiée>", "remplie": true}"""
+
+
+def _situation_dans_exception(question: str, passages: list[str], llm: LLM) -> bool:
+    """La situation de la question remplit-elle l'exonération citée ?
+
+    Le verdict compte seulement avec une phrase recopiée retrouvée dans les
+    passages cités ; sans preuve ou réponse illisible, l'omission signalée
+    est gardée (seconde rédaction, comme avant)."""
+    liste = "\n".join(f"- « {p} »" for p in passages)
+    message = f"Question (situation de l'utilisateur) : {question}\n\nPassages de l'exonération :\n{liste}"
+    try:
+        verdict = json.loads(llm.generer(CONSIGNE_SITUATION_EXCEPTION, message))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(verdict, dict) or verdict.get("remplie") is not True:
+        return False
+    phrase = str(verdict.get("phrase") or "").strip()
+    return bool(phrase) and any(_passage_present(phrase, p, SEUIL_CITATION) for p in passages)
 
 
 def precision_regimes(

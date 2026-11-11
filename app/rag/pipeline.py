@@ -66,9 +66,11 @@ from app.rag.generator import (
     corriger_citations,
     generer_reponse,
     rappeler_champ,
+    roles_a_verifier,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
+    verifier_roles,
 )
 from app.rag.legifrance import articles_legifrance
 from app.rag.nli import ScoreNLI
@@ -379,6 +381,7 @@ def repondre(
     k: int | None = None,
     juge: _LLM | None = None,
     historique: list[Echange] | None = None,
+    redacteur_roles: _LLM | None = None,
 ) -> ReponseGeneree:
     """Orchestration complète d'une requête : recherche puis génération sous
     deux garde-fous (cf. CLAUDE.md, section garde-fou anti-hallucination).
@@ -399,12 +402,17 @@ def repondre(
     historique : les échanges précédents de la conversation. Une question de
     suivi est d'abord réécrite en question autonome (suivi.py), qui sert
     ensuite à la recherche et à la génération.
+
+    redacteur_roles rédige la réponse refaite après un écart de rôles
+    (settings.llm_modele_roles) ; par défaut llm.
     """
     if k is None:
         k = settings.k_articles_generation
     question_posee = question
     question = reformuler_question(question, historique or [], llm)
-    reponse = _repondre_question(question, retriever, llm, nli, settings, k, juge)
+    reponse = _repondre_question(
+        question, retriever, llm, nli, settings, k, juge, redacteur_roles
+    )
     if question != question_posee:
         reponse = reponse.model_copy(update={"question_comprise": question})
     return reponse
@@ -418,6 +426,7 @@ def _repondre_question(
     settings: Settings,
     k: int,
     juge: _LLM | None,
+    redacteur_roles: _LLM | None = None,
 ) -> ReponseGeneree:
     """Recherche, génération et garde-fous pour une question autonome.
 
@@ -434,13 +443,57 @@ def _repondre_question(
     ce régime rappelé (ajouter_precision, t15)."""
     resultats = retriever.search(question, k=k)
     reponse = _rediger_et_verifier(question, resultats, llm, nli, settings, juge)
+    # Article dont le cas ne correspond pas à la situation décrite (v108) :
+    # rédaction refaite avec l'écart signalé, et la première réponse n'est
+    # pas gardée en repli, contrairement à la complétude : elle applique
+    # peut-être la règle d'un autre cas. Une seule fois (quota gratuit).
+    ecart = None
+    if roles_a_verifier(question, reponse, resultats):
+        ecart = verifier_roles(question, reponse, resultats, juge or llm)
+        if ecart is not None:
+            article_signale = _premier_article(reponse)
+            # Rédacteur dédié (qwen) : les gpt-oss inversaient les rôles même
+            # avec l'écart signalé (v108, 2026-11-11 : 0/6 contre 3/3).
+            reponse = _rediger_et_verifier(
+                question, resultats, redacteur_roles or llm, nli, settings, juge, ecart_roles=ecart
+            )
+            # Seconde rédaction qui s'appuie encore sur l'article signalé
+            # (v108 en réel, 2026-11-10 : art. 555 recité) : contrôle refait,
+            # refus si l'écart persiste. Deux signalements de suite sont
+            # exigés, car un seul signale parfois une réponse juste (v003).
+            if _premier_article(reponse) == article_signale and verifier_roles(
+                question, reponse, resultats, juge or llm
+            ):
+                return ReponseGeneree(
+                    refus=True,
+                    motif=f"l'article {article_signale} ne vise pas la situation décrite",
+                )
     if not _completude_a_controler(reponse, resultats, settings):
         return rappeler_champ(reponse, resultats)
     omission = verifier_completude(question, reponse, resultats, juge or llm)
     if omission is None:
         return rappeler_champ(reponse, resultats)
-    seconde = _rediger_et_verifier(question, resultats, llm, nli, settings, juge, omission)
+    # L'écart des rôles éventuel accompagne l'omission : sans lui, la
+    # rédaction de complétude revenait à l'article écarté (v108, 2026-11-10).
+    seconde = _rediger_et_verifier(
+        question, resultats, llm, nli, settings, juge, omission, ecart_roles=ecart
+    )
+    # Rédaction de complétude qui change d'article de tête : ce nouvel
+    # article n'a pas eu le contrôle des rôles ; écart → première gardée.
+    if (
+        _premier_article(seconde) not in (None, _premier_article(reponse))
+        and roles_a_verifier(question, seconde, resultats)
+        and verifier_roles(question, seconde, resultats, juge or llm)
+    ):
+        return rappeler_champ(reponse, resultats)
     return rappeler_champ(ajouter_precision(reponse, resultats) if seconde.refus else seconde, resultats)
+
+
+def _premier_article(reponse: ReponseGeneree) -> str | None:
+    """Numéro du premier article cité par une réponse acceptée, sinon None."""
+    if reponse.refus or not reponse.citations:
+        return None
+    return str(reponse.citations[0].article)
 
 
 def _completude_a_controler(reponse: ReponseGeneree, resultats: list, settings: Settings) -> bool:
@@ -461,9 +514,10 @@ def _rediger_et_verifier(
     settings: Settings,
     juge: _LLM | None,
     omission: str | None = None,
+    ecart_roles: str | None = None,
 ) -> ReponseGeneree:
     """Rédaction de la réponse puis garde-fous : citations, puis fidélité."""
-    reponse = generer_reponse(question, resultats, llm, omission)
+    reponse = generer_reponse(question, resultats, llm, omission, ecart_roles)
     reponse = corriger_citations(question, resultats, llm, reponse)
     reponse = verifier_citations(reponse, resultats)
     return verifier_fidelite(

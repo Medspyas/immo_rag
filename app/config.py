@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     # « l'état des lieux est obligatoire » (art. 3-2 : « est établi »), le
     # 120b l'accepte, et les deux refusent les réponses fausses testées.
     llm_modele_juge: str = "openai/gpt-oss-120b"
+    # Rédacteur de la seconde rédaction quand le contrôle des rôles signale
+    # que l'article cité ne vise pas la situation (generator.verifier_roles).
+    # v108 (2026-11-11, art. 554/555) : gpt-oss-20b et 120b inversaient les
+    # rôles à chaque essai, qwen3.8-27b répond juste 3/3. Utilisé seulement sur
+    # ce chemin, qui finissait en refus ; ses saturations passent au relais.
+    # Vide : la seconde rédaction reste confiée à llm_model.
+    llm_modele_roles: str = "qwen/qwen3.8-27b"
     # Après les garde-fous, le juge relit la réponse en partant des articles
     # cités : une omission qui la rend trompeuse (règle générale tue derrière
     # un plafond majoré, q58) déclenche une seconde rédaction
