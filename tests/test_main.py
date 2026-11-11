@@ -55,6 +55,7 @@ def test_query_renvoie_503_si_le_modele_de_langage_est_sature(monkeypatch):
     monkeypatch.setattr(main, "_retriever", lambda: object())
     monkeypatch.setattr(main, "_llm", lambda: object())
     monkeypatch.setattr(main, "_juge", lambda: object())
+    monkeypatch.setattr(main, "_redacteur_roles", lambda: None)
     monkeypatch.setattr(main, "_nli", lambda: object())
     monkeypatch.setattr(main, "repondre", _sature)
     reponse = client.post("/query", json={"question": "Quel préavis ?"})
@@ -147,6 +148,7 @@ def test_query_transmet_l_historique(monkeypatch):
     monkeypatch.setattr(main, "_retriever", lambda: object())
     monkeypatch.setattr(main, "_llm", lambda: object())
     monkeypatch.setattr(main, "_juge", lambda: object())
+    monkeypatch.setattr(main, "_redacteur_roles", lambda: None)
     monkeypatch.setattr(main, "_nli", lambda: object())
     monkeypatch.setattr(main, "repondre", _repondre)
     historique = [{"question": "Quel préavis ?", "reponse": "Trois mois."}]
