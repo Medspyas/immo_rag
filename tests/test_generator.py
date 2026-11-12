@@ -287,6 +287,13 @@ def test_groq_traduit_un_json_invalide_en_modele_indisponible(monkeypatch):
         llm.generer("c", "q")
 
 
+def test_groq_reserve_au_plus_la_limite_de_sortie_du_modele():
+    # qwen3.8-27b : 1000 tokens de sortie par minute, une réservation de 1024
+    # est refusée d'avance par Groq (2026-11-12).
+    assert GroqLLM("fake-key", "qwen/qwen3.8-27b").max_tokens == 1000
+    assert GroqLLM("fake-key", "openai/gpt-oss-20b").max_tokens == 1024
+
+
 def test_groq_sans_cle_api_leve_une_erreur():
     with pytest.raises(ValueError):
         get_llm(_settings(groq_api_key=None))
@@ -2056,6 +2063,20 @@ def test_roles_meme_schema_pas_d_ecart():
 def test_roles_sans_phrase_retrouvee_pas_d_ecart():
     llm = _LLMRolesFige(["le propriétaire du fonds", "un tiers"], phrase="Phrase inventée par le modèle.")
     assert verifier_roles(_Q108, _reponse_555(), [_ART_555], llm) is None
+
+
+def test_roles_passages_cites_montres_au_lecteur_de_l_article():
+    # x024 : le lecteur doit décrire le cas du passage cité, pas une autre
+    # phrase de l'article.
+    messages: list[str] = []
+
+    class _Espion(_LLMRolesFige):
+        def generer(self, consigne, question):
+            messages.append(question)
+            return super().generer(consigne, question)
+
+    verifier_roles(_Q108, _reponse_555(), [_ART_555], _Espion(["le propriétaire du fonds", "un tiers"]))
+    assert "Passages cités :\n« obliger le tiers à les enlever »" in messages[-1]
 
 
 def test_roles_designation_collective_ignoree():

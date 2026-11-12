@@ -149,6 +149,15 @@ class LLM(ABC):
         """Renvoie la réponse brute du modèle (chaîne JSON attendue)."""
 
 
+# Plafond de réponse réservé par appel. Groq refuse d'avance (429 « Request
+# too large ») une requête dont max_tokens dépasse la limite de tokens de
+# sortie par minute du modèle : qwen3.8-27b plafonne à 1000 (vérifié le
+# 2026-11-12 : 1024 refusé à chaque appel, 1000 accepté). Sans ce réglage,
+# chaque appel à qwen passait en silence au modèle de relais.
+MAX_TOKENS_REPONSE = 1024
+_MAX_TOKENS_PAR_MODELE = {"qwen/qwen3.8-27b": 1000}
+
+
 class GroqLLM(LLM):
     """Implémentation Groq : gratuite, retenue par défaut."""
 
@@ -164,6 +173,7 @@ class GroqLLM(LLM):
         self._client = Groq(api_key=api_key, max_retries=max_essais)
         self._model = model
         self.nom = model
+        self.max_tokens = _MAX_TOKENS_PAR_MODELE.get(model, MAX_TOKENS_REPONSE)
 
     def generer(self, consigne: str, question: str) -> str:
         from groq import (
@@ -206,7 +216,7 @@ class GroqLLM(LLM):
             ],
             temperature=0.0,
             response_format={"type": "json_object"},
-            max_tokens=1024,
+            max_tokens=self.max_tokens,
             # openai/gpt-oss-20b (modèle par défaut) raisonne avant de répondre ;
             # ce raisonnement consomme max_tokens en priorité. Sans ce réglage,
             # un raisonnement long épuise le budget avant d'atteindre la
@@ -1880,6 +1890,7 @@ liste, écris qui le tient dans le cas que vise l'article, avec les mots de \
 l'article (« le propriétaire du fonds », « un tiers », « le bailleur »...). Une \
 même personne est toujours désignée par les mêmes mots.
 Le schéma donné indique quels rôles sont tenus par une même personne. Si \
+des passages cités sont donnés, décris le cas qu'ils visent. Sinon, si \
 l'article vise plusieurs cas, décris celui qui suit ce schéma, s'il en existe un ; \
 sinon décris le cas que vise l'article, tel qu'il est écrit, sans l'adapter au schéma.
 Si l'article ne dit pas qui tient un rôle, écris "inconnu". Recopie aussi mot \
@@ -1986,10 +1997,20 @@ def verifier_roles(
             for i, roles in enumerate(groupes.values())
         )
         liste = "\n".join(f"- {r.get('role')}" for r in situation)
+        # Passages que la réponse cite dans cet article : le cas à décrire est
+        # le leur. x024 (2026-11-12) : sans eux, le lecteur décrivait une autre
+        # phrase de l'art. 29-1 (« le syndic en place ne peut être désigné
+        # administrateur provisoire ») et signalait un écart sur une réponse
+        # juste (« l'administrateur provisoire ne peut […] être désigné syndic »).
+        cle = (article.doc_id, str(article.metadata.get("article")))
+        passages = "\n".join(
+            f"« {c.passage} »" for c in reponse.citations if (c.doc_id, str(c.article)) == cle
+        )
+        cites_bloc = f"\n\nPassages cités :\n{passages}" if passages else ""
         objet, cas = _liste_json(
             llm.generer(
                 CONSIGNE_ROLES_ARTICLE,
-                f"Article :\n{_bloc_articles([article], requete=question)}\n\n"
+                f"Article :\n{_bloc_articles([article], requete=question)}{cites_bloc}\n\n"
                 f"Rôles :\n{liste}\n\nSchéma :\n{schema}",
             ),
             "roles",

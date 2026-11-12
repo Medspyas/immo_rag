@@ -79,6 +79,44 @@ def _fenetres_a_reclasser(resultat: _ResultatRecherche) -> list[str]:
     return [f"{titre}\n{f}" if titre else f for f in fenetres_article(resultat.content)]
 
 
+def _meilleure_fenetre_a_reclasser(resultat: _ResultatRecherche) -> list[str]:
+    """La fenêtre qui a fait retrouver l'article par le sens (rang porté par
+    le résultat de la recherche dense), précédée du titre de sa loi ; vide
+    si l'article a été retrouvé par son texte entier ou par BM25 seul."""
+    rang = getattr(resultat, "fenetre", None)
+    if rang is None:
+        return []
+    fenetres = fenetres_article(resultat.content)
+    if not 0 <= rang < len(fenetres):
+        return []
+    # Début de l'article (son objet) devant la fenêtre : isolée, une phrase
+    # qui cite un sujet en passant paraît répondre à une question hors corpus
+    # (t42, loi SRU : l'art. 279-0 bis A, TVA, cite les quotas de logements
+    # sociaux).
+    debut = _debut_article(resultat.content, CHAPEAU_FENETRE)
+    texte = f"{debut} […] {fenetres[rang]}" if debut else fenetres[rang]
+    titre = _titre_a_reclasser(resultat)
+    return [f"{titre}\n{texte}" if titre else texte]
+
+
+# Caractères du début de l'article montrés devant sa meilleure fenêtre.
+CHAPEAU_FENETRE = 500
+# Retenue sur le score de la meilleure fenêtre : un passage court et ciblé est
+# noté plus haut que l'article entier qui le contient ; sans retenue, des
+# questions hors corpus montaient (vh13 0,23 → 0,74, t42 franchissait le
+# seuil de l'étage 1). Mesures du 2026-11-12 : cf. config.rerank_meilleure_fenetre.
+MARGE_FENETRE = 0.3
+
+
+def _debut_article(contenu: str, longueur: int) -> str:
+    """Les `longueur` premiers caractères de l'article, coupés à un mot."""
+    if longueur <= 0:
+        return ""
+    if len(contenu) <= longueur:
+        return contenu
+    return contenu[: contenu.rfind(" ", 0, longueur)]
+
+
 def _texte_a_reclasser(resultat: _ResultatRecherche) -> str:
     """Texte soumis au reclasseur : l'article précédé du titre de sa loi (et
     du chapitre pour un code), puis des questions générées pour l'article
@@ -292,6 +330,11 @@ class HybridRetriever:
 
     rerank_fenetres : un article long est noté aussi sur chacune de ses
     fenêtres et garde son meilleur score (cf. _fenetres_a_reclasser).
+
+    rerank_meilleure_fenetre : un article long retrouvé par l'une de ses
+    fenêtres (recherche par le sens) est noté aussi sur cette seule fenêtre,
+    et garde son meilleur score. x013 (2026-11-12) : la règle de la caution
+    (art. 8-1, car. 2 969 sur 3 567) restait invisible au reclasseur.
     """
 
     def __init__(
@@ -306,6 +349,7 @@ class HybridRetriever:
         seuil_rerank: float | None = None,
         index_articles: _IndexArticles | None = None,
         rerank_fenetres: bool = False,
+        rerank_meilleure_fenetre: bool = False,
     ):
         self._embeddings = embeddings
         self._dense = recherche_dense
@@ -317,6 +361,7 @@ class HybridRetriever:
         self._seuil_rerank = seuil_rerank
         self._index_articles = index_articles
         self._rerank_fenetres = rerank_fenetres
+        self._rerank_meilleure_fenetre = rerank_meilleure_fenetre
 
     def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
         """Les k morceaux les mieux placés pour la question.
@@ -377,17 +422,27 @@ class HybridRetriever:
         # l'article entier, puis ses fenêtres si rerank_fenetres.
         textes: list[str] = []
         proprietaires: list[int] = []
+        # Retenue soustraite au score de chaque texte (MARGE_FENETRE pour la
+        # meilleure fenêtre, 0 sinon).
+        retenues: list[float] = []
         for position, chunk_id in enumerate(candidats):
             source = par_id[chunk_id]
             a_noter = [_texte_a_reclasser(source)]
+            retenue = [0.0]
             if self._rerank_fenetres:
                 a_noter += _fenetres_a_reclasser(source)
+            elif self._rerank_meilleure_fenetre:
+                fenetre = _meilleure_fenetre_a_reclasser(source)
+                a_noter += fenetre
+                retenue += [MARGE_FENETRE] * len(fenetre)
             textes += a_noter
             proprietaires += [position] * len(a_noter)
+            retenues += retenue + [0.0] * (len(a_noter) - len(retenue))
         meilleurs: dict[int, float] = {}
         for indice, score in self._reranker.rerank(query, textes):
             position = proprietaires[indice]
-            meilleurs[position] = max(score, meilleurs.get(position, score))
+            note = score - retenues[indice]
+            meilleurs[position] = max(note, meilleurs.get(position, note))
         classement = sorted(meilleurs.items(), key=lambda paire: paire[1], reverse=True)
 
         # Garde-fou étage 1 : si même le meilleur candidat est sous le seuil,

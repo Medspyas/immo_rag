@@ -422,3 +422,63 @@ def test_sans_index_d_articles_aucun_renvoi_suivi():
     reranker = _RerankerFake()
     _retriever([source], [], reranker=reranker).search("q")
     assert len(reranker.textes_recus) == 1
+
+
+# --- Meilleure fenêtre d'un article long au reclasseur (x013) ----------------
+
+
+def test_meilleure_fenetre_notee_en_plus_de_l_article():
+    from app.rag.fenetres import fenetres_article
+
+    long_texte = " ".join(f"mot{i}" for i in range(800))
+    a = uuid4()
+    dense = SearchResult(
+        id=a, doc_id="loi-89-462", content=long_texte, metadata={}, score=0.9, fenetre=2
+    )
+    reranker = _RerankerFake()
+    _retriever([dense], [], reranker=reranker, rerank_meilleure_fenetre=True).search("q")
+    assert len(reranker.textes_recus) == 2
+    # Début de l'article (son objet), puis la fenêtre retrouvée.
+    fenetre = reranker.textes_recus[1]
+    assert fenetre.startswith("mot0 mot1 ")
+    assert fenetre.endswith(" […] " + fenetres_article(long_texte)[2])
+
+
+def test_sans_fenetre_retrouvee_l_article_seul_est_note():
+    a = uuid4()
+    reranker = _RerankerFake()
+    _retriever([_dense(a)], [], reranker=reranker, rerank_meilleure_fenetre=True).search("q")
+    assert len(reranker.textes_recus) == 1
+
+
+def test_recherche_memoire_donne_le_rang_de_la_fenetre_gagnante():
+    import numpy as np
+
+    from app.rag.vector_store import Chunk
+    from eval.corpus_memoire import RechercheDenseMemoire
+
+    chunks = [
+        Chunk(id=uuid4(), doc_id="d", content="a", embedding=[1.0, 0.0], metadata={}),
+        Chunk(id=uuid4(), doc_id="d", content="b", embedding=[0.0, 1.0], metadata={}),
+    ]
+    matrice = np.array([[0.1, 0.0], [0.0, 0.5]], dtype=np.float32)
+    # Article 0 : deux fenêtres, la seconde bat son texte entier.
+    fenetres = np.array([[0.2, 0.0], [0.9, 0.0]], dtype=np.float32)
+    dense = RechercheDenseMemoire(chunks, matrice, fenetres, np.array([0, 0]))
+    resultats = dense.search([1.0, 1.0], k=2)
+    assert (resultats[0].content, resultats[0].fenetre) == ("a", 1)
+    assert (resultats[1].content, resultats[1].fenetre) == ("b", None)
+
+
+def test_score_de_la_fenetre_diminue_de_la_marge():
+    from app.rag.retriever import MARGE_FENETRE
+
+    long_texte = " ".join(f"mot{i}" for i in range(800))
+    dense = SearchResult(
+        id=uuid4(), doc_id="loi-89-462", content=long_texte, metadata={}, score=0.9, fenetre=1
+    )
+    # Article noté 0,1, sa fenêtre 0,9 : l'article garde 0,9 - marge.
+    resultats = _retriever(
+        [dense], [], reranker=_RerankerScores([0.1, 0.9]), rerank_meilleure_fenetre=True
+    ).search("q")
+    assert abs(resultats[0].score_rerank - (0.9 - MARGE_FENETRE)) < 1e-9

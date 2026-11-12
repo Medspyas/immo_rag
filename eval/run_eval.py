@@ -54,19 +54,23 @@ from app.rag.embeddings import get_embedding_provider
 from app.rag.generator import (
     ModeleIndisponible,
     QuotaJournalierEpuise,
+    ReponseGeneree,
     _contextes_cites,
     ajouter_precision,
     corriger_citations,
     generer_reponse,
     get_llm,
     get_llm_juge,
+    get_llm_roles,
     rappeler_champ,
+    roles_a_verifier,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
+    verifier_roles,
 )
 from app.rag.nli import get_nli_provider
-from app.rag.pipeline import _completude_a_controler
+from app.rag.pipeline import _completude_a_controler, _premier_article
 from app.rag.reranker import get_rerank_provider
 from app.rag.retriever import HybridRetriever
 from app.rag.suivi import reformuler_question
@@ -115,7 +119,7 @@ def _trace(
 
 def evaluer(
     cas_golden, retriever, llm, nli, settings: Settings, k: int = 10, juge=None,
-    juge_completude=None,
+    juge_completude=None, redacteur_roles=None,
 ) -> Iterator[dict]:
     """Fait tourner recherche + génération + garde-fou étage 2 sur chaque cas,
     et produit une trace par cas (voir `_trace`) au fur et à mesure, pour
@@ -154,35 +158,75 @@ def evaluer(
             continue
         omission = None
         seconde_refusee = False
-        if etat["verdict_local"] == "fondee" and _completude_a_controler(
-            etat["reponse"], resultats, settings
-        ):
-            omission = verifier_completude(
-                question, etat["reponse"], resultats, juge_completude or juge or llm
-            )
-            if omission:
-                seconde = _rediger(question, resultats, llm, nli, settings, juge, omission)
-                # Comme pipeline.repondre : une seconde rédaction refusée
-                # laisse la place à la première, déjà vérifiée.
-                seconde_refusee = seconde["verdict_local"] != "fondee"
-                if not seconde_refusee:
-                    etat = seconde
-                else:
-                    etat = {**etat, "reponse": ajouter_precision(etat["reponse"], resultats)}
-        if etat["verdict_local"] == "fondee":
-            etat = {**etat, "reponse": rappeler_champ(etat["reponse"], resultats)}
+        try:
+            # Comme pipeline._repondre_question : contrôle des rôles (v108).
+            ecart = None
+            if roles_a_verifier(question, etat["reponse"], resultats):
+                ecart = verifier_roles(question, etat["reponse"], resultats, juge or llm)
+                if ecart is not None:
+                    article_signale = _premier_article(etat["reponse"])
+                    etat = _rediger(
+                        question, resultats, redacteur_roles or llm, nli, settings, juge, ecart_roles=ecart
+                    )
+                    if _premier_article(etat["reponse"]) == article_signale and verifier_roles(
+                        question, etat["reponse"], resultats, juge or llm
+                    ):
+                        motif = f"l'article {article_signale} ne vise pas la situation décrite"
+                        etat = {**etat, "reponse": ReponseGeneree(refus=True, motif=motif),
+                                "verdict_local": "refus_roles", "motif_fidelite": motif}
+            if etat["verdict_local"] == "fondee" and _completude_a_controler(
+                etat["reponse"], resultats, settings
+            ):
+                omission = verifier_completude(
+                    question, etat["reponse"], resultats, juge_completude or juge or llm
+                )
+                if omission:
+                    seconde = _rediger(
+                        question, resultats, llm, nli, settings, juge, omission, ecart_roles=ecart
+                    )
+                    # Comme pipeline : nouvel article de tête sans contrôle des
+                    # rôles, écart → première gardée.
+                    if (
+                        seconde["verdict_local"] == "fondee"
+                        and _premier_article(seconde["reponse"])
+                        not in (None, _premier_article(etat["reponse"]))
+                        and roles_a_verifier(question, seconde["reponse"], resultats)
+                        and verifier_roles(question, seconde["reponse"], resultats, juge or llm)
+                    ):
+                        seconde = {**seconde, "verdict_local": "refus_roles"}
+                    # Comme pipeline.repondre : une seconde rédaction refusée
+                    # laisse la place à la première, déjà vérifiée.
+                    seconde_refusee = seconde["verdict_local"] != "fondee"
+                    if not seconde_refusee:
+                        etat = seconde
+                    else:
+                        etat = {**etat, "reponse": ajouter_precision(etat["reponse"], resultats)}
+            if etat["verdict_local"] == "fondee":
+                etat = {**etat, "reponse": rappeler_champ(etat["reponse"], resultats)}
+        except QuotaJournalierEpuise:
+            raise
+        except ModeleIndisponible as exc:
+            # Erreur d'un modèle après la première rédaction (rôles,
+            # complétude) : le cas compte en échec, la passe continue
+            # (examen du 2026-11-11 arrêté à x024 par un JSON invalide de qwen).
+            trace = _trace(cas, resultats, None, "erreur_modele", question=question)
+            trace["erreur"] = str(exc)[:300]
+            yield trace
+            continue
         trace = _trace(cas, resultats, question=question, **etat)
         trace["omission"] = omission
         trace["seconde_refusee"] = bool(omission) and seconde_refusee
         yield trace
 
 
-def _rediger(question, resultats, llm, nli, settings: Settings, juge, omission=None) -> dict:
+def _rediger(
+    question, resultats, llm, nli, settings: Settings, juge, omission=None, ecart_roles=None
+) -> dict:
     """Rédaction puis garde-fous (citations, fidélité) : arguments de `_trace`
     décrivant le résultat, verdict compris."""
     historique_gen = getattr(llm, "historique", None)
     debut_gen = len(historique_gen) if historique_gen is not None else 0
-    reponse_brute = generer_reponse(question, resultats, llm, omission)
+    reponse_brute = generer_reponse(question, resultats, llm, omission, ecart_roles)
     reponse_brute = corriger_citations(question, resultats, llm, reponse_brute)
     generateurs = historique_gen[debut_gen:] if historique_gen is not None else []
     etat = {"brute": reponse_brute, "generateurs": generateurs}
@@ -280,6 +324,7 @@ def main() -> None:
     llm = get_llm(settings)
     nli = get_nli_provider(settings)
     juge = get_llm_juge(settings)
+    redacteur_roles = get_llm_roles(settings)
     if args.relais_kimi:
         from eval.kimi import KimiLLM, RelaisKimi, lire_cle
 
@@ -297,6 +342,7 @@ def main() -> None:
         k_avant_rerank=settings.k_avant_rerank,
         seuil_rerank=settings.seuil_garde_fou_retrieval,
         index_articles=corpus.bm25,
+        rerank_meilleure_fenetre=settings.rerank_meilleure_fenetre,
     )
 
     cas_golden = [c for c in charger_golden(args.fichier) if args.avec_hors_corpus or not c.hors_corpus]
@@ -318,7 +364,7 @@ def main() -> None:
     with fichier.open("w", encoding="utf-8") as f:
         for t in traces:
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
-        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge), start=1):
+        for i, t in enumerate(evaluer(a_faire, retriever, llm, nli, settings, k=args.k or settings.k_articles_generation, juge=juge, redacteur_roles=redacteur_roles), start=1):
             f.write(json.dumps(t, ensure_ascii=False) + "\n")
             f.flush()
             traces.append(t)

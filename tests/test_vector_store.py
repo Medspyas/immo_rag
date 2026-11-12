@@ -116,6 +116,8 @@ def test_search_retrouve_un_article_par_sa_fenetre():
 
     assert resultats[0].id == long.id
     assert resultats[0].score == pytest.approx(1.0, abs=1e-6)
+    # Rang de la fenêtre gagnante, transmis au reclasseur.
+    assert resultats[0].fenetre == 1
 
     store.delete_by_doc(doc_id)
 

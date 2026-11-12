@@ -117,6 +117,7 @@ def mesurer(settings, chemin: Path | None = None, detail: bool = False) -> dict[
             k_avant_rerank=settings.k_avant_rerank,
             k_par_source=settings.k_par_source,
             rerank_fenetres=settings.rerank_fenetres,
+            rerank_meilleure_fenetre=settings.rerank_meilleure_fenetre,
         ),
         dans,
     )
@@ -140,6 +141,7 @@ def mesurer(settings, chemin: Path | None = None, detail: bool = False) -> dict[
         k_avant_rerank=settings.k_avant_rerank,
         index_articles=corpus.bm25,
         rerank_fenetres=settings.rerank_fenetres,
+        rerank_meilleure_fenetre=settings.rerank_meilleure_fenetre,
     )
     scores_hors = []
     for c in hors:

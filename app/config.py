@@ -61,6 +61,18 @@ class Settings(BaseSettings):
     # neuves 0,670 → 0,691, mais reclassement 1,3 s → 5,2 s (p95 8,2 s) sur
     # carte graphique, soit environ quatre fois plus de textes à noter.
     rerank_fenetres: bool = False
+    # Reclasseur noté aussi sur la seule fenêtre qui a fait retrouver un article
+    # long par le sens, précédée des 500 premiers caractères de l'article, score
+    # diminué de 0,3 (retriever._meilleure_fenetre_a_reclasser, MARGE_FENETRE).
+    # x013 : la règle de la caution (art. 8-1, car. 2 969 sur 3 567) restait
+    # invisible au reclasseur (rang 10). Mesuré le 2026-11-12, 344 questions :
+    # MRR golden 0,801 → 0,806, examen 0,874 → 0,905 (hit@5 92,7 → 98,2 %),
+    # jeu figé 0,861 inchangé, test2 0,941 → 0,942 ; x013 10e → 1re ; aucune
+    # question en recul ; maxima hors corpus inchangés (seul vh13 monte,
+    # 0,23 → 0,35, déjà au-dessus du seuil). Sans retenue ni début d'article :
+    # 4 questions en recul et t42 (hors corpus) franchissait le seuil de
+    # l'étage 1. Coût : +24 % de textes à noter (≈ 10 fenêtres par question).
+    rerank_meilleure_fenetre: bool = True
 
     # Résultats demandés à chaque recherche (sens, mots-clés) avant fusion, et
     # candidats de la fusion soumis au reclasseur. Mesuré sur le golden dataset
@@ -107,9 +119,9 @@ class Settings(BaseSettings):
     llm_model: str = "openai/gpt-oss-20b"
     # Modèles de relais quand llm_model a épuisé son quota par minute : Groq
     # compte le quota séparément pour chaque modèle, deux modèles doublent
-    # donc le débit (cf. generator.LLMEnCascade). qwen/qwen3.8-27b est écarté :
-    # sa limite de 1000 tokens de sortie par minute est sous le max_tokens de
-    # 1024 que réserve chaque appel. Liste vide : un seul modèle, sans cascade.
+    # donc le débit (cf. generator.LLMEnCascade). qwen/qwen3.8-27b n'y est
+    # pas : sa limite de 1000 tokens de sortie par minute ne permet qu'environ
+    # une réponse par minute. Liste vide : un seul modèle, sans cascade.
     llm_modeles_relais: list[str] = ["openai/gpt-oss-120b"]
     # Juge de repli du garde-fou étage 2 : essayé en premier pour le juge, les
     # autres modèles servant de relais. Mesuré le 2026-10-02 : le 20b rejetait

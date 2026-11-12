@@ -53,6 +53,9 @@ class ResultatMemoire:
     content: str
     metadata: dict
     score: float
+    # Rang de la fenêtre (fenetres.py) qui a donné le score, None si c'est le
+    # texte entier de l'article (cf. vector_store.SearchResult).
+    fenetre: int | None = None
 
 
 class RechercheDenseMemoire:
@@ -80,9 +83,12 @@ class RechercheDenseMemoire:
 
     def search(self, query_embedding: list[float], k: int) -> list[ResultatMemoire]:
         q = np.asarray(query_embedding, dtype=np.float32)
-        scores = self._matrice @ q
+        scores_articles = self._matrice @ q
+        scores = scores_articles.copy()
+        scores_fenetres = None
         if self._fenetres is not None and len(self._fenetres):
-            np.maximum.at(scores, self._proprietaires, self._fenetres @ q)
+            scores_fenetres = self._fenetres @ q
+            np.maximum.at(scores, self._proprietaires, scores_fenetres)
         meilleurs = np.argsort(scores)[::-1][:k]
         return [
             ResultatMemoire(
@@ -91,9 +97,23 @@ class RechercheDenseMemoire:
                 content=self._chunks[i].content,
                 metadata=self._chunks[i].metadata,
                 score=float(scores[i]),
+                fenetre=self._meilleure_fenetre(i, scores_articles[i], scores_fenetres),
             )
             for i in meilleurs
         ]
+
+    def _meilleure_fenetre(self, i: int, score_article: float, scores_fenetres) -> int | None:
+        """Rang, parmi les fenêtres de l'article i, de celle qui bat le texte
+        entier ; None sinon. Les fenêtres sont rangées par article, dans
+        l'ordre (construire_corpus)."""
+        if scores_fenetres is None:
+            return None
+        debut = int(np.searchsorted(self._proprietaires, i, side="left"))
+        fin = int(np.searchsorted(self._proprietaires, i, side="right"))
+        if fin == debut:
+            return None
+        rang = int(np.argmax(scores_fenetres[debut:fin]))
+        return rang if scores_fenetres[debut + rang] > score_article else None
 
 
 @dataclass

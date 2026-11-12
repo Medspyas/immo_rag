@@ -59,6 +59,9 @@ class SearchResult(BaseModel):
     content: str
     metadata: dict
     score: float  # proximité de sens : 1.0 = identique, 0.0 = aucun rapport
+    # Rang de la fenêtre (fenetres.py) qui a donné le score, None si c'est le
+    # texte entier : le reclasseur peut lire ce passage (rerank_meilleure_fenetre).
+    fenetre: int | None = None
 
 
 class MorceauStocke(BaseModel):
@@ -190,17 +193,20 @@ class VectorStore:
             cur.execute(
                 """
                 WITH proches AS (
-                    (SELECT id AS chunk_id, embedding <=> %(q)s::vector AS distance
+                    (SELECT id AS chunk_id, NULL::int AS rang,
+                            embedding <=> %(q)s::vector AS distance
                      FROM chunks ORDER BY embedding <=> %(q)s::vector LIMIT %(k)s)
                     UNION ALL
-                    (SELECT chunk_id, embedding <=> %(q)s::vector AS distance
+                    (SELECT chunk_id, rang, embedding <=> %(q)s::vector AS distance
                      FROM fenetres ORDER BY embedding <=> %(q)s::vector LIMIT %(k_fenetres)s)
                 ),
                 meilleurs AS (
-                    SELECT chunk_id, min(distance) AS distance
-                    FROM proches GROUP BY chunk_id ORDER BY distance LIMIT %(k)s
+                    SELECT * FROM (
+                        SELECT DISTINCT ON (chunk_id) chunk_id, rang, distance
+                        FROM proches ORDER BY chunk_id, distance
+                    ) parchunk ORDER BY distance LIMIT %(k)s
                 )
-                SELECT c.id, c.doc_id, c.content, c.metadata, 1 - m.distance AS score
+                SELECT c.id, c.doc_id, c.content, c.metadata, 1 - m.distance AS score, m.rang
                 FROM meilleurs m JOIN chunks c ON c.id = m.chunk_id
                 ORDER BY m.distance
                 """,
@@ -208,7 +214,9 @@ class VectorStore:
             )
             rows = cur.fetchall()
         return [
-            SearchResult(id=r[0], doc_id=r[1], content=r[2], metadata=r[3], score=r[4])
+            SearchResult(
+                id=r[0], doc_id=r[1], content=r[2], metadata=r[3], score=r[4], fenetre=r[5]
+            )
             for r in rows
         ]
 

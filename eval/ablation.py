@@ -109,6 +109,7 @@ def recherche_hybride(
     k_avant_rerank: int = 20,
     k_par_source: int = 20,
     rerank_fenetres: bool = False,
+    rerank_meilleure_fenetre: bool = False,
 ) -> Recherche:
     retriever = HybridRetriever(
         corpus.embeddings,
@@ -119,6 +120,7 @@ def recherche_hybride(
         k_avant_rerank=k_avant_rerank,
         index_articles=corpus.bm25,
         rerank_fenetres=rerank_fenetres,
+        rerank_meilleure_fenetre=rerank_meilleure_fenetre,
     )
 
     def rechercher(question: str, k: int) -> list[Source]:
