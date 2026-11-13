@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     # 4 questions en recul et t42 (hors corpus) franchissait le seuil de
     # l'étage 1. Coût : +24 % de textes à noter (≈ 10 fenêtres par question).
     rerank_meilleure_fenetre: bool = True
+    # Article classé 1er à la fois par le sens et par mots-clés gardé parmi les
+    # passages transmis, même si le reclasseur le fait tomber plus bas
+    # (retriever.HybridRetriever, garder_consensus). y040 (2026-11-13) :
+    # 1383 J 1er des deux recherches, 9e après reclassement. Mesuré hors ligne
+    # sur 386 questions (6 jeux, k = 5) : un seul déclenchement, y040, article
+    # attendu retrouvé ; aucune perte ; 0 déclenchement sur 43 hors corpus.
+    garder_consensus: bool = True
 
     # Résultats demandés à chaque recherche (sens, mots-clés) avant fusion, et
     # candidats de la fusion soumis au reclasseur. Mesuré sur le golden dataset

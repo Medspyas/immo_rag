@@ -482,3 +482,35 @@ def test_score_de_la_fenetre_diminue_de_la_marge():
         [dense], [], reranker=_RerankerScores([0.1, 0.9]), rerank_meilleure_fenetre=True
     ).search("q")
     assert abs(resultats[0].score_rerank - (0.9 - MARGE_FENETRE)) < 1e-9
+
+
+# --- Article 1er des deux recherches gardé (y040) ----------------------------
+
+
+def _trois_candidats_consensus_dernier(**kwargs):
+    a, b, c = uuid4(), uuid4(), uuid4()
+    # « a » est 1er par le sens et par mots-clés, mais le reclasseur le met 3e.
+    retriever = _retriever(
+        [_dense(a), _dense(b), _dense(c)], [_sparse(a)],
+        reranker=_RerankerScores([0.1, 0.9, 0.8]), **kwargs,
+    )
+    return a, b, c, retriever.search("q", k=2)
+
+
+def test_consensus_garde_a_la_derniere_place():
+    a, b, _, resultats = _trois_candidats_consensus_dernier(garder_consensus=True)
+    assert [r.id for r in resultats] == [b, a]
+
+
+def test_sans_option_le_classement_du_reclasseur_reste():
+    _, b, c, resultats = _trois_candidats_consensus_dernier()
+    assert [r.id for r in resultats] == [b, c]
+
+
+def test_consensus_deja_retenu_rien_ne_change():
+    a, b = uuid4(), uuid4()
+    resultats = _retriever(
+        [_dense(a), _dense(b)], [_sparse(a)],
+        reranker=_RerankerScores([0.9, 0.1]), garder_consensus=True,
+    ).search("q", k=2)
+    assert [r.id for r in resultats] == [a, b]

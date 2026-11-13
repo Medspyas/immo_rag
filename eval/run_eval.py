@@ -343,6 +343,7 @@ def main() -> None:
         seuil_rerank=settings.seuil_garde_fou_retrieval,
         index_articles=corpus.bm25,
         rerank_meilleure_fenetre=settings.rerank_meilleure_fenetre,
+        garder_consensus=settings.garder_consensus,
     )
 
     cas_golden = [c for c in charger_golden(args.fichier) if args.avec_hors_corpus or not c.hors_corpus]

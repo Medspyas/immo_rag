@@ -369,6 +369,7 @@ def construire_retriever(
         seuil_rerank=settings.seuil_garde_fou_retrieval if reranker is not None else None,
         index_articles=bm25_index,
         rerank_meilleure_fenetre=settings.rerank_meilleure_fenetre,
+        garder_consensus=settings.garder_consensus,
     )
 
 

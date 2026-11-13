@@ -207,6 +207,7 @@ def main() -> None:
         index_articles=corpus.bm25,
         rerank_fenetres=settings.rerank_fenetres,
         rerank_meilleure_fenetre=settings.rerank_meilleure_fenetre,
+        garder_consensus=settings.garder_consensus,
     )
 
     if args.complet:

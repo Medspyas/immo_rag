@@ -335,6 +335,14 @@ class HybridRetriever:
     fenêtres (recherche par le sens) est noté aussi sur cette seule fenêtre,
     et garde son meilleur score. x013 (2026-11-12) : la règle de la caution
     (art. 8-1, car. 2 969 sur 3 567) restait invisible au reclasseur.
+
+    garder_consensus : l'article classé 1er à la fois par la recherche par le
+    sens et par la recherche par mots-clés reste parmi les k résultats, à la
+    dernière place s'il en était sorti au reclassement. y040 (2026-11-13) :
+    l'article 1383 J (zones de développement prioritaire), 1er des deux
+    recherches, tombait au 9e rang derrière d'autres articles d'exonération
+    notés presque autant (0,968 contre 0,993) ; la réponse appliquait la règle
+    d'un autre régime.
     """
 
     def __init__(
@@ -350,6 +358,7 @@ class HybridRetriever:
         index_articles: _IndexArticles | None = None,
         rerank_fenetres: bool = False,
         rerank_meilleure_fenetre: bool = False,
+        garder_consensus: bool = False,
     ):
         self._embeddings = embeddings
         self._dense = recherche_dense
@@ -362,6 +371,7 @@ class HybridRetriever:
         self._index_articles = index_articles
         self._rerank_fenetres = rerank_fenetres
         self._rerank_meilleure_fenetre = rerank_meilleure_fenetre
+        self._garder_consensus = garder_consensus
 
     def search(self, query: str, k: int = 10) -> list[RetrievalResult]:
         """Les k morceaux les mieux placés pour la question.
@@ -457,10 +467,19 @@ class HybridRetriever:
         if self._seuil_rerank is not None and (meilleur is None or meilleur < self._seuil_rerank):
             return []
 
-        return [
-            _resultat(candidats[indice], score_rerank=score)
-            for indice, score in classement[:k]
-        ]
+        retenus = classement[:k]
+        if self._garder_consensus and k > 0:
+            consensus = next(
+                (
+                    paire for paire in classement[k:]
+                    if rang_dense.get(candidats[paire[0]]) == 1
+                    and rang_bm25.get(candidats[paire[0]]) == 1
+                ),
+                None,
+            )
+            if consensus is not None:
+                retenus = retenus[: k - 1] + [consensus]
+        return [_resultat(candidats[indice], score_rerank=score) for indice, score in retenus]
 
     def _articles_cites(
         self, candidats: list[UUID], par_id: dict[UUID, _ResultatRecherche]
