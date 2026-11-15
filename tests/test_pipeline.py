@@ -14,6 +14,7 @@ from app.rag.chunking import RawChunk
 from app.rag.fenetres import fenetres_article
 from app.rag.generator import (
     CONSIGNE_COMPLETUDE,
+    CONSIGNE_HORS_REGIME,
     CONSIGNE_ROLES_ARTICLE,
     CONSIGNE_ROLES_QUESTION,
 )
@@ -512,16 +513,21 @@ class _LLMSelonConsigne:
     """Répond selon la consigne reçue : rédactions successives d'un côté,
     verdict de complétude de l'autre. Retient les messages de rédaction."""
 
-    def __init__(self, redactions: list[str], completude: str):
+    def __init__(self, redactions: list[str], completude: str, hors_regime: str = '{"incompatible": false}'):
         self._redactions = list(redactions)
         self._completude = completude
+        self._hors_regime = hors_regime
         self.messages_redaction: list[str] = []
         self.appels_completude = 0
+        self.appels_hors_regime = 0
 
     def generer(self, consigne: str, question: str) -> str:
         if consigne == CONSIGNE_COMPLETUDE:
             self.appels_completude += 1
             return self._completude
+        if consigne == CONSIGNE_HORS_REGIME:
+            self.appels_hors_regime += 1
+            return self._hors_regime
         self.messages_redaction.append(question)
         return self._redactions.pop(0)
 
@@ -616,6 +622,41 @@ def test_repondre_seconde_refusee_rappelle_le_regime_particulier():
     reponse = repondre("Quel préavis ?", _RetrieverFake([article]), llm, _NLIToujoursFonde(), _settings())
     assert reponse.reponse.startswith("Le délai de préavis est de trois mois.")
     assert "Précision : L'article 15 relève de : « Dispositions particulières aux logements meublés »." in reponse.reponse
+    assert llm.appels_hors_regime == 1
+
+
+def _repondre_regime_meuble(question: str, hors_regime: str):
+    """Seconde rédaction refusée sur un article des meublés, verdict hors
+    régime donné."""
+    article = _ResultatFake("loi-89-462", "Le délai de préavis est de trois mois.", article="15")
+    article.metadata["section"] = "Titre > Dispositions particulières aux logements meublés"
+    inventee = json.dumps(
+        {
+            "refus": False,
+            "reponse": "Le préavis est de six mois.",
+            "citations": [{"doc_id": "loi-89-462", "article": "15", "passage": "passage absent de l'article"}],
+        }
+    )
+    juge_ok = json.dumps({"fondees": [True]})
+    llm = _LLMSelonConsigne([_REPONSE_OK, juge_ok, inventee, inventee], _INCOMPLETE, hors_regime)
+    return repondre(question, _RetrieverFake([article]), llm, _NLIToujoursFonde(), _settings())
+
+
+def test_repondre_situation_hors_regime_est_refusee():
+    # yh06 : logement de fonction, préavis des meublés appliqué.
+    question = "Quel préavis pour quitter mon logement de fonction ?"
+    verdict = json.dumps({"mots": "logement de fonction", "incompatible": True})
+    reponse = _repondre_regime_meuble(question, verdict)
+    assert reponse.refus is True
+    assert "logement de fonction" in reponse.motif
+
+
+def test_repondre_hors_regime_sans_mots_de_la_question_garde_la_premiere():
+    # Mots non retrouvés dans la question : verdict ignoré, première gardée.
+    verdict = json.dumps({"mots": "contrat de travail", "incompatible": True})
+    reponse = _repondre_regime_meuble("Quel préavis pour quitter mon logement ?", verdict)
+    assert reponse.refus is False
+    assert "Précision :" in reponse.reponse
 
 
 

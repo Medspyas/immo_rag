@@ -67,6 +67,7 @@ from app.rag.generator import (
     generer_reponse,
     rappeler_champ,
     roles_a_verifier,
+    situation_hors_regime,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
@@ -488,6 +489,17 @@ def _repondre_question(
         and verifier_roles(question, seconde, resultats, juge or llm)
     ):
         return rappeler_champ(reponse, resultats)
+    finale = seconde if not seconde.refus else reponse
+    # Question d'un autre cadre que le régime particulier des articles cités
+    # (yh06 : logement de fonction auquel était appliqué le préavis des
+    # meublés, par la première rédaction comme par la seconde) : refus, le
+    # rappel du régime ne rendrait pas la réponse juste.
+    mots = situation_hors_regime(question, finale, resultats, juge or llm)
+    if mots is not None:
+        return ReponseGeneree(
+            refus=True,
+            motif=f"les articles trouvés relèvent d'un régime particulier qui ne vise pas « {mots} »",
+        )
     return rappeler_champ(ajouter_precision(reponse, resultats) if seconde.refus else seconde, resultats)
 
 

@@ -64,6 +64,7 @@ from app.rag.generator import (
     get_llm_roles,
     rappeler_champ,
     roles_a_verifier,
+    situation_hors_regime,
     verifier_citations,
     verifier_completude,
     verifier_fidelite,
@@ -197,7 +198,19 @@ def evaluer(
                     # Comme pipeline.repondre : une seconde rédaction refusée
                     # laisse la place à la première, déjà vérifiée.
                     seconde_refusee = seconde["verdict_local"] != "fondee"
-                    if not seconde_refusee:
+                    finale = etat if seconde_refusee else seconde
+                    # Comme pipeline : question d'un autre cadre que le
+                    # régime des articles cités → refus (yh06).
+                    mots = situation_hors_regime(
+                        question, finale["reponse"], resultats, juge_completude or juge or llm
+                    )
+                    if mots is not None:
+                        refus = ReponseGeneree(
+                            refus=True,
+                            motif=f"les articles trouvés relèvent d'un régime particulier qui ne vise pas « {mots} »",
+                        )
+                        etat = {**finale, "reponse": refus, "verdict_local": "refus_hors_regime"}
+                    elif not seconde_refusee:
                         etat = seconde
                     else:
                         etat = {**etat, "reponse": ajouter_precision(etat["reponse"], resultats)}

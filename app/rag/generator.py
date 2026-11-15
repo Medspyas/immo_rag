@@ -2380,6 +2380,50 @@ def ajouter_precision(
     return reponse.model_copy(update={"reponse": f"{reponse.reponse}\n\nPrécision : {precision}"})
 
 
+CONSIGNE_HORS_REGIME = """Tu lis la question d'un utilisateur à un assistant juridique et les intitulés des textes sur lesquels la réponse s'appuie. Ces textes ne valent que pour un régime particulier.
+
+1. « cadre_textes » : le type de logement, de bail ou de contrat que visent ces textes, d'après leurs intitulés.
+2. « mots » : recopie mot pour mot, en six mots au plus, les mots de la question qui nomment le type de logement, de bail ou de contrat de l'utilisateur ; "" si la question n'en nomme pas.
+3. « incompatible » : true seulement si ce type ne peut en aucun cas relever du cadre des textes (un logement de fonction lié à un contrat de travail n'est pas un bail meublé) ; false s'il peut en relever (un « appartement » peut être loué meublé), si la question n'en nomme pas, ou en cas de doute.
+
+Réponds UNIQUEMENT par ce JSON, sans texte autour :
+{"cadre_textes": "<...>", "mots": "<...>", "incompatible": false}"""
+
+
+def situation_hors_regime(
+    question: str,
+    reponse: ReponseGeneree,
+    resultats: list[_ResultatRecherche],
+    llm: LLM,
+) -> str | None:
+    """Mots de la question qui la placent hors du régime particulier des
+    articles cités, ou None.
+
+    yh06 (hors corpus, 2026-11-15) : « préavis d'un salarié qui quitte son
+    logement de fonction » ; la réponse appliquait le préavis d'un mois des
+    meublés et du bail mobilité (art. 25-8, 25-15), le juge l'acceptait et le
+    rappel du régime (ajouter_precision) ne la rendait pas juste. Appelé
+    seulement là où ce rappel serait ajouté. Le verdict compte seulement si
+    les mots recopiés se retrouvent dans la question."""
+    intitules = _intitules_particuliers(reponse, resultats)
+    if reponse.refus or not intitules:
+        return None
+    liste = "\n".join(f"- « {i} »" for i in intitules)
+    message = f"Question : {question}\n\nIntitulés des textes cités :\n{liste}"
+    try:
+        verdict = json.loads(llm.generer(CONSIGNE_HORS_REGIME, message))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(verdict, dict) or verdict.get("incompatible") is not True:
+        return None
+    mots = str(verdict.get("mots") or "").strip()
+    # Mots retrouvés dans la question, courts : la question recopiée en
+    # entier n'est pas la désignation d'un autre cadre (v041, 2026-11-15).
+    if not mots or len(mots.split()) > 6 or _normaliser(mots) not in _normaliser(question):
+        return None
+    return mots
+
+
 # Article qui borne le champ (« … de l'article 31 du code … » → « 31 »).
 _ARTICLE_VISE = re.compile(r"\barticle\s+(\d[\w-]*)")
 
